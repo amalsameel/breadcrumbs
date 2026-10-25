@@ -10,7 +10,7 @@ import { Waveform } from "../Waveform";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
 import { Spinner } from "../ui/Spinner";
-import { classifyMicError, MIC_MESSAGES } from "./flow";
+import { classifyMicError, MIC_MESSAGES, recordingNotice } from "./flow";
 import type { MicProblem } from "./flow";
 import { StepHeading } from "./PhoneScreen";
 
@@ -158,12 +158,13 @@ export function InterviewStep({ sid, seat, questions, startIndex, onDone, descri
         id="step-title"
         eyebrow={`Question ${index + 1} of ${questions.length}`}
         title={question.text}
+        size="md"
         lead="About 20 seconds. Speak naturally, there are no wrong answers."
       />
 
       <p className="sr-only" aria-live="polite">
         {rec.k === "recording"
-          ? "Recording"
+          ? recordingNotice(elapsed, LIMIT_MS)
           : rec.k === "uploading"
             ? "Listening back to your answer"
             : rec.k === "heard"
@@ -172,17 +173,18 @@ export function InterviewStep({ sid, seat, questions, startIndex, onDone, descri
       </p>
 
       {showRecorder && (
-        <div className="flex flex-1 flex-col items-center justify-center gap-6 py-4">
-          <div className="w-full max-w-xs">
-            <Waveform analyser={rec.k === "recording" ? rec.handle.analyser : null} />
-          </div>
+        <div className="flex flex-1 flex-col items-center justify-center gap-5 py-2">
           <RecordButton
             state={buttonState}
             elapsedMs={elapsed}
             limitMs={LIMIT_MS}
+            analyser={rec.k === "recording" ? rec.handle.analyser : null}
             onPress={() => (rec.k === "recording" ? void stop() : void start())}
             idleLabel={idleLabelFor(rec)}
           />
+          <div className="w-full max-w-[16rem]">
+            <Waveform analyser={rec.k === "recording" ? rec.handle.analyser : null} />
+          </div>
           {rec.k === "uploading" && (
             <p className="flex items-center gap-2 text-[16px] text-ink-muted">
               <Spinner size={18} /> Listening back...
@@ -210,8 +212,8 @@ export function InterviewStep({ sid, seat, questions, startIndex, onDone, descri
       )}
 
       {rec.k === "upload_error" && (
-        <Card tone="sunken" className="flex flex-col gap-4" role="alert">
-          <p className="text-[17px] font-semibold text-ink">We couldn't save that answer</p>
+        <Card tone="glow" className="flex flex-col gap-4" role="alert">
+          <p className="text-[18px] font-medium text-ink">We couldn't save that answer</p>
           <p className="text-[15px] text-ink-muted">{rec.message}</p>
           <div className="flex flex-col gap-2">
             {rec.blob.size > 0 && (
@@ -244,11 +246,11 @@ function HeardCard({
   return (
     <div className="flex flex-col gap-4">
       <Card tone="glow">
-        <p className="mb-2 text-[14px] font-medium tracking-wide text-amber uppercase">We heard</p>
+        <p className="mb-3 text-[14px] font-medium text-ink-muted">We heard</p>
         {empty ? (
           <p className="text-[17px] text-ink-muted">We couldn't quite catch that. Try once more, a little closer to the phone?</p>
         ) : (
-          <blockquote className="font-display text-[20px] leading-snug text-ink">"{truncate(transcript, 240)}"</blockquote>
+          <blockquote className="font-display text-[22px] leading-[1.3] tracking-[-0.02em] text-ink">"{truncate(transcript, 240)}"</blockquote>
         )}
       </Card>
       {empty ? (
@@ -277,8 +279,8 @@ function HeardCard({
 function MicNotice({ problem }: { problem: MicProblem }) {
   const msg = MIC_MESSAGES[problem];
   return (
-    <Card tone="sunken" role="alert" className="w-full">
-      <p className="text-[17px] font-semibold text-ink">{msg.title}</p>
+    <Card tone="glow" role="alert" className="w-full">
+      <p className="text-[17px] font-medium text-ink">{msg.title}</p>
       <p className="mt-1 text-[15px] leading-relaxed text-ink-muted">{msg.body}</p>
     </Card>
   );

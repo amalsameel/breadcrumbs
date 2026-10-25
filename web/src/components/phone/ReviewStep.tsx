@@ -6,9 +6,10 @@ import type { Profile, Seat } from "../../lib/types";
 import { ProfileChips } from "../ProfileChips";
 import { Button } from "../ui/Button";
 import { TogglePill } from "../ui/Pill";
+import { FIELD_CLASS } from "../ui/TextField";
 import { Spinner } from "../ui/Spinner";
 import { addTopic, OFF_LIMITS_PRESETS, toggleTopic } from "./flow";
-import { StepHeading } from "./PhoneScreen";
+import { ErrorNote, StepHeading } from "./PhoneScreen";
 
 interface ReviewStepProps {
   sid: string;
@@ -40,7 +41,7 @@ export function ReviewStep({ sid, seat, profile, onProfile, onReady, describeErr
         <h1 id="step-title" tabIndex={-1} className="sr-only">
           Loading your profile
         </h1>
-        {loadError ? <p role="alert" className="text-[16px] text-ink-muted">{loadError}</p> : <Spinner size={28} label="Loading your profile" />}
+        {loadError ? <ErrorNote>{loadError}</ErrorNote> : <Spinner size={28} label="Loading your profile" className="text-ink" />}
       </section>
     );
   }
@@ -92,8 +93,8 @@ function ReviewForm({
       />
 
       {profile.vibe && (
-        <p className="-mt-4 text-[16px] text-ink-muted">
-          Your vibe: <span className="font-display text-[18px] text-crumb italic">{profile.vibe}</span>
+        <p className="-mt-4 inline-flex items-center gap-2 self-start rounded-full bg-bg-raised px-4 py-2 text-[15px] text-ink-muted shadow-pill">
+          Your vibe: <span className="font-medium text-ink">{profile.vibe}</span>
         </p>
       )}
 
@@ -106,10 +107,10 @@ function ReviewForm({
 
       <section aria-labelledby="offlimits-title" className="flex flex-col gap-3">
         <div>
-          <h2 id="offlimits-title" className="font-display text-[22px] font-semibold text-ink">
+          <h2 id="offlimits-title" className="font-display text-[24px] font-normal tracking-[-0.02em] text-ink">
             Off-limits
           </h2>
-          <p className="mt-1 text-[15px] text-ink-muted">Topics Breadcrumbs will never raise, even as a fun fact.</p>
+          <p className="mt-1.5 text-[15px] text-ink-muted">Topics Breadcrumbs will never raise, even as a fun fact.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           {OFF_LIMITS_PRESETS.map((topic) => (
@@ -143,19 +144,15 @@ function ReviewForm({
             maxLength={40}
             placeholder="Add a topic, e.g. my ex"
             enterKeyHint="done"
-            className="min-h-12 min-w-0 flex-1 rounded-2xl border border-line bg-bg-sunken px-4 text-[17px] text-ink outline-none placeholder:text-ink-faint focus:border-amber"
+            className={`${FIELD_CLASS} min-h-12 min-w-0 flex-1 border-line`}
           />
-          <Button type="submit" variant="secondary" size="md" className="min-h-12" disabled={!draft.trim()}>
+          <Button type="submit" variant="secondary" size="md" className="min-h-12 shrink-0" disabled={!draft.trim()}>
             Add
           </Button>
         </form>
       </section>
 
-      {error && (
-        <p role="alert" className="rounded-2xl border border-danger/50 bg-danger/10 px-4 py-3 text-[15px] text-ink">
-          {error}
-        </p>
-      )}
+      {error && <ErrorNote>{error}</ErrorNote>}
 
       <Button block onClick={() => void ready()} loading={submitting}>
         I'm ready

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { CrumbMark, CrumbSteps } from "../ui/Crumbs";
+import { CrumbSteps, Wordmark } from "../ui/Crumbs";
 import { Pill } from "../ui/Pill";
 
 interface PhoneScreenProps {
@@ -9,40 +9,44 @@ interface PhoneScreenProps {
   footer?: ReactNode; // sticky bottom action bar (primary CTA within thumb reach)
 }
 
-/** Mobile shell: safe-area padding, readable column, optional sticky footer. No horizontal scroll. */
+/** Mobile shell: off-white canvas, safe-area padding, readable column, optional sticky footer. No horizontal scroll. */
 export function PhoneScreen({ children, modeLabel, progress, footer }: PhoneScreenProps) {
   return (
-    <div className="relative flex min-h-dvh flex-col overflow-x-hidden bg-bg text-ink">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 h-72 bg-[radial-gradient(60%_100%_at_50%_0%,rgba(245,165,36,0.12),transparent)]"
-      />
+    <div className="flex min-h-dvh flex-col overflow-x-clip bg-bg text-ink">
       <header
-        className="relative mx-auto flex w-full max-w-md items-center justify-between gap-3 px-5 pb-2"
-        style={{ paddingTop: "max(1rem, env(safe-area-inset-top))" }}
+        className="mx-auto flex w-full max-w-md items-center justify-between gap-3 pb-2"
+        style={{
+          paddingTop: "max(1rem, env(safe-area-inset-top))",
+          paddingLeft: "max(1.25rem, env(safe-area-inset-left))",
+          paddingRight: "max(1.25rem, env(safe-area-inset-right))",
+        }}
       >
-        <div className="flex items-center gap-2">
-          <CrumbMark size={26} className="text-ink" />
-          <span className="font-display text-[19px] font-semibold tracking-tight">Breadcrumbs</span>
-        </div>
-        <div className="flex items-center gap-3">
-          {progress && <CrumbSteps {...progress} />}
-          {modeLabel && <Pill>{modeLabel}</Pill>}
+        <span className="shrink-0">
+          <Wordmark />
+        </span>
+        <div className="flex min-w-0 items-center justify-end gap-3">
+          {progress && (
+            <span className="shrink-0">
+              <CrumbSteps {...progress} />
+            </span>
+          )}
+          {/* The pill gives way first on narrow screens: it truncates with an ellipsis. */}
+          {modeLabel && <Pill className="max-w-[40vw]">{modeLabel}</Pill>}
         </div>
       </header>
       <main
-        className="relative mx-auto flex w-full max-w-md flex-1 flex-col px-5 pt-4"
+        className="mx-auto flex w-full max-w-md flex-1 flex-col pt-6"
         style={{
           paddingLeft: "max(1.25rem, env(safe-area-inset-left))",
           paddingRight: "max(1.25rem, env(safe-area-inset-right))",
-          paddingBottom: footer ? "1.5rem" : "max(1.5rem, env(safe-area-inset-bottom))",
+          paddingBottom: footer ? "1.5rem" : "max(2rem, env(safe-area-inset-bottom))",
         }}
       >
         {children}
       </main>
       {footer && (
         <div
-          className="sticky bottom-0 z-10 border-t border-line/60 bg-bg/90 backdrop-blur-md"
+          className="sticky bottom-0 z-10 border-t border-line bg-bg/90 backdrop-blur-md"
           style={{ paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}
         >
           <div className="mx-auto w-full max-w-md px-5 pt-3">{footer}</div>
@@ -52,15 +56,38 @@ export function PhoneScreen({ children, modeLabel, progress, footer }: PhoneScre
   );
 }
 
-/** Large display heading + optional lead paragraph used at the top of each step. */
-export function StepHeading({ eyebrow, title, lead, id }: { eyebrow?: string; title: ReactNode; lead?: ReactNode; id?: string }) {
+/** Large regular-weight display heading + optional lead paragraph used at the top of each step. */
+interface StepHeadingProps {
+  eyebrow?: string;
+  title: ReactNode;
+  lead?: ReactNode;
+  id?: string;
+  size?: "lg" | "md"; // md for long titles such as interview questions
+}
+
+export function StepHeading({ eyebrow, title, lead, id, size = "lg" }: StepHeadingProps) {
   return (
-    <div className="mb-6">
-      {eyebrow && <p className="mb-2 text-[14px] font-medium tracking-wide text-amber uppercase">{eyebrow}</p>}
-      <h1 id={id} tabIndex={-1} style={{ outline: "none" }} className="font-display text-[30px] leading-[1.15] font-semibold text-ink">
+    <div className="mb-8">
+      {eyebrow && <p className="mb-3 text-[14px] font-medium text-ink-muted">{eyebrow}</p>}
+      <h1
+        id={id}
+        tabIndex={-1}
+        style={{ outline: "none" }}
+        className={`font-display ${size === "md" ? "text-[28px] leading-[1.15]" : "text-[34px] leading-[1.08]"} font-normal tracking-[-0.035em] text-balance text-ink`}
+      >
         {title}
       </h1>
-      {lead && <p className="mt-3 text-[17px] leading-relaxed text-ink-muted">{lead}</p>}
+      {lead && <p className="mt-4 text-[17px] leading-[1.5] text-ink-muted">{lead}</p>}
     </div>
+  );
+}
+
+/** Inline error banner on the light canvas. */
+export function ErrorNote({ children }: { children: ReactNode }) {
+  return (
+    <p role="alert" className="flex items-start gap-3 rounded-2xl border border-danger/30 bg-bg-raised px-4 py-3 text-[15px] leading-snug text-ink">
+      <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-danger" />
+      <span className="min-w-0">{children}</span>
+    </p>
   );
 }

@@ -14,11 +14,14 @@ import {
   optInCopy,
   parseSeat,
   partnerName,
+  recordLabel,
+  recordingNotice,
   stepIndex,
   toggleTopic,
   trailForSeat,
   waitingLine,
 } from "./flow.ts";
+import { classifyGesture, keepsOrb, nearestPos, SLOT_REACH, wrapIndex } from "../ui/carousel.ts";
 
 function seatSummary(over = {}) {
   return {
@@ -207,4 +210,103 @@ test("no em dash characters in user-facing copy", async () => {
     const text = await readFile(f, "utf8");
     assert.ok(!text.includes(EM_DASH), `em dash found in ${f}`);
   }
+});
+
+// ---- Regression tests (round 2 review of Home + phone UI) ------------------------------------------
+
+async function readSrc(rel) {
+  const { readFile } = await import("node:fs/promises");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  return readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "..", rel), "utf8");
+}
+
+/** Source of a top-level `function name(...) {...}` up to the next top-level function. */
+function functionBody(text, name) {
+  const start = text.indexOf(`function ${name}(`);
+  assert.ok(start >= 0, `function ${name} not found`);
+  const next = text.indexOf("\nfunction ", start + 1);
+  return text.slice(start, next < 0 ? undefined : next);
+}
+
+test("carousel: a rightward drag is 'previous' and swallows the click; a tap selects", () => {
+  // The reported case: drag from x 1040 to 1130 on the right neighbor must step back, not pick it.
+  assert.deepEqual(classifyGesture(90, 0), { kind: "swipe", delta: -1 });
+  assert.deepEqual(classifyGesture(-90, 4), { kind: "swipe", delta: 1 });
+  assert.deepEqual(classifyGesture(3, 2), { kind: "tap" });
+  // Moved too far for a tap but not a swipe (or mostly vertical): neither steps nor picks.
+  assert.deepEqual(classifyGesture(30, 0), { kind: "drag" });
+  assert.deepEqual(classifyGesture(60, 80), { kind: "drag" });
+});
+
+test("carousel: Home swallows the post-gesture click in the capture phase, never a keyboard click", async () => {
+  const home = await readSrc("pages/Home.tsx");
+  const carousel = functionBody(home, "OrbCarousel");
+  assert.match(carousel, /onClickCapture=\{onClickCapture\}/);
+  assert.match(carousel, /suppressClick\.current = gesture\.kind !== "tap"/);
+  assert.match(carousel, /e\.detail === 0/);
+});
+
+test("carousel: nearestPos wraps both ways without jumping across the stage", () => {
+  assert.equal(nearestPos(0, 2, 3), -1); // Social -> Speed dating is one step back
+  assert.equal(nearestPos(0, 1, 3), 1);
+  assert.equal(nearestPos(5, 0, 3), 6); // 5 shows index 2; index 0 is the next one
+  assert.equal(wrapIndex(-4, 3), 2);
+});
+
+test("carousel: one persistent play button outside the keyed slots keeps focus across steps", async () => {
+  const home = await readSrc("pages/Home.tsx");
+  assert.equal(home.split("data-carousel-play").length - 1, 1, "exactly one play button");
+  assert.ok(!functionBody(home, "CarouselSlot").includes("<button"), "slots must not own a button");
+  const carousel = functionBody(home, "OrbCarousel");
+  assert.match(carousel, /onClick=\{\(\) => onStart\(current\)\}/);
+  assert.match(carousel, /aria-label=\{`Set the table for \$\{copy\.label\}`\}/);
+});
+
+test("carousel: an orb leaving the visible range stays mounted while it slides out", async () => {
+  // Offset 2 is visible (opacity 0.4); one step later it is offset 3 and must still render its orb.
+  for (let d = 0; d <= SLOT_REACH; d++) assert.ok(keepsOrb(d), `orb at distance ${d} unmounted`);
+  const home = await readSrc("pages/Home.tsx");
+  assert.match(functionBody(home, "CarouselSlot"), /keepsOrb\(dist\) && <CrumbOrb/);
+});
+
+test("narrow screens: segmented options and pills shrink and truncate instead of clipping", async () => {
+  const seg = await readSrc("components/ui/Segmented.tsx");
+  assert.ok(!/\bshrink-0\b/.test(seg), "segmented options must be allowed to shrink");
+  assert.match(seg, /inline-flex min-w-0 shrink /);
+  assert.match(seg, /<span className="min-w-0 truncate">\{o\.label\}<\/span>/);
+  const pill = await readSrc("components/ui/Pill.tsx");
+  assert.match(pill, /<span className="min-w-0 truncate[^"]*">\{children\}<\/span>/);
+  assert.match(functionBody(pill, "Pill"), /max-w-full min-w-0/);
+  const screen = await readSrc("components/phone/PhoneScreen.tsx");
+  assert.match(screen, /<Pill className="max-w-\[40vw\]">/);
+});
+
+test("contrast: no small text uses the raw danger color (4.40:1 on white, 4.04:1 on the canvas)", async () => {
+  const files = [
+    "components/ui/TextField.tsx",
+    "components/ui/Pill.tsx",
+    "components/ui/Button.tsx",
+    "components/ConsentForm.tsx",
+    "components/phone/PhoneScreen.tsx",
+    "pages/Home.tsx",
+    "pages/Join.tsx",
+  ];
+  for (const f of files) assert.ok(!/\btext-danger\b/.test(await readSrc(f)), `text-danger in ${f}`);
+});
+
+test("record control: stable verb label, no toggle state, time left only at coarse marks", async () => {
+  assert.equal(recordLabel(false), "Start recording");
+  assert.equal(recordLabel(true), "Stop recording");
+  const rb = await readSrc("components/RecordButton.tsx");
+  assert.ok(!rb.includes("aria-pressed"), "record button must not be a toggle");
+  assert.match(rb, /aria-label=\{recordLabel\(recording\)\}/);
+
+  const limit = 20_000;
+  const said = new Set();
+  for (let t = 0; t <= limit; t += 100) said.add(recordingNotice(t, limit));
+  assert.deepEqual([...said], ["Recording", "10 seconds left", "5 seconds left"]);
+  assert.equal(recordingNotice(9_000, limit), "Recording");
+  assert.equal(recordingNotice(10_000, limit), "10 seconds left");
+  assert.equal(recordingNotice(15_001, limit), "5 seconds left");
 });

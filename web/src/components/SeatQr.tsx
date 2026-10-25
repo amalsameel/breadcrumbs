@@ -39,33 +39,40 @@ export default function SeatQr({ seat, url, summary }: SeatQrProps) {
   return (
     <motion.section
       aria-label={`Seat ${seat}`}
-      className={`flex w-full max-w-[392px] flex-col items-center gap-5 rounded-[28px] border bg-bg-raised/70 p-6 backdrop-blur transition-colors duration-500 ${
-        ready ? "border-ok/50" : "border-line"
+      className={`flex w-full max-w-[440px] flex-col items-center gap-4 rounded-[24px] border bg-bg-raised p-5 shadow-card transition-colors duration-500 sm:p-6 ${
+        ready ? "border-ok/40" : "border-line"
       }`}
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5, delay: seat === 1 ? 0 : 0.08 }}
+      transition={{ duration: 0.5, delay: seat === 1 ? 0.08 : 0.14, ease: [0.22, 1, 0.36, 1] }}
     >
-      <header className="flex w-full items-baseline justify-between">
-        <span className="font-mono text-xs uppercase tracking-[0.2em] text-ink-faint">Seat {seat}</span>
-        <span className="text-sm text-ink-muted" aria-live="polite">
+      <header className="flex w-full items-center justify-between gap-3">
+        <span className="inline-flex min-h-7 items-center rounded-full bg-well px-3 font-mono text-[12px] uppercase tracking-[0.14em] text-ink-muted">
+          Seat {seat}
+        </span>
+        <span className="text-right text-[14px] text-ink-muted" aria-live="polite">
           {headline(summary)}
         </span>
       </header>
 
-      <div className="rounded-2xl bg-ink p-3.5 shadow-[0_0_60px_-18px_rgba(245,165,36,0.6)]">
+      <div className="rounded-[20px] border border-line bg-bg-raised p-3">
         <QRCodeSVG
           value={url}
-          size={208}
+          size={176}
           level="M"
           marginSize={0}
-          bgColor="#F6EFE6"
-          fgColor="#17120E"
+          bgColor="#FFFFFF"
+          fgColor="#0C0B0A"
           title={`Join link for seat ${seat}`}
+          className="block h-auto w-[min(176px,52vw)]"
         />
       </div>
 
-      <p className={`min-h-9 font-display text-[28px] leading-none ${name ? "text-ink" : "text-ink-faint"}`}>
+      <p
+        className={`min-h-9 text-center font-display text-[28px] font-normal leading-none tracking-[-0.03em] ${
+          name ? "text-ink" : "text-ink-muted"
+        }`}
+      >
         {name ?? (summary?.joined ? "Joined" : "Waiting for someone")}
       </p>
 

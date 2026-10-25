@@ -29,10 +29,10 @@ export function Switch({ checked, onChange, label, description }: SwitchProps) {
       </span>
       <span
         aria-hidden="true"
-        className={`relative h-7 w-12 shrink-0 rounded-full transition-colors duration-200 ${checked ? "bg-amber" : "bg-line"}`}
+        className={`relative h-7 w-12 shrink-0 rounded-full transition-colors duration-200 ${checked ? "bg-ink" : "bg-line-strong"}`}
       >
         <span
-          className={`absolute top-1 left-1 h-5 w-5 rounded-full bg-ink shadow transition-transform duration-200 ${checked ? "translate-x-5" : ""}`}
+          className={`absolute top-1 left-1 h-5 w-5 rounded-full bg-bg-raised shadow-[0_1px_3px_rgb(12_11_10/0.25)] transition-transform duration-200 ${checked ? "translate-x-5" : ""}`}
         />
       </span>
     </button>

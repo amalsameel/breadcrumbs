@@ -4,8 +4,10 @@ import type { FormEvent } from "react";
 import type { Mode } from "../lib/types";
 import { Button } from "./ui/Button";
 import { Card } from "./ui/Card";
+import { OrbDot } from "./ui/Crumbs";
 import { TextField } from "./ui/TextField";
 import { MODE_COPY } from "./ui/modes";
+import { ErrorNote } from "./phone/PhoneScreen";
 
 interface ConsentFormProps {
   mode: Mode;
@@ -57,19 +59,19 @@ export function ConsentForm({ mode, partnerName, onSubmit }: ConsentFormProps) {
         {partnerName ? (
           <>
             {" "}
-            with <span className="font-semibold text-ink">{partnerName}</span>
+            with <span className="font-medium text-ink">{partnerName}</span>
           </>
         ) : null}
         . Here's exactly what happens:
       </p>
 
-      <Card tone="sunken" as="section" aria-label="What happens" className="p-4">
-        <ul className="flex flex-col gap-4">
+      <Card as="section" aria-label="What happens" className="p-5">
+        <ul className="flex flex-col gap-5">
           {PROMISES.map((p) => (
             <li key={p.title} className="flex gap-3">
-              <span aria-hidden="true" className="mt-2 h-2 w-2 shrink-0 rounded-full bg-crumb shadow-[0_0_8px_rgba(255,210,122,0.8)]" />
+              <OrbDot palette={MODE_COPY[mode].palette} size={14} className="mt-1" />
               <span>
-                <span className="block text-[16px] font-semibold text-ink">{p.title}</span>
+                <span className="block text-[16px] font-medium text-ink">{p.title}</span>
                 <span className="block text-[15px] leading-snug text-ink-muted">{p.body}</span>
               </span>
             </li>
@@ -97,8 +99,9 @@ export function ConsentForm({ mode, partnerName, onSubmit }: ConsentFormProps) {
         <label
           htmlFor={agreeId}
           className={
-            "flex min-h-14 cursor-pointer items-start gap-3 rounded-2xl border bg-bg-raised p-4 " +
-            (agreeError ? "border-danger" : agreed ? "border-amber/60" : "border-line")
+            "flex min-h-14 cursor-pointer items-start gap-3 rounded-3xl border bg-bg-raised p-4 transition-[border-color,box-shadow] duration-150 " +
+            "has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ink " +
+            (agreeError ? "border-danger" : agreed ? "border-ink shadow-card" : "border-line")
           }
         >
           <input
@@ -111,25 +114,22 @@ export function ConsentForm({ mode, partnerName, onSubmit }: ConsentFormProps) {
             }}
             aria-invalid={agreeError ? true : undefined}
             aria-describedby={agreeError ? `${agreeId}-err` : undefined}
-            className="mt-0.5 h-6 w-6 shrink-0 cursor-pointer accent-amber"
+            className="mt-0.5 h-6 w-6 shrink-0 cursor-pointer accent-ink"
           />
           <span className="text-[16px] leading-snug text-ink">
-            <span className="font-semibold">I agree.</span> I consent to Breadcrumbs transcribing my voice answers and
+            <span className="font-medium">I agree.</span> I consent to Breadcrumbs transcribing my voice answers and
             listening to this conversation as described above. Typing my name above is my signature.
           </span>
         </label>
         {agreeError && (
-          <p id={`${agreeId}-err`} role="alert" className="text-[14px] text-danger">
-            {agreeError}
+          <p id={`${agreeId}-err`} role="alert" className="flex items-start gap-2 text-[14px] leading-snug text-ink">
+            <span aria-hidden="true" className="mt-[5px] h-2 w-2 shrink-0 rounded-full bg-danger" />
+            <span className="min-w-0">{agreeError}</span>
           </p>
         )}
       </div>
 
-      {formError && (
-        <p role="alert" className="rounded-2xl border border-danger/50 bg-danger/10 px-4 py-3 text-[15px] text-ink">
-          {formError}
-        </p>
-      )}
+      {formError && <ErrorNote>{formError}</ErrorNote>}
 
       <Button type="submit" block loading={submitting}>
         I agree, let's begin

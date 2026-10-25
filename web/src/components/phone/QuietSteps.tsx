@@ -1,14 +1,14 @@
 // The calm screens: waiting for the partner, "phones face down" during the conversation, and "gone".
 import { Link } from "react-router-dom";
-import { BreathingCrumb } from "../ui/Crumbs";
+import { OrbFigure } from "../ui/Crumbs";
 import { waitingLine } from "./flow";
 import { StepHeading } from "./PhoneScreen";
 
 export function WaitingStep({ partner, partnerReady }: { partner: string | null; partnerReady: boolean }) {
   return (
     <section aria-labelledby="step-title" className="flex flex-1 flex-col items-center justify-center text-center">
-      <BreathingCrumb size={150} />
-      <div className="mt-8" aria-live="polite">
+      <OrbFigure size={200} mode={partnerReady ? "warming" : "idle"} />
+      <div className="mt-10" aria-live="polite">
         <StepHeading
           id="step-title"
           title={waitingLine(partner, partnerReady)}
@@ -22,8 +22,8 @@ export function WaitingStep({ partner, partnerReady }: { partner: string | null;
 export function LiveStep({ partner, calibrating }: { partner: string | null; calibrating: boolean }) {
   return (
     <section aria-labelledby="step-title" className="flex flex-1 flex-col items-center justify-center text-center">
-      <BreathingCrumb size={190} />
-      <div className="mt-8">
+      <OrbFigure size={240} mode="listening" />
+      <div className="mt-10">
         <StepHeading
           id="step-title"
           title="You're all set."
@@ -40,7 +40,10 @@ export function LiveStep({ partner, calibrating }: { partner: string | null; cal
             </>
           }
         />
-        <p className="text-[15px] leading-relaxed text-ink-muted" aria-live="polite">
+        <p
+          className="mx-auto -mt-2 inline-flex max-w-sm rounded-2xl bg-bg-raised px-4 py-3 text-[15px] leading-relaxed text-ink-muted shadow-pill"
+          aria-live="polite"
+        >
           {calibrating
             ? "First, the Table will ask you each to say hi, so it can tell your voices apart."
             : "Everything happens on the Table now. This page will wake up when you're done."}
@@ -54,10 +57,8 @@ export function GoneStep({ reason }: { reason: "gone" | "bad_link" }) {
   const badLink = reason === "bad_link";
   return (
     <section aria-labelledby="step-title" className="flex flex-1 flex-col items-center justify-center text-center">
-      <div className="opacity-60">
-        <BreathingCrumb size={110} />
-      </div>
-      <div className="mt-6">
+      <OrbFigure size={150} mode="paused" palette="sage" still />
+      <div className="mt-10">
         <StepHeading
           id="step-title"
           title={badLink ? "This link doesn't look right" : "This table has been cleared"}
@@ -70,7 +71,7 @@ export function GoneStep({ reason }: { reason: "gone" | "bad_link" }) {
       </div>
       <Link
         to="/"
-        className="inline-flex min-h-12 items-center rounded-2xl border border-line bg-bg-raised px-5 text-[16px] font-semibold text-ink hover:border-ink-faint"
+        className="inline-flex min-h-[54px] items-center rounded-full bg-bg-raised px-7 text-[17px] font-medium text-ink shadow-pill transition-colors hover:bg-bg"
       >
         Go to Breadcrumbs
       </Link>

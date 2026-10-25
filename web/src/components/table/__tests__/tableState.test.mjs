@@ -2,7 +2,7 @@
 //   node --import ./src/components/table/__tests__/register.mjs --test src/components/table/__tests__/
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { initialState, isSpeaking, tableReducer, visibleCrumb } from "../tableState.ts";
+import { initialState, isSpeaking, recapCrumb, tableReducer, visibleCrumb } from "../tableState.ts";
 
 const server = (state, event, at = 1000) => tableReducer(state, { type: "server", event, at });
 
@@ -138,16 +138,106 @@ describe("caption selection", () => {
     ...extra,
   });
 
-  it("shows the crumb while it is spoken and lingers after", () => {
+  it("shows the crumb in full the moment it arrives, while it plays, and for a reading time after", () => {
     assert.equal(visibleCrumb([], 0), null);
-    assert.ok(visibleCrumb([record("playing")], 60_000));
-    assert.ok(visibleCrumb([record("done", { endedAt: 10_000 })], 20_000));
-    assert.equal(visibleCrumb([record("done", { endedAt: 10_000 })], 30_000), null);
+    // no waiting for the chime or the first word: the whole line is up on arrival
+    assert.ok(visibleCrumb([record("pending")], 0));
+    assert.ok(visibleCrumb([record("playing", { startedAt: 500 })], 60_000));
+    // one word: 4 s of reading time after the voice ends
+    const done = [record("done", { startedAt: 500, endedAt: 10_000 })];
+    assert.ok(visibleCrumb(done, 13_900));
+    assert.equal(visibleCrumb(done, 14_100), null);
   });
 
-  it("clears interrupted crumbs sooner", () => {
-    assert.ok(visibleCrumb([record("interrupted", { endedAt: 10_000 })], 12_000));
-    assert.equal(visibleCrumb([record("interrupted", { endedAt: 10_000 })], 15_000), null);
+  it("then shrinks into a small last-crumb line, then leaves the orb alone", () => {
+    const done = [record("done", { startedAt: 500, endedAt: 10_000 })];
+    assert.equal(recapCrumb(done, 13_900), null);
+    assert.ok(recapCrumb(done, 14_100));
+    assert.ok(recapCrumb(done, 43_900));
+    assert.equal(recapCrumb(done, 44_100), null);
+    assert.equal(visibleCrumb(done, 44_100), null);
+  });
+
+  it("keeps an interrupted crumb readable for its full reading time", () => {
+    const ten = "one two three four five six seven eight nine ten";
+    const cut = [record("interrupted", { text: ten, startedAt: 500, endedAt: 1_000 })];
+    // 10 words: 0.35 s per word + 2 s = 5.5 s after the cut, never yanked away at once
+    assert.ok(visibleCrumb(cut, 6_400));
+    assert.equal(visibleCrumb(cut, 6_600), null);
+  });
+
+  it("never shows a caption for less than 6 s in total", () => {
+    const quick = [record("done", { startedAt: 100, endedAt: 600 })];
+    assert.ok(visibleCrumb(quick, 5_900));
+    assert.equal(visibleCrumb(quick, 6_100), null);
+  });
+
+  it("a crumb whose audio never starts still gets its reading time", () => {
+    const stuck = [record("pending")];
+    assert.ok(visibleCrumb(stuck, 7_900)); // still waiting for playback
+    // 3 s of expected speech + 4 s reading = 7 s, but the 8 s wait for playback wins
+    assert.ok(visibleCrumb(stuck, 6_500));
+    assert.equal(visibleCrumb(stuck, 8_100), null);
+    assert.ok(recapCrumb(stuck, 8_100));
+  });
+
+  it("Skip removes the crumb at once, with no lingering caption and no recap", () => {
+    let s = server(initialState, crumbEvent("c_1"), 0);
+    s = tableReducer(s, { type: "line_started", id: "c_1", at: 500 });
+    s = tableReducer(s, { type: "line_skipped", id: "c_1", at: 900 });
+    assert.equal(s.crumbs[0].status, "interrupted");
+    assert.equal(s.crumbs[0].endedAt, 900);
+    assert.equal(s.crumbs[0].skippedAt, 900);
+    assert.equal(isSpeaking(s.crumbs[0], 900), false);
+    assert.ok(visibleCrumb(s.crumbs, 899));
+    assert.equal(visibleCrumb(s.crumbs, 900), null);
+    assert.equal(recapCrumb(s.crumbs, 900), null);
+    assert.equal(recapCrumb(s.crumbs, 20_000), null);
+    // playback then reports the faded line as interrupted: it stays skipped
+    s = tableReducer(s, { type: "line_ended", id: "c_1", at: 1_100, interrupted: true });
+    assert.equal(s.crumbs[0].skippedAt, 900);
+    assert.equal(visibleCrumb(s.crumbs, 1_100), null);
+    assert.equal(recapCrumb(s.crumbs, 1_100), null);
+  });
+
+  it("Skip on a crumb still in its chime, or on one that already finished", () => {
+    let s = server(initialState, crumbEvent("c_1"), 0);
+    s = tableReducer(s, { type: "line_skipped", id: "c_1", at: 300 });
+    assert.equal(s.crumbs[0].status, "interrupted");
+    assert.equal(visibleCrumb(s.crumbs, 300), null);
+
+    let d = server(initialState, crumbEvent("c_2"), 0);
+    d = tableReducer(d, { type: "line_started", id: "c_2", at: 200 });
+    d = tableReducer(d, { type: "line_ended", id: "c_2", at: 3_000, interrupted: false });
+    assert.ok(visibleCrumb(d.crumbs, 4_000)); // lingering for its reading time
+    d = tableReducer(d, { type: "line_skipped", id: "c_2", at: 4_000 });
+    assert.equal(d.crumbs[0].status, "done"); // a finished crumb is never rewritten
+    assert.equal(d.crumbs[0].endedAt, 3_000);
+    assert.equal(visibleCrumb(d.crumbs, 4_000), null);
+    assert.equal(recapCrumb(d.crumbs, 4_000), null);
+  });
+
+  it("a barge-in or server interruption is not a skip and keeps its reading time", () => {
+    let s = server(initialState, crumbEvent("c_1"), 0);
+    s = tableReducer(s, { type: "line_started", id: "c_1", at: 500 });
+    s = server(s, { type: "crumb_interrupted", crumb_id: "c_1" }, 900);
+    assert.equal(s.crumbs[0].skippedAt, null);
+    assert.ok(visibleCrumb(s.crumbs, 4_000));
+    // skipping an unknown id or a second time changes nothing
+    const again = tableReducer(tableReducer(s, { type: "line_skipped", id: "c_1", at: 5_000 }), {
+      type: "line_skipped",
+      id: "c_1",
+      at: 6_000,
+    });
+    assert.equal(again.crumbs[0].skippedAt, 5_000);
+    assert.equal(tableReducer(s, { type: "line_skipped", id: "nope", at: 5_000 }).crumbs[0].skippedAt, null);
+  });
+
+  it("Skip also clears a spoken calibration prompt", () => {
+    let s = server(initialState, { type: "system_say", id: "sys_1", text: "Say hi", audio_b64: "" }, 0);
+    assert.equal(s.systemLine.skippedAt, null);
+    s = tableReducer(s, { type: "line_skipped", id: "sys_1", at: 400 });
+    assert.equal(s.systemLine.skippedAt, 400);
   });
 
   it("stops treating a crumb that never started as speaking", () => {

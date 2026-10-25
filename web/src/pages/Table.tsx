@@ -18,7 +18,7 @@ import { seatNames } from "../components/table/format";
 import { useShortcuts } from "../components/table/hooks";
 import LiveStage from "../components/table/LiveStage";
 import Lobby from "../components/table/Lobby";
-import { Backdrop } from "../components/table/primitives";
+import { Backdrop, TableButton } from "../components/table/primitives";
 import TopBar from "../components/table/TopBar";
 import { useTable } from "../lib/useTable";
 
@@ -65,10 +65,10 @@ export default function Table() {
   const showDrawer = xrayOpen && xrayAvailable;
 
   return (
-    <div className="relative flex min-h-dvh flex-col overflow-hidden">
+    <div className="relative flex min-h-dvh flex-col overflow-x-clip bg-bg text-ink">
       <Backdrop />
       <div
-        className={`flex min-h-dvh flex-1 flex-col transition-[padding] duration-300 ease-out ${showDrawer ? "xl:pr-[440px]" : ""}`}
+        className={`flex min-h-dvh flex-1 flex-col transition-[padding] duration-300 ease-out ${showDrawer ? "xl:pr-[464px]" : ""}`}
       >
         <TopBar
           mode={view.session?.mode ?? null}
@@ -80,12 +80,13 @@ export default function Table() {
           roundRemainingS={live ? (view.engine?.round_remaining_s ?? null) : null}
           mock={Boolean(view.session?.mock.muse)}
           showConnection={view.load !== "not_found" && !view.wiped}
+          muse={view.muse}
         />
 
         <main className="flex flex-1 flex-col">{body}</main>
 
         {live && (
-          <footer className="relative z-10 flex flex-col gap-3 px-6 pb-6 sm:px-8">
+          <footer className="relative z-10 mx-auto flex w-full max-w-[1460px] flex-col gap-4 px-4 pb-6 sm:px-8 sm:pb-8">
             <div className="flex justify-center">
               <CrumbTrail crumbs={view.crumbs} />
             </div>
@@ -105,16 +106,17 @@ export default function Table() {
         )}
 
         {phase === "calibrating" && !view.wiped && (
-          <footer className="flex justify-end px-6 pb-5 sm:px-8">
-            <button
-              type="button"
+          <footer className="mx-auto flex w-full max-w-[1460px] justify-end px-4 pb-6 sm:px-8">
+            <TableButton
+              size="sm"
+              icon="xray"
+              shortcut="X"
               onClick={toggleXray}
               aria-pressed={showDrawer}
               aria-controls="xray-drawer"
-              className="min-h-9 cursor-pointer rounded-lg px-3 text-xs text-ink-faint transition-colors hover:bg-bg-raised/60 hover:text-ink"
             >
-              X-ray (X)
-            </button>
+              X-ray
+            </TableButton>
           </footer>
         )}
       </div>
@@ -124,7 +126,10 @@ export default function Table() {
       </AnimatePresence>
 
       {view.serverError && live && (
-        <p role="alert" className="pointer-events-none fixed left-1/2 top-16 z-30 -translate-x-1/2 rounded-full bg-bg-raised px-4 py-1.5 text-xs text-ink-muted">
+        <p
+          role="alert"
+          className="pointer-events-none fixed left-1/2 top-20 z-30 max-w-[92vw] -translate-x-1/2 rounded-full border border-line bg-bg-raised px-4 py-2 text-[13px] text-ink shadow-card"
+        >
           {view.serverError}
         </p>
       )}

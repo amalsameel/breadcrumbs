@@ -264,7 +264,7 @@ function LoadingOrError({ error, onRetry }: { error: string | null; onRetry: () 
   if (!error) {
     return (
       <div className="flex flex-1 items-center justify-center">
-        <Spinner size={32} label="Finding your table" className="text-amber" />
+        <Spinner size={32} label="Finding your table" className="text-ink" />
       </div>
     );
   }

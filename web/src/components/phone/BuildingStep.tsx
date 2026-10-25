@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { Profile, Seat } from "../../lib/types";
 import { Button } from "../ui/Button";
-import { BreathingCrumb } from "../ui/Crumbs";
+import { OrbFigure } from "../ui/Crumbs";
 import { StepHeading } from "./PhoneScreen";
 
 const inflight = new Map<string, Promise<Profile>>();
@@ -45,8 +45,8 @@ export function BuildingStep({ sid, seat, onBuilt, describeError }: BuildingStep
 
   return (
     <section aria-labelledby="step-title" className="flex flex-1 flex-col items-center justify-center text-center">
-      <BreathingCrumb size={140} />
-      <div className="mt-6 w-full">
+      <OrbFigure size={200} mode={error ? "paused" : "warming"} />
+      <div className="mt-10 w-full">
         <StepHeading
           id="step-title"
           title={error ? "That didn't work" : "Gathering your crumbs..."}

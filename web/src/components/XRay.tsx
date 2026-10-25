@@ -5,7 +5,7 @@ import type { EngineSnapshot, Seat } from "../lib/types";
 import type { TableActions, TableView } from "../lib/useTable";
 import Sparkline from "./Sparkline";
 import { Icon } from "./table/Icon";
-import { fmt, sourceCaption, staleThreshold } from "./table/format";
+import { fmt, noiseSuspected, sourceCaption, staleThreshold } from "./table/format";
 import { TuningPanel } from "./table/TuningPanel";
 import { DevTurnBox } from "./table/DevTurnBox";
 
@@ -22,23 +22,23 @@ export default function XRay({ view, actions, names, onClose }: XRayProps) {
     <motion.aside
       id="xray-drawer"
       aria-label="X-ray: how Breadcrumbs is thinking"
-      className="fixed inset-y-0 right-0 z-40 flex w-[min(440px,100vw)] flex-col border-l border-line bg-bg-sunken/95 font-mono text-[12px] text-ink-muted shadow-[-24px_0_60px_-30px_rgba(0,0,0,0.9)] backdrop-blur-md"
-      initial={{ x: "100%" }}
+      className="fixed inset-y-0 right-0 z-40 flex w-[min(440px,100vw)] flex-col overflow-hidden border-l border-line bg-bg-raised font-mono text-[12px] text-ink-muted shadow-drawer sm:inset-y-3 sm:right-3 sm:rounded-[24px] sm:border"
+      initial={{ x: "105%" }}
       animate={{ x: 0 }}
-      exit={{ x: "100%" }}
+      exit={{ x: "105%" }}
       transition={{ type: "tween", duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
     >
-      <header className="flex items-center justify-between border-b border-line px-5 py-3">
+      <header className="flex items-center justify-between border-b border-line px-5 py-3.5">
         <div className="flex items-center gap-2 text-ink">
           <Icon name="xray" size={16} />
-          <h2 className="text-[13px] font-medium uppercase tracking-[0.2em]">X-ray</h2>
+          <h2 className="font-sans text-[15px] font-semibold tracking-[-0.01em]">X-ray</h2>
         </div>
         <div className="flex items-center gap-3">
           <MuseBadge view={view} />
           <button
             type="button"
             onClick={onClose}
-            className="grid size-9 cursor-pointer place-items-center rounded-lg text-ink-muted transition-colors hover:bg-bg-raised hover:text-ink"
+            className="grid size-10 cursor-pointer place-items-center rounded-full border border-line bg-bg-raised text-ink-muted transition-colors hover:border-line-strong hover:text-ink"
             aria-label="Close X-ray"
           >
             <Icon name="close" size={18} />
@@ -46,7 +46,7 @@ export default function XRay({ view, actions, names, onClose }: XRayProps) {
         </div>
       </header>
 
-      <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
+      <div className="flex-1 divide-y divide-line overflow-y-auto px-5 [&>*]:py-4">
         {engine ? (
           <>
             <PauseSection engine={engine} history={view.history.map((p) => p.silence)} />
@@ -59,7 +59,7 @@ export default function XRay({ view, actions, names, onClose }: XRayProps) {
             <LastCrumbSection view={view} names={names} />
           </>
         ) : (
-          <p className="text-ink-faint">Waiting for the engine. It starts once both seats are ready.</p>
+          <p className="text-ink-muted">Waiting for the engine. It starts once both seats are ready.</p>
         )}
         <TranscriptSection view={view} names={names} />
         <DecisionSection view={view} />
@@ -84,7 +84,7 @@ function Section({ title, aside, children }: { title: string; aside?: ReactNode;
   return (
     <section className="space-y-2">
       <div className="flex items-baseline justify-between">
-        <h3 className="text-[11px] font-medium uppercase tracking-[0.18em] text-ink-faint">{title}</h3>
+        <h3 className="font-mono text-[11px] font-medium uppercase tracking-[0.16em] text-ink-muted">{title}</h3>
         {aside}
       </div>
       {children}
@@ -95,7 +95,7 @@ function Section({ title, aside, children }: { title: string; aside?: ReactNode;
 function Row({ k, children }: { k: string; children: ReactNode }) {
   return (
     <div className="flex items-baseline justify-between gap-4 py-0.5">
-      <dt className="shrink-0 text-ink-faint">{k}</dt>
+      <dt className="shrink-0 text-ink-muted">{k}</dt>
       <dd className="min-w-0 truncate text-right text-ink">{children}</dd>
     </div>
   );
@@ -105,7 +105,10 @@ function MuseBadge({ view }: { view: TableView }) {
   const status = view.muse?.status ?? (view.session?.mock.muse ? "mock" : "connecting");
   const ok = status === "connected" || status === "mock";
   return (
-    <span className="flex items-center gap-1.5 text-[11px] text-ink-faint" title={view.muse?.detail ?? undefined}>
+    <span
+      className="inline-flex min-h-7 items-center gap-1.5 rounded-full border border-line px-2.5 text-[11px] text-ink-muted"
+      title={view.muse?.detail ?? undefined}
+    >
       <span className={`size-1.5 rounded-full ${ok ? "bg-ok" : status === "error" ? "bg-danger" : "bg-amber"}`} aria-hidden="true" />
       Muse: {status}
     </span>
@@ -113,9 +116,9 @@ function MuseBadge({ view }: { view: TableView }) {
 }
 
 const BAND_COLOR: Record<EngineSnapshot["band"], string> = {
-  normal: "var(--color-ink-faint)",
-  warming: "var(--color-amber)",
-  long: "var(--color-crumb)",
+  normal: "var(--color-ink-muted)",
+  warming: "var(--color-crumb)",
+  long: "var(--color-amber)",
   exceptional: "var(--color-danger)",
 };
 
@@ -136,8 +139,14 @@ function PauseSection({ engine, history }: { engine: EngineSnapshot; history: nu
         </span>
       }
     >
+      {noiseSuspected(engine) && (
+        <p className="inline-flex min-h-7 items-center gap-1.5 rounded-full bg-well px-2.5 text-[11px] text-ink" role="status">
+          <span className="size-1.5 rounded-full bg-paused" aria-hidden="true" />
+          Background noise ignored
+        </p>
+      )}
       <div
-        className="relative h-3 rounded-full bg-bg-raised"
+        className="relative h-3 rounded-full bg-bg-sunken"
         role="meter"
         aria-label="Silence against thresholds"
         aria-valuemin={0}
@@ -153,7 +162,7 @@ function PauseSection({ engine, history }: { engine: EngineSnapshot; history: nu
           <div key={m.label} className="absolute -inset-y-1 w-px bg-ink/70" style={{ left: pct(m.v) }} aria-hidden="true" />
         ))}
       </div>
-      <div className="relative h-4 text-[10px] text-ink-faint" aria-hidden="true">
+      <div className="relative h-4 text-[10px] text-ink-muted" aria-hidden="true">
         {markers.map((m) => (
           <span key={m.label} className="absolute -translate-x-1/2 whitespace-nowrap" style={{ left: pct(m.v) }}>
             {m.label} {fmt(m.v)}
@@ -165,9 +174,10 @@ function PauseSection({ engine, history }: { engine: EngineSnapshot; history: nu
         min={0}
         max={engine.t_exc * 1.2}
         thresholds={[
-          { value: engine.t_long, label: "t_long", color: "var(--color-crumb)" },
+          { value: engine.t_long, label: "t_long", color: "var(--color-amber)" },
           { value: engine.t_exc, label: "t_exc", color: "var(--color-danger)" },
         ]}
+        color="var(--color-ink)"
         label="Silence over the last 60 seconds"
       />
     </Section>
@@ -196,7 +206,7 @@ function StalenessSection({
     <Section
       title="Staleness"
       aside={
-        <span className={engine.stale ? "text-crumb" : "text-ink"}>
+        <span className={engine.stale ? "text-amber-ink" : "text-ink"}>
           <span className="text-lg tabular-nums">{fmt(engine.staleness, 2)}</span> {engine.stale ? "· stale" : "· lively"}
         </span>
       }
@@ -204,14 +214,14 @@ function StalenessSection({
       <div className="grid grid-cols-5 gap-2">
         {parts.map(([key, value]) => (
           <div key={key} className="flex flex-col items-center gap-1" title={PART_LABEL[key]}>
-            <div className="relative h-12 w-4 overflow-hidden rounded-md bg-bg-raised" aria-hidden="true">
+            <div className="relative h-12 w-4 overflow-hidden rounded-md bg-bg-sunken" aria-hidden="true">
               <div
                 className="absolute inset-x-0 bottom-0 rounded-md bg-amber transition-[height] duration-300"
                 style={{ height: `${Math.min(1, Math.max(0, value)) * 100}%` }}
               />
             </div>
             <span className="text-ink">{key}</span>
-            <span className="tabular-nums text-[10px] text-ink-faint">{fmt(value, 2)}</span>
+            <span className="tabular-nums text-[10px] text-ink-muted">{fmt(value, 2)}</span>
             <span className="sr-only">{`${PART_LABEL[key]} ${value.toFixed(2)}`}</span>
           </div>
         ))}
@@ -220,8 +230,8 @@ function StalenessSection({
         values={history}
         min={0}
         max={1}
-        thresholds={[{ value: staleSwitch, label: "stale", color: "var(--color-crumb)" }]}
-        color="var(--color-crumb)"
+        thresholds={[{ value: staleSwitch, label: "stale", color: "var(--color-ink-muted)" }]}
+        color="var(--color-amber)"
         label="Staleness over the last 60 seconds"
       />
     </Section>
@@ -245,6 +255,7 @@ function StateSection({ engine }: { engine: EngineSnapshot }) {
         <Row k="signals">
           {[engine.turn_active && "turn", engine.vad_active && "vad", engine.tts_playing && "tts"].filter(Boolean).join(" ") || "quiet"}
         </Row>
+        <Row k="background noise">{noiseSuspected(engine) ? "ignored (steady noise)" : "clear"}</Row>
         <Row k="flags">
           {[engine.listening_paused && "paused", engine.auto_paused && "safety", engine.quiet_hint && "quiet_hint"]
             .filter(Boolean)
@@ -261,9 +272,9 @@ function StateSection({ engine }: { engine: EngineSnapshot }) {
 
 function Cached({ label, text }: { label: string; text: string | null }) {
   return (
-    <div className="rounded-lg border border-line/70 px-3 py-2">
-      <div className="text-[10px] uppercase tracking-[0.18em] text-ink-faint">cached {label}</div>
-      <p className="mt-0.5 font-sans text-[13px] leading-snug text-ink">{text ?? <span className="text-ink-faint">none yet</span>}</p>
+    <div className="rounded-xl border border-line px-3 py-2">
+      <div className="text-[10px] uppercase tracking-[0.16em] text-ink-muted">cached {label}</div>
+      <p className="mt-0.5 font-sans text-[13px] leading-snug text-ink">{text ?? <span className="text-ink-muted">none yet</span>}</p>
     </div>
   );
 }
@@ -273,10 +284,10 @@ function LastCrumbSection({ view, names }: { view: TableView; names: Record<Seat
   if (!last) return null;
   const c = last.crumb;
   return (
-    <Section title="Last crumb" aside={<span className="text-ink-faint">{c.id}</span>}>
+    <Section title="Last crumb" aside={<span className="text-ink-muted">{c.id}</span>}>
       <p className="font-sans text-[13px] leading-snug text-ink">{c.text}</p>
-      <p className="rounded-lg bg-bg-raised/70 px-3 py-2 font-sans text-[13px] leading-snug text-ink-muted">
-        <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-ink-faint">why </span>
+      <p className="rounded-xl bg-well px-3 py-2 font-sans text-[13px] leading-snug text-ink-muted">
+        <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-muted">why </span>
         {c.why}
       </p>
       <dl>
@@ -310,12 +321,12 @@ function TranscriptSection({ view, names }: { view: TableView; names: Record<Sea
   const partialSeat = partial?.label ? (view.labelMap[partial.label] ?? null) : null;
 
   return (
-    <Section title="Transcript" aside={<span className="text-ink-faint">{view.turns.length} turns</span>}>
-      <div ref={boxRef} className="max-h-64 space-y-1.5 overflow-y-auto rounded-lg border border-line/70 p-3" aria-live="off">
-        {turns.length === 0 && !partial && <p className="text-ink-faint">No turns yet.</p>}
+    <Section title="Transcript" aside={<span className="text-ink-muted">{view.turns.length} turns</span>}>
+      <div ref={boxRef} className="max-h-64 space-y-1.5 overflow-y-auto rounded-xl border border-line bg-bg p-3" aria-live="off">
+        {turns.length === 0 && !partial && <p className="text-ink-muted">No turns yet.</p>}
         {turns.map((t) => (
-          <p key={t.turn_id} className={t.dropped_as_bot ? "text-ink-faint/60 line-through decoration-ink-faint/40" : ""}>
-            <span className={t.dropped_as_bot ? "" : "text-amber"}>{who(t.seat, t.label)}</span>{" "}
+          <p key={t.turn_id} className={t.dropped_as_bot ? "text-ink-muted/70 line-through decoration-ink-muted/40" : ""}>
+            <span className={t.dropped_as_bot ? "" : "font-medium text-amber-ink"}>{who(t.seat, t.label)}</span>{" "}
             <span className={`font-sans text-[13px] ${t.dropped_as_bot ? "" : "text-ink"}`}>{t.text}</span>
             {t.dropped_as_bot && <Tag>bot</Tag>}
             {t.hold && <Tag>hold:{t.hold}</Tag>}
@@ -323,7 +334,7 @@ function TranscriptSection({ view, names }: { view: TableView; names: Record<Sea
           </p>
         ))}
         {partial && (
-          <p className="italic text-ink-faint">
+          <p className="italic text-ink-muted">
             {who(partialSeat, partial.label)} <span className="font-sans text-[13px]">{partial.text}</span>
           </p>
         )}
@@ -333,21 +344,21 @@ function TranscriptSection({ view, names }: { view: TableView; names: Record<Sea
 }
 
 function Tag({ children }: { children: ReactNode }) {
-  return <span className="ml-1.5 rounded border border-line px-1 text-[10px] not-italic text-ink-faint">{children}</span>;
+  return <span className="ml-1.5 rounded border border-line px-1 text-[10px] not-italic text-ink-muted">{children}</span>;
 }
 
 function DecisionSection({ view }: { view: TableView }) {
   const items = view.decisions.slice(0, 40);
   return (
-    <Section title="Decisions" aside={<span className="text-ink-faint">newest first</span>}>
+    <Section title="Decisions" aside={<span className="text-ink-muted">newest first</span>}>
       {items.length === 0 ? (
-        <p className="text-ink-faint">No decisions yet.</p>
+        <p className="text-ink-muted">No decisions yet.</p>
       ) : (
         <ol className="max-h-56 space-y-1 overflow-y-auto">
           {items.map((d, i) => (
             <li key={`${d.at_s}-${d.action}-${i}`} className="grid grid-cols-[52px_80px_1fr] gap-2">
-              <span className="tabular-nums text-ink-faint">+{fmt(d.at_s)}</span>
-              <span className="text-amber">{d.action}</span>
+              <span className="tabular-nums text-ink-muted">+{fmt(d.at_s)}</span>
+              <span className="font-medium text-amber-ink">{d.action}</span>
               <span className="font-sans text-[12px] text-ink-muted">{d.reason}</span>
             </li>
           ))}
@@ -362,7 +373,7 @@ function LabelMapSection({ labelMap, names }: { labelMap: Record<string, Seat>; 
   return (
     <Section title="Voice labels">
       {entries.length === 0 ? (
-        <p className="text-ink-faint">Not calibrated yet.</p>
+        <p className="text-ink-muted">Not calibrated yet.</p>
       ) : (
         <dl>
           {entries.map(([label, seat]) => (

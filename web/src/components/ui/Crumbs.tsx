@@ -1,54 +1,78 @@
-import { motion, useReducedMotion } from "framer-motion";
+// Small brand primitives: the tiny orb dot (wordmark, tabs, list bullets), the step indicator and a
+// sized orb figure for the calm phone screens. Color lives only inside the orbs; everything else is ink.
+import type { CSSProperties } from "react";
+import CrumbOrb from "../CrumbOrb";
+import type { OrbPalette } from "../CrumbOrb";
+import type { OrbMode } from "../table/format";
+import { PALETTES } from "../table/orbLook";
 
-/** Brand mark: three crumbs on a little winding trail. Decorative. */
-export function CrumbMark({ size = 28, className = "" }: { size?: number; className?: string }) {
+/** CSS background for a static gradient sphere with a soft white glint near the upper left. */
+export function orbDotBackground(palette: OrbPalette): string {
+  const c = PALETTES[palette]; // same colors as the Crumb Orb
+  return [
+    "radial-gradient(circle at 32% 26%, rgba(255,255,255,0.98) 0%, rgba(255,255,255,0.75) 9%, rgba(255,255,255,0) 30%)",
+    `radial-gradient(circle at 76% 80%, ${c.rim} 0%, transparent 48%)`,
+    `radial-gradient(circle at 30% 74%, ${c.deep} 0%, transparent 62%)`,
+    `radial-gradient(circle at 62% 34%, ${c.main} 0%, transparent 72%)`,
+    c.soft,
+  ].join(", ");
+}
+
+interface OrbDotProps {
+  palette?: OrbPalette;
+  size?: number;
+  className?: string;
+  style?: CSSProperties;
+}
+
+/** A tiny static orb (12 to 28 px). Decorative. */
+export function OrbDot({ palette = "ember", size = 14, className = "", style }: OrbDotProps) {
   return (
-    <svg aria-hidden="true" width={size} height={size} viewBox="0 0 32 32" className={className}>
-      <path
-        d="M4 26c5-1 6-6 11-7s7-6 13-8"
-        fill="none"
-        stroke="currentColor"
-        strokeOpacity="0.28"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeDasharray="0.5 4"
-      />
-      <circle cx="6" cy="25" r="2.2" fill="#F5A524" />
-      <circle cx="15.5" cy="18.8" r="2.8" fill="#FFD27A" />
-      <circle cx="26" cy="11.5" r="3.4" fill="#FFD27A" />
-    </svg>
+    <span
+      aria-hidden="true"
+      className={`inline-block shrink-0 rounded-full ${className}`}
+      style={{
+        width: size,
+        height: size,
+        background: orbDotBackground(palette),
+        boxShadow: "inset 0 -1px 2px rgb(12 11 10 / 0.18), 0 1px 2px rgb(12 11 10 / 0.08)",
+        ...style,
+      }}
+    />
   );
 }
 
-/** A single softly glowing crumb that breathes slowly (about 0.2 Hz, matching the Table orb). */
-export function BreathingCrumb({ size = 120, tone = "amber" }: { size?: number; tone?: "amber" | "hold" }) {
-  const reduce = useReducedMotion();
-  const color = tone === "hold" ? "#5B8DEF" : "#F5A524";
-  const core = tone === "hold" ? "#A9C3F7" : "#FFD27A";
+/** Wordmark: a tiny ember orb and the name. */
+export function Wordmark({ size = "md" }: { size?: "md" | "lg" }) {
+  const lg = size === "lg";
   return (
-    <div aria-hidden="true" className="relative grid place-items-center" style={{ width: size, height: size }}>
-      <motion.div
-        className="absolute inset-0 rounded-full"
-        style={{ background: `radial-gradient(circle, ${color}55 0%, ${color}00 70%)` }}
-        animate={reduce ? undefined : { scale: [0.85, 1.12, 0.85], opacity: [0.55, 1, 0.55] }}
-        transition={{ duration: 5, repeat: Infinity, ease: "easeInOut" }}
-      />
-      <motion.div
-        className="rounded-full"
-        style={{
-          width: size * 0.26,
-          height: size * 0.26,
-          background: `radial-gradient(circle at 35% 35%, #FFF6E0 0%, ${core} 45%, ${color} 100%)`,
-          boxShadow: `0 0 ${size * 0.25}px ${color}`,
-        }}
-        animate={reduce ? undefined : { scale: [1, 1.08, 1] }}
-        transition={{ duration: 5, repeat: Infinity, ease: "easeInOut" }}
-      />
+    <span className="inline-flex items-center gap-2">
+      <OrbDot size={lg ? 22 : 18} />
+      <span className={`font-display font-semibold tracking-[-0.03em] text-ink ${lg ? "text-[22px]" : "text-[19px]"}`}>
+        Breadcrumbs
+      </span>
+    </span>
+  );
+}
+
+interface OrbFigureProps {
+  size: number;
+  mode?: OrbMode;
+  palette?: OrbPalette;
+  still?: boolean;
+  className?: string;
+}
+
+/** A Crumb Orb in a fixed square box, for the calm phone screens. Decorative. */
+export function OrbFigure({ size, mode = "listening", palette, still, className = "" }: OrbFigureProps) {
+  return (
+    <div aria-hidden="true" className={`relative shrink-0 ${className}`} style={{ width: size, height: size }}>
+      <CrumbOrb mode={mode} palette={palette} still={still} />
     </div>
   );
 }
 
-/** Row of small crumbs used as a step indicator: filled for done, glowing for current. */
+/** Row of small marks used as a step indicator: filled for done, long for current. */
 export function CrumbSteps({ total, current, label }: { total: number; current: number; label: string }) {
   return (
     <div role="img" aria-label={label} className="flex items-center gap-1.5">
@@ -56,12 +80,8 @@ export function CrumbSteps({ total, current, label }: { total: number; current: 
         <span
           key={i}
           className={
-            "h-2 rounded-full transition-all duration-300 " +
-            (i < current
-              ? "w-2 bg-amber"
-              : i === current
-                ? "w-5 bg-crumb shadow-[0_0_10px_rgba(255,210,122,0.8)]"
-                : "w-2 bg-line")
+            "h-1.5 rounded-full transition-all duration-300 " +
+            (i < current ? "w-1.5 bg-ink" : i === current ? "w-5 bg-ink" : "w-1.5 bg-line-strong")
           }
         />
       ))}

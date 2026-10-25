@@ -62,7 +62,7 @@ export function TuningPanel({ params, onChange }: TuningPanelProps) {
           <div key={s.key} className="space-y-1">
             <label htmlFor={id} className="flex items-baseline justify-between">
               <span className="text-ink-muted">
-                {s.label} <span className="text-ink-faint">{s.key}</span>
+                {s.label} <span className="text-ink-muted/80">{s.key}</span>
               </span>
               <span className="tabular-nums text-ink">
                 {value.toFixed(s.step < 0.1 ? 2 : 1)}
@@ -77,14 +77,14 @@ export function TuningPanel({ params, onChange }: TuningPanelProps) {
               step={s.step}
               value={value}
               onChange={(e) => setSlider(s.key, Number(e.target.value))}
-              className="h-6 w-full cursor-pointer accent-amber"
+              className="h-6 w-full cursor-pointer accent-ink"
             />
           </div>
         );
       })}
       <label className="flex cursor-pointer items-center justify-between gap-3 py-1">
         <span className="text-ink-muted">
-          Wildcard drops <span className="text-ink-faint">WILDCARD_ENABLED</span>
+          Wildcard drops <span className="text-ink-muted/80">WILDCARD_ENABLED</span>
         </span>
         <span className="relative inline-flex items-center">
           <input
@@ -96,11 +96,11 @@ export function TuningPanel({ params, onChange }: TuningPanelProps) {
           />
           <span
             aria-hidden="true"
-            className="h-6 w-11 rounded-full border border-line bg-bg-raised transition-colors peer-checked:border-amber peer-checked:bg-amber/30 peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-crumb"
+            className="h-6 w-11 rounded-full border border-line bg-bg-sunken transition-colors peer-checked:border-ink peer-checked:bg-ink peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ink"
           />
           <span
             aria-hidden="true"
-            className="absolute left-1 size-4 rounded-full bg-ink-muted transition-transform peer-checked:translate-x-5 peer-checked:bg-amber"
+            className="absolute left-1 size-4 rounded-full bg-bg-raised shadow-pill transition-transform peer-checked:translate-x-5"
           />
           <span className="ml-2 w-6 text-ink">{wildcard ? "on" : "off"}</span>
         </span>

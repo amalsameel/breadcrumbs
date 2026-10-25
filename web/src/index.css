@@ -1,29 +1,51 @@
-@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
 @import "tailwindcss";
 
-/* Design tokens (PRD 14.3): warm, cozy, a little magical. Dark-only by design (a table at a night event). */
+/*
+ * Design tokens. Visual direction (user request, 2026-10-24): an ElevenLabs-style light, airy canvas
+ * adapted for Breadcrumbs: warm off-white surfaces, near-black ink, black/white pill buttons, large
+ * rounded containers, a clean grotesk, and a soft grainy gradient orb as the one splash of color.
+ * This replaces the PRD 14.3 dark palette; the orb keeps the amber family (listening), blue (holding)
+ * and gray (paused) so state colors still match the PRD, always paired with a text label.
+ */
 @theme {
-  --color-bg: #17120E;
-  --color-bg-raised: #221A14;
-  --color-bg-sunken: #100C09;
-  --color-line: #3A2E24;
-  --color-amber: #F5A524;
-  --color-crumb: #FFD27A;
-  --color-hold: #5B8DEF;
-  --color-paused: #6B6B6B;
-  --color-ink: #F6EFE6;
-  --color-ink-muted: #B9AC9D;
-  --color-ink-faint: #85786B;
-  --color-danger: #F07167;
-  --color-ok: #7BC67E;
+  /* Surfaces */
+  --color-bg: #F7F5F2; /* page canvas, warm off-white */
+  --color-bg-raised: #FFFFFF; /* cards, active pills, inputs */
+  --color-bg-sunken: #EFECE7; /* large container wells, segmented-control track */
+  --color-line: #E4E0DA; /* hairline borders */
+  --color-line-strong: #D3CEC6;
+  --color-well: #F3F1EE; /* big rounded showcase containers, a shade darker than the canvas */
 
-  --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  /* Ink */
+  --color-ink: #0C0B0A; /* headings, primary text, black pill buttons */
+  --color-ink-muted: #5F5A54; /* body copy, secondary labels */
+  --color-ink-faint: #9C958D; /* captions, disabled */
+  --color-on-ink: #FFFFFF; /* text on black buttons */
+
+  /* Orb + state accents (PRD state colors) */
+  --color-amber: #F07A2C; /* listening: warm orange, like the "narration" orb */
+  --color-crumb: #FFB86B; /* crumb highlight */
+  --color-hold: #6C8CF5; /* holding: periwinkle blue */
+  --color-paused: #9AA29C; /* paused: soft sage gray */
+  --color-danger: #D6453D;
+  --color-ok: #2F9E5B;
+  --color-amber-ink: #A4470F; /* amber for small text on light surfaces (4.5:1 on white and the canvas) */
+
+  --font-display: "Inter Tight", "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --radius-pill: 9999px;
+  --radius-card: 28px;
+  --shadow-pill: 0 1px 2px rgb(12 11 10 / 0.06), 0 0 0 1px rgb(12 11 10 / 0.06);
+  --shadow-card: 0 1px 2px rgb(12 11 10 / 0.04), 0 8px 24px -12px rgb(12 11 10 / 0.12);
+  --shadow-raised: 0 1px 2px rgb(12 11 10 / 0.06), 0 4px 14px -6px rgb(12 11 10 / 0.14); /* active segmented tab */
+  --shadow-drawer: 0 1px 2px rgb(12 11 10 / 0.05), 0 24px 64px -28px rgb(12 11 10 / 0.28);
 }
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 html,
@@ -39,10 +61,18 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.025em;
 }
 
 :focus-visible {
-  outline: 2px solid var(--color-crumb);
+  outline: 2px solid var(--color-ink);
   outline-offset: 3px;
 }
 
@@ -53,5 +83,32 @@ body {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* Crumb Orb (CSS path and the float of the hero orb). Reduced motion is handled by the rule above. */
+@keyframes orb-drift {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes orb-breathe {
+  0%,
+  100% {
+    transform: scale(calc(1 - var(--orb-breath, 0.02)));
+  }
+  50% {
+    transform: scale(calc(1 + var(--orb-breath, 0.02)));
+  }
+}
+
+@keyframes orb-float {
+  0%,
+  100% {
+    transform: translateY(-1.2%);
+  }
+  50% {
+    transform: translateY(1.2%);
   }
 }

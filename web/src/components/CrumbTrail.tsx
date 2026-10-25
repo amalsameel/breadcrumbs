@@ -1,8 +1,9 @@
-// The trail of crumbs (PRD 14.3): one small glowing dot per crumb along the bottom edge.
-// Tapping a dot shows that crumb's text; interrupted crumbs glow dimmer.
+// The trail of crumbs (PRD 14.3): one tiny orb per crumb along the bottom edge.
+// Tapping a dot shows that crumb's text; interrupted crumbs are drawn fainter and say so.
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useState } from "react";
 import type { CrumbRecord } from "../lib/useTable";
+import { OrbDot } from "./CrumbOrb";
 
 const MAX_DOTS = 24;
 const PEEK_MS = 9000;
@@ -33,14 +34,14 @@ export default function CrumbTrail({ crumbs }: { crumbs: CrumbRecord[] }) {
           <motion.div
             key={open.id}
             role="status"
-            className="absolute bottom-full mb-3 w-[min(440px,80vw)] rounded-2xl border border-line bg-bg-raised/95 px-4 py-3 text-center shadow-[0_12px_40px_-12px_rgba(0,0,0,0.7)] backdrop-blur"
+            className="absolute bottom-full z-20 mb-3 w-[min(440px,86vw)] rounded-[20px] border border-line bg-bg-raised px-5 py-4 text-center shadow-card"
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 4 }}
             transition={{ duration: 0.2 }}
           >
-            <p className="font-display text-lg leading-snug text-ink">{open.text}</p>
-            <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-ink-faint">
+            <p className="font-display text-[19px] leading-snug tracking-[-0.015em] text-ink">{open.text}</p>
+            <p className="mt-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">
               {open.crumb.kind}
               {open.status === "interrupted" ? " · interrupted" : ""}
             </p>
@@ -48,7 +49,7 @@ export default function CrumbTrail({ crumbs }: { crumbs: CrumbRecord[] }) {
         )}
       </AnimatePresence>
       <ol className="flex items-center gap-0.5">
-        {hidden > 0 && <li className="px-1 font-mono text-[11px] text-ink-faint">+{hidden}</li>}
+        {hidden > 0 && <li className="px-1 font-mono text-[12px] text-ink-muted">+{hidden}</li>}
         {shown.map((c, i) => {
           const dim = c.status === "interrupted";
           const isOpen = c.id === openId;
@@ -56,7 +57,7 @@ export default function CrumbTrail({ crumbs }: { crumbs: CrumbRecord[] }) {
             <li key={c.id}>
               <button
                 type="button"
-                className="group grid size-7 cursor-pointer place-items-center rounded-full"
+                className="group grid size-8 cursor-pointer place-items-center rounded-full"
                 aria-label={`Crumb ${hidden + i + 1}${dim ? ", interrupted" : ""}: show text`}
                 aria-pressed={isOpen}
                 onClick={(e) => {
@@ -64,18 +65,18 @@ export default function CrumbTrail({ crumbs }: { crumbs: CrumbRecord[] }) {
                   setOpenId(isOpen ? null : c.id);
                 }}
               >
-                <span className="block transition-transform duration-200 group-hover:scale-125">
+                <span
+                  className="block rounded-full transition-transform duration-200 group-hover:scale-125"
+                  style={{ outline: isOpen ? "1.5px solid var(--color-ink)" : "none", outlineOffset: 3 }}
+                >
                   <motion.span
-                    className="block size-2.5 rounded-full bg-crumb"
-                    style={{
-                      boxShadow: dim ? "none" : "0 0 10px 2px rgba(255,210,122,0.55)",
-                      outline: isOpen ? "1.5px solid var(--color-ink)" : "none",
-                      outlineOffset: 3,
-                    }}
+                    className="block"
                     initial={{ scale: 0, opacity: 0 }}
-                    animate={{ scale: 1, opacity: dim ? 0.35 : 1 }}
+                    animate={{ scale: 1, opacity: dim ? 0.4 : 1 }}
                     transition={{ type: "spring", stiffness: 260, damping: 18 }}
-                  />
+                  >
+                    <OrbDot palette="ember" className="block size-3" />
+                  </motion.span>
                 </span>
               </button>
             </li>

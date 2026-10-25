@@ -6,10 +6,10 @@ import type { Mode, Seat, TrailResponse } from "../../lib/types";
 import { TrailCard } from "../TrailCard";
 import { Button } from "../ui/Button";
 import { Card } from "../ui/Card";
-import { BreathingCrumb } from "../ui/Crumbs";
+import { OrbFigure } from "../ui/Crumbs";
 import { TextField } from "../ui/TextField";
 import { contactHref, optInCopy, trailForSeat } from "./flow";
-import { StepHeading } from "./PhoneScreen";
+import { ErrorNote, StepHeading } from "./PhoneScreen";
 
 // ---- Opt-in -------------------------------------------------------------------------
 
@@ -106,11 +106,7 @@ export function OptInStep({ mode, partner, onSubmit, describeError }: OptInStepP
         </form>
       )}
 
-      {error && (
-        <p role="alert" className="rounded-2xl border border-danger/50 bg-danger/10 px-4 py-3 text-[15px] text-ink">
-          {error}
-        </p>
-      )}
+      {error && <ErrorNote>{error}</ErrorNote>}
     </section>
   );
 }
@@ -158,8 +154,8 @@ export function TrailStep({ sid, seat, trail, trailReadyTick, wiped, onTrail, ch
   if (!trail) {
     return (
       <section aria-labelledby="step-title" className="flex flex-1 flex-col items-center justify-center text-center">
-        <BreathingCrumb size={140} />
-        <div className="mt-8" aria-live="polite">
+        <OrbFigure size={200} mode="warming" />
+        <div className="mt-10" aria-live="polite">
           <StepHeading id="step-title" title="Thanks! Gathering the trail..." lead="This only takes a moment." />
         </div>
       </section>
@@ -180,9 +176,9 @@ export function TrailStep({ sid, seat, trail, trailReadyTick, wiped, onTrail, ch
           <TrailCard items={mine} />
         </>
       ) : (
-        <div className="flex flex-col items-center pt-8 text-center">
-          <BreathingCrumb size={120} />
-          <div className="mt-6">
+        <div className="flex flex-col items-center pt-6 text-center">
+          <OrbFigure size={180} mode="idle" />
+          <div className="mt-10">
             <StepHeading
               id="step-title"
               title="Thanks for the conversation!"
@@ -212,7 +208,7 @@ function ContactCard({ name, contact }: { name: string | null; contact: string }
   }
 
   return (
-    <Card className="flex items-center justify-between gap-3">
+    <Card tone="glow" className="flex items-center justify-between gap-3">
       <div className="min-w-0">
         <p className="text-[14px] text-ink-muted">{name ? `${name} shared` : "Their contact"}</p>
         {href ? (
@@ -220,12 +216,12 @@ function ContactCard({ name, contact }: { name: string | null; contact: string }
             href={href}
             target="_blank"
             rel="noopener noreferrer"
-            className="block truncate text-[19px] font-semibold text-crumb underline decoration-amber/40 underline-offset-4"
+            className="block truncate text-[19px] font-medium text-ink underline decoration-line-strong underline-offset-4 hover:decoration-ink"
           >
             {contact}
           </a>
         ) : (
-          <p className="truncate text-[19px] font-semibold text-crumb select-all">{contact}</p>
+          <p className="truncate text-[19px] font-medium text-ink select-all">{contact}</p>
         )}
       </div>
       {canCopy && (
@@ -242,7 +238,7 @@ function ContactCard({ name, contact }: { name: string | null; contact: string }
 
 function DeletedNote({ wiped }: { wiped: boolean }) {
   return (
-    <p className="flex items-start gap-2 rounded-2xl bg-bg-sunken px-4 py-3 text-[15px] leading-relaxed text-ink-muted" aria-live="polite">
+    <p className="flex items-start gap-3 rounded-2xl border border-line bg-bg-sunken/60 px-4 py-3 text-[15px] leading-relaxed text-ink-muted" aria-live="polite">
       <span aria-hidden="true" className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-ok" />
       {wiped
         ? "This session has been deleted. The transcript and profiles are gone, and no audio was ever stored."

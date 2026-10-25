@@ -2,7 +2,7 @@
 // `TableState`. Kept free of I/O so it can be unit tested (see __tests__/tableState.test.mjs).
 import type { AppConfig, Crumb, Decision, EngineSnapshot, Seat, ServerEvent, SessionSummary, TurnEvent } from "../../lib/types";
 import type { SocketStatus } from "../../lib/ws";
-import { estimateSpeechS } from "./format";
+import { captionStage, estimateSpeechS, STUCK_PENDING_MS } from "./format";
 
 export type MicState =
   | { status: "idle" }
@@ -23,6 +23,8 @@ export interface SpokenLine {
   receivedAt: number;
   startedAt: number | null;
   endedAt: number | null;
+  /** When someone pressed Skip on it; a skipped line leaves at once (captionHideAt). */
+  skippedAt: number | null;
 }
 
 export interface CrumbRecord extends SpokenLine {
@@ -102,6 +104,8 @@ export type TableAction =
   | { type: "mic"; mic: MicState }
   | { type: "line_started"; id: string; at: number }
   | { type: "line_ended"; id: string; at: number; interrupted: boolean }
+  /** The user pressed Skip on this line (crumb or prompt): unlike a barge-in it leaves at once. */
+  | { type: "line_skipped"; id: string; at: number }
   | { type: "params_local"; changes: Record<string, unknown> }
   | { type: "ending"; value: boolean }
   | { type: "clear_error" }
@@ -117,6 +121,13 @@ function applyLinePatch(state: TableState, id: string, patch: Partial<SpokenLine
     crumbs: state.crumbs.map((c) => updateLine(c, id, patch)),
     systemLine: state.systemLine ? updateLine(state.systemLine, id, patch) : null,
   };
+}
+
+/** Skip: a line still pending or playing is cut; a finished one keeps its status and just leaves. */
+function skipLine<T extends SpokenLine>(line: T, id: string, at: number): T {
+  if (line.id !== id || line.skippedAt !== null) return line;
+  if (line.status === "done") return { ...line, skippedAt: at };
+  return { ...line, status: "interrupted", endedAt: line.endedAt ?? at, skippedAt: at };
 }
 
 function reduceServer(state: TableState, event: ServerEvent, at: number): TableState {
@@ -146,6 +157,7 @@ function reduceServer(state: TableState, event: ServerEvent, at: number): TableS
         receivedAt: at,
         startedAt: null,
         endedAt: null,
+        skippedAt: null,
         crumb: event.crumb,
         cacheHit: event.cache_hit,
         latencyMs: event.latency_ms,
@@ -172,6 +184,7 @@ function reduceServer(state: TableState, event: ServerEvent, at: number): TableS
           receivedAt: at,
           startedAt: null,
           endedAt: null,
+          skippedAt: null,
         },
       };
     case "calibration":
@@ -226,6 +239,12 @@ export function tableReducer(state: TableState, action: TableAction): TableState
       const status: PlaybackStatus = action.interrupted ? "interrupted" : "done";
       return applyLinePatch(state, action.id, { status, endedAt: action.at });
     }
+    case "line_skipped":
+      return {
+        ...state,
+        crumbs: state.crumbs.map((c) => skipLine(c, action.id, action.at)),
+        systemLine: state.systemLine ? skipLine(state.systemLine, action.id, action.at) : null,
+      };
     case "params_local":
       return { ...state, params: { ...state.params, ...action.changes } };
     case "ending":
@@ -239,22 +258,23 @@ export function tableReducer(state: TableState, action: TableAction): TableState
 
 // ---- Live caption selection -----------------------------------------------------------
 
-const LINGER_MS = 14_000; // keep a finished crumb on screen a little while, then let the orb be alone
-const LINGER_INTERRUPTED_MS = 3_500;
-const STUCK_PENDING_MS = 8_000; // a crumb that never started playing stops counting as "speaking"
-
 /** Whether a crumb still counts as being spoken (pending covers the chime and audio decode). */
 export function isSpeaking(c: CrumbRecord, now: number): boolean {
   if (c.status === "playing") return true;
   return c.status === "pending" && now - c.receivedAt < STUCK_PENDING_MS;
 }
 
-/** The crumb to caption under the orb right now, if any. */
+/**
+ * The crumb to caption in full under the orb right now, if any. It appears the moment it arrives,
+ * stays while it is voiced and for a reading time afterwards (see captionHideAt).
+ */
 export function visibleCrumb(crumbs: CrumbRecord[], now: number): CrumbRecord | null {
   const last = crumbs.at(-1);
-  if (!last) return null;
-  if (isSpeaking(last, now)) return last;
-  const endedAt = last.endedAt ?? last.receivedAt;
-  const linger = last.status === "interrupted" ? LINGER_INTERRUPTED_MS : LINGER_MS;
-  return now - endedAt < linger ? last : null;
+  return last && captionStage(last, now) === "full" ? last : null;
+}
+
+/** After its reading time the last crumb shrinks into a small "last crumb" line for a while (never a skipped one). */
+export function recapCrumb(crumbs: CrumbRecord[], now: number): CrumbRecord | null {
+  const last = crumbs.at(-1);
+  return last && captionStage(last, now) === "recap" ? last : null;
 }

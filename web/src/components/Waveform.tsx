@@ -1,4 +1,4 @@
-// Live scrolling waveform from the recorder's AnalyserNode (PRD 14.2). Idle state is a quiet row of crumbs.
+// Live scrolling waveform from the recorder's AnalyserNode (PRD 14.2). Idle state is a quiet row of dots.
 import { useEffect, useRef } from "react";
 
 interface WaveformProps {
@@ -7,10 +7,11 @@ interface WaveformProps {
   bars?: number;
 }
 
-const BAR_COLOR = "#FFD27A";
-const IDLE_COLOR = "rgba(185, 172, 157, 0.35)";
+// Ink on the light canvas (tokens --color-ink and --color-line-strong); color stays inside the orb.
+const BAR_COLOR = "#0C0B0A";
+const IDLE_COLOR = "#D3CEC6";
 
-export function Waveform({ analyser, height = 64, bars = 40 }: WaveformProps) {
+export function Waveform({ analyser, height = 48, bars = 40 }: WaveformProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
@@ -59,7 +60,7 @@ export function Waveform({ analyser, height = 64, bars = 40 }: WaveformProps) {
           continue;
         }
         const h = Math.max(barW, history[i] * (height - 4));
-        ctx.globalAlpha = 0.35 + 0.65 * (i / bars);
+        ctx.globalAlpha = 0.18 + 0.72 * (i / bars);
         ctx.fillStyle = BAR_COLOR;
         roundRect(ctx, x, (height - h) / 2, barW, h, barW / 2);
         ctx.fill();

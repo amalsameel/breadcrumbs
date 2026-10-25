@@ -1,8 +1,9 @@
-// Live Table controls (PRD 6.6): bottom corners, large touch targets, labels always visible.
+// Live Table controls (PRD 6.6): a pill track of toggles on the left, the black "Drop a crumb" pill on
+// the right, large touch targets, labels and key hints always visible.
 // End uses an inline two-step confirm (no browser dialogs).
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useState } from "react";
-import { TableButton } from "./table/primitives";
+import { SegmentTrack, TableButton } from "./table/primitives";
 
 interface ControlsProps {
   holding: boolean;
@@ -22,25 +23,32 @@ const CONFIRM_MS = 5000;
 export default function Controls(props: ControlsProps) {
   const { holding, paused, ending, xrayOpen } = props;
   return (
-    <div className="pointer-events-none flex w-full flex-wrap items-end justify-between gap-3">
-      <div className="pointer-events-auto flex flex-wrap items-center gap-3" role="group" aria-label="Crumb controls">
-        <TableButton tone="primary" icon="spark" shortcut="Space" onClick={props.onSpark}>
-          Drop a crumb
-        </TableButton>
-        <TableButton icon="skip" onClick={props.onSkip}>
-          Skip
-        </TableButton>
-      </div>
-      <div className="pointer-events-auto flex flex-wrap items-center justify-end gap-3" role="group" aria-label="Session controls">
-        <TableButton icon={holding ? "play" : "hold"} shortcut="H" onClick={props.onHold} aria-pressed={holding}>
+    <div className="flex w-full flex-wrap items-center justify-between gap-3">
+      <SegmentTrack label="Session controls" className="w-full justify-center sm:w-auto">
+        <TableButton
+          tone="segment"
+          size="md"
+          icon={holding ? "play" : "hold"}
+          shortcut="H"
+          onClick={props.onHold}
+          aria-pressed={holding}
+        >
           {holding ? "Resume" : "Hold 60 s"}
         </TableButton>
-        <TableButton icon={paused ? "mic" : "micOff"} shortcut="P" onClick={props.onPause} aria-pressed={paused}>
-          {paused ? "Resume listening" : "Pause listening"}
-        </TableButton>
-        <EndButton ending={ending} onEnd={props.onEnd} />
         <TableButton
-          tone="ghost"
+          tone="segment"
+          size="md"
+          icon={paused ? "mic" : "micOff"}
+          shortcut="P"
+          onClick={props.onPause}
+          aria-pressed={paused}
+        >
+          {/* Short label on phones; the accessible name always starts with the visible text. */}
+          <span className="sm:hidden">{paused ? "Resume" : "Pause"}</span>
+          <span className="hidden sm:inline">{paused ? "Resume listening" : "Pause listening"}</span>
+        </TableButton>
+        <TableButton
+          tone="segment"
           size="md"
           icon="xray"
           shortcut="X"
@@ -49,6 +57,19 @@ export default function Controls(props: ControlsProps) {
           aria-controls="xray-drawer"
         >
           X-ray
+        </TableButton>
+      </SegmentTrack>
+      <div
+        className="order-first flex w-full flex-wrap items-center justify-end gap-2.5 sm:order-none sm:w-auto sm:flex-nowrap"
+        role="group"
+        aria-label="Crumb controls"
+      >
+        <EndButton ending={ending} onEnd={props.onEnd} />
+        <TableButton size="md" icon="skip" onClick={props.onSkip} className="flex-1 sm:flex-none">
+          Skip
+        </TableButton>
+        <TableButton tone="primary" icon="spark" shortcut="Space" onClick={props.onSpark} className="order-first w-full sm:order-none sm:w-auto">
+          Drop a crumb
         </TableButton>
       </div>
     </div>
@@ -82,6 +103,7 @@ function EndButton({ ending, onEnd }: { ending: boolean; onEnd(): void }) {
         >
           <TableButton
             tone="danger"
+            size="md"
             icon="end"
             disabled={ending}
             onClick={() => {
@@ -91,7 +113,10 @@ function EndButton({ ending, onEnd }: { ending: boolean; onEnd(): void }) {
           >
             {ending ? "Ending" : "Yes, end"}
           </TableButton>
-          <TableButton tone="ghost" size="md" onClick={() => setConfirming(false)}>
+          <span className="sr-only" role="status">
+            End the session for both of you?
+          </span>
+          <TableButton tone="ghost" size="md" autoFocus onClick={() => setConfirming(false)}>
             Keep talking
           </TableButton>
         </motion.div>
@@ -103,7 +128,7 @@ function EndButton({ ending, onEnd }: { ending: boolean; onEnd(): void }) {
           exit={{ opacity: 0, scale: 0.96 }}
           transition={{ duration: 0.15 }}
         >
-          <TableButton icon="end" disabled={ending} onClick={() => setConfirming(true)}>
+          <TableButton size="md" icon="end" disabled={ending} onClick={() => setConfirming(true)}>
             End
           </TableButton>
         </motion.div>

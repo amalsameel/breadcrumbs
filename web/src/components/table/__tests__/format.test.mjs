@@ -3,7 +3,17 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  CAPTION_ENTER_S,
+  CAPTION_EXIT_S,
+  CAPTION_MIN_TOTAL_MS,
+  CAPTION_RECAP_MS,
+  captionHideAt,
+  captionLingerMs,
+  captionStage,
+  captionStaggerS,
   deriveOrb,
+  lobbyStep,
+  noiseSuspected,
   estimateSpeechS,
   formatClock,
   isInsecureUrl,
@@ -17,6 +27,7 @@ import {
   wavDurationS,
   wordsOf,
 } from "../format.ts";
+import { approach, backingSize, hexToRgb, MODE_LOOKS, PALETTES, resolveLook, rippleProgress } from "../orbLook.ts";
 
 /** A real 24 kHz mono 16-bit WAV of `seconds` of silence, base64 encoded. */
 function wavB64(seconds, sampleRate = 24000) {
@@ -252,5 +263,176 @@ describe("speechServiceProblem (calibration must not stall silently)", () => {
     for (const status of ["connecting", "connected", "resyncing", "mock", null, undefined]) {
       assert.equal(speechServiceProblem(status), null);
     }
+  });
+});
+
+describe("caption timing (issue 2: whole line at once, then time to read)", () => {
+  const line = (status, extra = {}) => ({
+    text: "Maya, what made you sign up for the half marathon?",
+    durationS: 3,
+    status,
+    receivedAt: 1_000,
+    startedAt: null,
+    endedAt: null,
+    ...extra,
+  });
+
+  it("reading time is at least 4 s, else 0.35 s per word plus 2 s", () => {
+    assert.equal(captionLingerMs("hi"), 4_000);
+    assert.equal(captionLingerMs("one two three four five"), 4_000); // 1.75 + 2 = 3.75 s
+    assert.equal(captionLingerMs("w ".repeat(10)), 5_500);
+    assert.equal(captionLingerMs("w ".repeat(20)), 9_000);
+  });
+
+  it("the entrance is quick: the last word starts within ~0.12 s and lands in under 0.45 s", () => {
+    assert.ok(CAPTION_ENTER_S >= 0.25 && CAPTION_ENTER_S <= 0.35);
+    assert.equal(captionStaggerS(1), 0);
+    assert.equal(captionStaggerS(4), 0.02);
+    for (const n of [2, 6, 12, 30, 80]) {
+      const stagger = captionStaggerS(n);
+      assert.ok(stagger <= 0.02, `stagger for ${n} words`);
+      assert.ok((n - 1) * stagger + CAPTION_ENTER_S <= 0.45 + 1e-9, `total for ${n} words`);
+    }
+  });
+
+  it("stays up while pending (chime, decode) and while playing, whatever the clock says", () => {
+    assert.equal(captionHideAt(line("pending"), 1_000), null);
+    assert.equal(captionHideAt(line("pending"), 8_500), null);
+    assert.equal(captionHideAt(line("playing", { startedAt: 1_500 }), 120_000), null);
+    assert.equal(captionStage(line("playing", { startedAt: 1_500 }), 120_000), "full");
+  });
+
+  it("hides a reading time after the voice ends, and never before 6 s in total", () => {
+    const words = 10;
+    const done = line("done", { startedAt: 1_500, endedAt: 4_500 });
+    assert.equal(captionHideAt(done, 5_000), 4_500 + Math.max(4_000, words * 350 + 2_000));
+    const blip = line("done", { text: "ok", startedAt: 1_100, endedAt: 1_400 });
+    assert.equal(captionHideAt(blip, 2_000), 1_000 + CAPTION_MIN_TOTAL_MS);
+  });
+
+  it("an interrupted line keeps the same reading time from the moment it was cut", () => {
+    const cut = line("interrupted", { startedAt: 1_500, endedAt: 2_000 });
+    assert.equal(captionHideAt(cut, 2_100), Math.max(2_000 + 5_500, 1_000 + CAPTION_MIN_TOTAL_MS));
+  });
+
+  it("a line whose audio never plays falls back to its expected length", () => {
+    const stuck = line("pending");
+    assert.equal(captionHideAt(stuck, 9_500), Math.max(1_000 + 3_000 + 5_500, 1_000 + CAPTION_MIN_TOTAL_MS));
+  });
+
+  it("a skipped line leaves the moment it is skipped: no reading time, no 6 s minimum, no recap", () => {
+    const playing = line("playing", { startedAt: 1_500, skippedAt: 2_000 });
+    assert.equal(captionHideAt(playing, 2_000), 2_000);
+    assert.equal(captionStage(playing, 1_999), "full");
+    assert.equal(captionStage(playing, 2_000), "gone");
+    // skipped while still in its chime, or after it finished and was lingering
+    assert.equal(captionStage(line("interrupted", { endedAt: 1_200, skippedAt: 1_200 }), 1_200), "gone");
+    assert.equal(captionStage(line("done", { startedAt: 1_500, endedAt: 4_500, skippedAt: 5_000 }), 5_000), "gone");
+    // a barge-in (not a skip) still gets its full reading time
+    assert.equal(captionStage(line("interrupted", { startedAt: 1_500, endedAt: 2_000, skippedAt: null }), 2_100), "full");
+  });
+
+  it("a leaving caption is a short crossfade, never something a new crumb waits on", () => {
+    assert.ok(CAPTION_EXIT_S > 0 && CAPTION_EXIT_S <= 0.25);
+  });
+
+  it("moves full -> recap -> gone", () => {
+    const done = line("done", { startedAt: 1_500, endedAt: 4_500 });
+    const hideAt = captionHideAt(done, 5_000);
+    assert.equal(captionStage(done, hideAt - 1), "full");
+    assert.equal(captionStage(done, hideAt), "recap");
+    assert.equal(captionStage(done, hideAt + CAPTION_RECAP_MS - 1), "recap");
+    assert.equal(captionStage(done, hideAt + CAPTION_RECAP_MS), "gone");
+  });
+});
+
+describe("background noise (issue 4)", () => {
+  it("reads the optional engine flag and says so under the orb", () => {
+    assert.equal(noiseSuspected(null), false);
+    assert.equal(noiseSuspected(engine()), false);
+    assert.equal(noiseSuspected(engine({ noise_suspected: true })), true);
+    assert.deepEqual(deriveOrb(engine({ noise_suspected: true }), false), {
+      mode: "listening",
+      label: "Listening",
+      detail: "Background noise ignored",
+    });
+    // a real state still wins over the noise note
+    assert.equal(deriveOrb(engine({ noise_suspected: true, pending_delivery: true }), false).label, "Finding a crumb");
+  });
+});
+
+describe("lobbyStep", () => {
+  const seat = (extra = {}) => ({ joined: false, consented: false, ready: false, name: null, has_profile: false, answered: 0, opted_in: null, ...extra });
+  const session = (a, b) => ({ seats: { 1: seat(a), 2: seat(b) } });
+
+  it("walks scan -> consent and profile -> say hi", () => {
+    assert.equal(lobbyStep(session({}, {})), 1);
+    assert.equal(lobbyStep(session({ joined: true }, {})), 1);
+    assert.equal(lobbyStep(session({ joined: true }, { joined: true })), 2);
+    assert.equal(lobbyStep(session({ joined: true, ready: true }, { joined: true })), 2);
+    assert.equal(lobbyStep(session({ joined: true, ready: true }, { joined: true, ready: true })), 3);
+  });
+});
+
+describe("orb looks (CrumbOrb contract)", () => {
+  it("maps every state to its palette", () => {
+    assert.equal(MODE_LOOKS.listening.palette, "ember");
+    assert.equal(MODE_LOOKS.warming.palette, "ember");
+    assert.equal(MODE_LOOKS.crumb.palette, "ember");
+    assert.equal(MODE_LOOKS.idle.palette, "ember");
+    assert.equal(MODE_LOOKS.holding.palette, "lilac");
+    assert.equal(MODE_LOOKS.paused.palette, "sage");
+    assert.equal(MODE_LOOKS.safety.palette, "cocoa");
+  });
+
+  it("listening breathes at 0.2 Hz; warming is livelier; a crumb is brightest with the strongest tip", () => {
+    assert.equal(MODE_LOOKS.listening.breathHz, 0.2);
+    assert.ok(MODE_LOOKS.warming.speed > MODE_LOOKS.listening.speed);
+    assert.ok(MODE_LOOKS.warming.saturation > MODE_LOOKS.listening.saturation);
+    assert.ok(MODE_LOOKS.crumb.brightness >= MODE_LOOKS.warming.brightness);
+    for (const look of Object.values(MODE_LOOKS)) {
+      assert.ok(look.glint > 0.5, "the white tip is never switched off");
+      assert.ok(MODE_LOOKS.crumb.glint >= look.glint);
+    }
+    assert.ok(MODE_LOOKS.idle.speed < MODE_LOOKS.listening.speed);
+  });
+
+  it("a palette override changes only the colors", () => {
+    const look = resolveLook("holding", "citrus");
+    assert.equal(look.palette, "citrus");
+    assert.equal(look.breathHz, MODE_LOOKS.holding.breathHz);
+    assert.equal(resolveLook("listening").palette, "ember");
+  });
+
+  it("every palette has five valid colors and none of them is white (the tip owns white)", () => {
+    for (const [name, colors] of Object.entries(PALETTES)) {
+      for (const hex of Object.values(colors)) {
+        assert.match(hex, /^#[0-9A-F]{6}$/i, `${name} ${hex}`);
+        const [r, g, b] = hexToRgb(hex);
+        assert.ok(r >= 0 && r <= 1 && g >= 0 && g <= 1 && b >= 0 && b <= 1);
+        assert.ok(r + g + b < 2.99, `${name} ${hex} is pure white`);
+      }
+    }
+    assert.deepEqual(hexToRgb("#FFFFFF"), [1, 1, 1]);
+    assert.deepEqual(hexToRgb("#000"), [0, 0, 0]);
+  });
+
+  it("canvas size is DPR aware and capped", () => {
+    assert.equal(backingSize(200, 1), 200);
+    assert.equal(backingSize(200, 2), 400);
+    assert.equal(backingSize(200, 3), 400); // DPR above 2 is not worth the pixels
+    assert.equal(backingSize(400, 2), 560);
+    assert.equal(backingSize(0, 2), 0);
+    assert.equal(backingSize(100, Number.NaN), 100);
+  });
+
+  it("ripple and easing helpers", () => {
+    assert.equal(rippleProgress(null, 100), null);
+    assert.equal(rippleProgress(1_000, 1_000), 0);
+    assert.equal(rippleProgress(1_000, 1_750, 1_500), 0.5);
+    assert.equal(rippleProgress(1_000, 2_600, 1_500), null);
+    assert.equal(approach(0, 0.5), 0);
+    assert.equal(approach(1, 0), 1);
+    assert.ok(Math.abs(approach(0.5, 0.5) - (1 - Math.exp(-1))) < 1e-12);
   });
 });

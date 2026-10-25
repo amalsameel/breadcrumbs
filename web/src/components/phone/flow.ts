@@ -203,3 +203,25 @@ export const MIC_MESSAGES: Record<MicProblem, { title: string; body: string }> =
     body: "Something went wrong starting the microphone. Try again in a moment.",
   },
 };
+
+/**
+ * Accessible name of the record control. It is a plain button whose verb follows the state (never a
+ * toggle, and never the countdown, which would change the name every second while it has focus).
+ */
+export function recordLabel(recording: boolean): string {
+  return recording ? "Stop recording" : "Start recording";
+}
+
+/** Seconds left at which the interview's polite live region announces the remaining time. */
+export const TIME_LEFT_MARKS = [10, 5] as const;
+
+/**
+ * What the interview's live region says while recording: "Recording" at first, then the time left
+ * only at the coarse marks (10 s, then 5 s), so a screen reader hears it twice rather than every tick.
+ */
+export function recordingNotice(elapsedMs: number, limitMs: number): string {
+  const left = Math.max(0, Math.ceil((limitMs - elapsedMs) / 1000));
+  let mark: number | null = null;
+  for (const m of TIME_LEFT_MARKS) if (left <= m) mark = m;
+  return mark === null ? "Recording" : `${mark} seconds left`;
+}
