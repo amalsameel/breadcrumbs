@@ -4,6 +4,7 @@ import type { Seat } from "../../lib/types";
 import type { CalibrationStep, TableView } from "../../lib/useTable";
 import CrumbOrb from "../CrumbOrb";
 import CrumbCaption from "./CrumbCaption";
+import { micOnMessage, speechServiceProblem } from "./format";
 import { StatusChip, type ChipState } from "./primitives";
 import StartListening from "./StartListening";
 
@@ -26,6 +27,7 @@ export default function Calibration({ view, names, onStartListening }: Calibrati
   const [s1, s2, done] = stepStates(view.calibrationStep);
   const resyncing = view.muse?.status === "resyncing";
   const micOn = view.mic.status === "on";
+  const speechProblem = micOn ? speechServiceProblem(view.muse?.status, view.muse?.detail) : null;
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-8 px-6 py-6">
@@ -43,6 +45,17 @@ export default function Calibration({ view, names, onStartListening }: Calibrati
             exit={{ opacity: 0 }}
           >
             Re-syncing voices
+          </motion.p>
+        )}
+        {speechProblem && (
+          <motion.p
+            role="alert"
+            className="max-w-xl rounded-2xl border border-danger/60 bg-danger/10 px-4 py-2 text-center text-sm text-ink"
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+          >
+            {speechProblem}
           </motion.p>
         )}
       </AnimatePresence>
@@ -84,7 +97,9 @@ export default function Calibration({ view, names, onStartListening }: Calibrati
         </li>
       </ol>
 
-      {!micOn && <StartListening mic={view.mic} onStart={onStartListening} />}
+      {!micOn && (
+        <StartListening mic={view.mic} onStart={onStartListening} onMessage={micOnMessage("calibrating", view.bothConsented)} />
+      )}
       {micOn && view.audioLink === "forbidden" && (
         <p className="text-sm text-ink-faint" role="status">
           Waiting for both consents before any audio is sent.

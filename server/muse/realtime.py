@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import math
+import ssl
 import sys
 import time
 import uuid
@@ -20,6 +21,7 @@ from array import array
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+import certifi
 import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus, InvalidURI
@@ -28,10 +30,22 @@ import config
 
 log = logging.getLogger("breadcrumbs.muse")
 
+
+def tls_context(url: str) -> ssl.SSLContext | None:
+    """certifi CA bundle for wss:// URLs.
+
+    The python.org macOS build ships without system root certificates, so the default context
+    fails every wss handshake with SSLCertVerificationError (httpx already uses certifi, which is why
+    REST transcription worked while the realtime stream did not). Plain ws:// (local test servers) needs none.
+    """
+    return ssl.create_default_context(cafile=certifi.where()) if url.startswith("wss://") else None
+
 OnEvent = Callable[[dict], Awaitable[None]]
 OnStatus = Callable[[str, str], Awaitable[None]]
 
-QUEUE_MAXSIZE = 40  # 40 x 80 ms = 3.2 s, so a reconnect burst stays under Muse's 5 s pacing limit
+QUEUE_MAXSIZE = 40  # 40 x 80 ms = 3.2 s of backlog at most
+MAX_AHEAD_S = 1.5  # the sender never runs more than this far ahead of real time (Muse closes 1008 past 5 s)
+PCM_BYTES_PER_S = 24_000 * 2  # PCM16 mono at 24 kHz
 HANDSHAKE_TIMEOUT_S = 10.0
 OPEN_TIMEOUT_S = 30.0
 CLOSE_TIMEOUT_S = 5.0
@@ -112,6 +126,50 @@ class _DropOldestQueue:
         return self._q.qsize()
 
 
+class _Pacer:
+    """Real-time pacing for the uplink (PRD 11.1: "send at about real-time speed").
+
+    Muse consumes audio at (at least) real-time speed and cannot bank idle time, so the lead is a
+    leaky bucket: each frame adds its duration, wall-clock time drains it, and it never goes below
+    zero. Muse's own `audioProcessedMs` can only lower it (when Muse runs faster than real time). A
+    Table that stalls and then flushes its backlog (Wi-Fi hiccup, throttled tab) would otherwise put
+    the stream seconds ahead in one burst, and Muse closes past 5 s ahead with 1008, which is fatal.
+    """
+
+    def __init__(self, max_ahead_s: float = MAX_AHEAD_S, clock: Callable[[], float] = time.monotonic) -> None:
+        self.max_ahead_s = max_ahead_s
+        self.clock = clock
+        self.lead_s = 0.0
+        self.sent_s = 0.0  # audio sent in this Muse session
+        self._at: float | None = None
+
+    def reset(self) -> None:
+        self.lead_s = 0.0
+        self.sent_s = 0.0
+        self._at = None
+
+    def note_processed(self, processed_s: float) -> None:
+        if 0.0 < processed_s <= self.sent_s:  # Muse can't have processed audio it was never sent
+            self.lead_s = min(self.lead_s, max(0.0, self.sent_s - processed_s))
+
+    def _drain(self) -> float:
+        now = self.clock()
+        if self._at is not None:
+            self.lead_s = max(0.0, self.lead_s - (now - self._at))
+        self._at = now
+        return now
+
+    def wait_s(self, frame_s: float) -> float:
+        """How long to wait before sending a frame of `frame_s` seconds (0 when it can go now)."""
+        self._drain()
+        return max(0.0, self.lead_s + frame_s - self.max_ahead_s)
+
+    def sent(self, frame_s: float) -> None:
+        self._drain()
+        self.lead_s += frame_s
+        self.sent_s += frame_s
+
+
 class _ClientBase:
     """State and callback plumbing shared by the real and mock clients."""
 
@@ -170,6 +228,7 @@ class MuseRealtimeClient(_ClientBase):
         model: str | None = None,
         backoff: Sequence[float] = BACKOFF_S,
         handshake_timeout: float = HANDSHAKE_TIMEOUT_S,
+        max_ahead_s: float = MAX_AHEAD_S,
     ) -> None:
         super().__init__(on_event, keywords, on_status)
         self.url = url  # template with a `{sid}` placeholder
@@ -178,6 +237,7 @@ class MuseRealtimeClient(_ClientBase):
         self.backoff = tuple(backoff)
         self.handshake_timeout = handshake_timeout
         self.reconnects = 0
+        self._pacer = _Pacer(max_ahead_s)
         self._ever_connected = False  # a reconnect after this means diarization labels were reset
         self._ws: ClientConnection | None = None
         self._session_done = asyncio.Event()
@@ -187,6 +247,7 @@ class MuseRealtimeClient(_ClientBase):
         attempt = 0
         while not self._closing:
             started = time.monotonic()
+            failure = ""
             try:
                 code = await self._run_session(resync=self._ever_connected)
             except (MuseFatalError, InvalidURI) as exc:
@@ -198,7 +259,8 @@ class MuseRealtimeClient(_ClientBase):
                 if isinstance(exc, InvalidStatus) and _is_fatal_http(exc):
                     await self._status("error", f"Muse rejected the connection (HTTP {exc.response.status_code})")
                     return
-                log.warning("muse connection failed: %s", type(exc).__name__)
+                failure = type(exc).__name__
+                log.warning("muse connection failed: %s", failure)
             finally:
                 self.connected = False
             if self._closing:
@@ -211,7 +273,9 @@ class MuseRealtimeClient(_ClientBase):
             delay = backoff_delay(attempt, self.backoff)
             attempt += 1
             self.reconnects += 1
-            await self._status("reconnecting", f"close {code}, retry in {delay:g} s")
+            # The Table shows this detail, so a connection that never opens names its cause instead of looking like a stall.
+            why = f"connection failed: {failure}" if failure else f"close {code}"
+            await self._status("reconnecting", f"{why}, retry in {delay:g} s")
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
         await self._status("closed", "")
@@ -221,8 +285,14 @@ class MuseRealtimeClient(_ClientBase):
         sid = f"bc-{uuid.uuid4()}"
         self._session_done.clear()
         try:
+            url = self.url.format(sid=sid)
+            tls = tls_context(url)
             async with websockets.connect(
-                self.url.format(sid=sid), open_timeout=OPEN_TIMEOUT_S, max_size=None, close_timeout=CLOSE_TIMEOUT_S
+                url,
+                open_timeout=OPEN_TIMEOUT_S,
+                max_size=None,
+                close_timeout=CLOSE_TIMEOUT_S,
+                **({"ssl": tls} if tls else {}),
             ) as ws:
                 self._ws = ws
                 await ws.send(json.dumps(build_handshake(self.api_key, self.model, self.keywords)))
@@ -271,13 +341,21 @@ class MuseRealtimeClient(_ClientBase):
                 await sender
 
     async def _send_loop(self, ws: ClientConnection) -> None:
+        self._pacer.reset()  # a new Muse session starts with nothing buffered
         try:
             while True:
                 frame = await self._queue.get()
                 if frame is _END:
                     await ws.send(json.dumps({"type": "endStream"}))
                     return
+                frame_s = len(frame) / PCM_BYTES_PER_S
+                self._pacer.note_processed(self.audio_processed_ms / 1000.0)
+                wait = self._pacer.wait_s(frame_s)
+                if wait > 0:
+                    # Meanwhile new frames pile up in the drop-oldest queue, so the backlog stays bounded.
+                    await asyncio.sleep(wait)
                 await ws.send(frame)
+                self._pacer.sent(frame_s)
         except ConnectionClosed:
             return
         except asyncio.CancelledError:
@@ -338,7 +416,7 @@ def _is_fatal_http(exc: InvalidStatus) -> bool:
 # ---------------------------------------------------------------------------
 
 SAMPLE_RATE = 24_000
-BYTES_PER_MS = SAMPLE_RATE * 2 // 1000  # 48 bytes of PCM16 mono per millisecond
+BYTES_PER_MS = PCM_BYTES_PER_S // 1000  # 48 bytes of PCM16 mono per millisecond
 
 
 def pcm16_rms(frame: bytes) -> float:

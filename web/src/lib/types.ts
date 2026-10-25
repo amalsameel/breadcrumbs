@@ -70,7 +70,8 @@ export interface CreateSessionResponse {
 }
 
 export interface AppConfig {
-  mock: { muse: boolean; gemini: boolean };
+  mock: { muse: boolean; gemini: boolean }; // `gemini` = text AI mocked (no Gemini or Claude key)
+  ai_provider: "claude" | "gemini" | "mock"; // first text provider; fallbacks: Gemini, then Muse Spark
   dev_tools: boolean;
   public_base_url: string;
   ffmpeg: boolean;

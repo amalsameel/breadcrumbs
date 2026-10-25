@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 import struct
+import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -16,6 +17,7 @@ from muse.realtime import (
     MAX_KEYWORDS,
     QUEUE_MAXSIZE,
     MockMuseRealtime,
+    _Pacer,
     MuseRealtimeClient,
     backoff_delay,
     build_handshake,
@@ -36,6 +38,7 @@ class FakeMuse:
         self.handshakes: list[dict] = []
         self.session_ids: list[str] = []
         self.binary: list[bytes] = []
+        self.binary_at: list[float] = []  # time.monotonic() of each binary frame's arrival
         self.text: list[dict] = []
         self.port = 0
 
@@ -56,11 +59,13 @@ class FakeMuse:
         if behavior in ("close_1011", "close_1013", "close_1008"):
             await ws.close(int(behavior[-4:]), "scripted")
             return
-        await ws.send(json.dumps({"type": "speechStart", "turnId": 1, "audioProcessedMs": 400}))
-        await ws.send(json.dumps({"type": "audioProgress", "audioProcessedMs": 1000}))
+        if behavior != "quiet":  # "quiet" sends no events, so no audioProcessedMs feedback either
+            await ws.send(json.dumps({"type": "speechStart", "turnId": 1, "audioProcessedMs": 400}))
+            await ws.send(json.dumps({"type": "audioProgress", "audioProcessedMs": 1000}))
         async for msg in ws:
             if isinstance(msg, bytes):
                 self.binary.append(msg)
+                self.binary_at.append(time.monotonic())
                 continue
             frame = json.loads(msg)
             self.text.append(frame)
@@ -250,6 +255,23 @@ async def test_network_error_retries_until_closed() -> None:
     await asyncio.wait_for(task, TIMEOUT)
     assert "connected" not in rec.status_names
     assert rec.status_names[-1] == "closed"
+    # The Table shows this detail: a connection that never opens must name its cause, not "close None".
+    detail = next(d for st, d in rec.statuses if st == "reconnecting")
+    assert detail.startswith("connection failed: ") and "None" not in detail
+
+
+def test_wss_uses_certifi_tls_context() -> None:
+    """Regression: the python.org macOS build has no system CA store, so wss to Muse failed every
+    handshake with SSLCertVerificationError and calibration stalled. wss:// must carry certifi's bundle."""
+    import ssl
+
+    import certifi
+
+    ctx = realtime.tls_context("wss://api.meta.ai/v1/asr/realtime?sessionId=x")
+    assert isinstance(ctx, ssl.SSLContext) and ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
+    assert ctx.cert_store_stats()["x509_ca"] > 0  # loaded from certifi, not an empty system store
+    assert certifi.where()
+    assert realtime.tls_context("ws://127.0.0.1:9999/x") is None  # local fake servers stay plain
 
 
 async def test_on_event_exception_does_not_drop_session() -> None:
@@ -368,3 +390,64 @@ async def test_reconnect_burst_is_capped_by_drop_oldest_queue() -> None:
     assert fake.binary[0] == (20).to_bytes(2, "little") * 1920
     assert fake.binary[-1] == (QUEUE_MAXSIZE + 19).to_bytes(2, "little") * 1920
     assert client.dropped_frames == 20
+
+
+# --- real-time pacing (PRD 11.1: never more than 5 s ahead, or Muse closes with 1008) -----------
+
+
+def max_lead_s(arrivals: list[float], frame_s: float = 0.08) -> float:
+    """Worst lead over real time as Muse sees it: a leaky bucket that drains at real-time speed."""
+    lead, worst, prev = 0.0, 0.0, None
+    for at in arrivals:
+        if prev is not None:
+            lead = max(0.0, lead - (at - prev))
+        lead += frame_s
+        worst = max(worst, lead)
+        prev = at
+    return worst
+
+
+def test_pacer_bounds_lead_and_cannot_bank_idle_time() -> None:
+    now = [0.0]
+    pacer = _Pacer(max_ahead_s=1.0, clock=lambda: now[0])
+    sent_at_once = 0
+    while pacer.wait_s(0.08) == 0.0:
+        pacer.sent(0.08)
+        sent_at_once += 1
+    assert sent_at_once == 12  # 0.96 s may go out in a burst, the 13th frame has to wait
+    assert pacer.wait_s(0.08) == pytest.approx(0.04)
+    now[0] = 30.0  # a long stall: Muse sat idle, which does not let the next burst run further ahead
+    burst = 0
+    while pacer.wait_s(0.08) == 0.0:
+        pacer.sent(0.08)
+        burst += 1
+    assert burst == 12
+    pacer.note_processed(pacer.sent_s)  # Muse reports it has processed everything sent: lead is gone
+    assert pacer.lead_s == 0.0
+    pacer.note_processed(pacer.sent_s + 5.0)  # nonsense feedback never opens extra room
+    assert pacer.lead_s == 0.0
+
+
+async def test_flushed_backlog_is_paced_to_real_time() -> None:
+    """A Table that stalls and then flushes 2.4 s of audio over the network (frames arriving a few at a
+    time, so the drop-oldest queue never fills) must not reach Muse faster than real time allows."""
+    fake, server = await start_fake(["quiet"])
+    rec = Recorder()
+    client = MuseRealtimeClient(
+        rec.on_event, [], rec.on_status, url=fake.url, api_key="k", model="m", backoff=(0.01,), max_ahead_s=0.5
+    )
+    frames = 30
+    async with server:
+        task = asyncio.create_task(client.run())
+        await rec.wait_for_status("connected")
+        for _ in range(frames):
+            client.push_audio(FRAME)
+            await asyncio.sleep(0)  # the uplink delivers the backlog in pieces, yielding in between
+        deadline = time.monotonic() + TIMEOUT
+        while len(fake.binary) < frames and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        await client.close()
+        await asyncio.wait_for(task, TIMEOUT)
+    assert len(fake.binary) == frames and client.dropped_frames == 0
+    assert max_lead_s(fake.binary_at) <= 0.5 + 0.1
+    assert "error" not in rec.status_names

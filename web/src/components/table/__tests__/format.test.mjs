@@ -8,8 +8,12 @@ import {
   formatClock,
   isInsecureUrl,
   isLocalUrl,
+  isResyncStep,
+  micOnMessage,
   seatName,
   sourceCaption,
+  speechServiceProblem,
+  staleThreshold,
   wavDurationS,
   wordsOf,
 } from "../format.ts";
@@ -190,6 +194,63 @@ describe("deriveOrb", () => {
   it("always carries a text label (no color-only state)", () => {
     for (const e of [engine(), engine({ listening_paused: true }), engine({ auto_paused: true })]) {
       assert.ok(deriveOrb(e, false).label.length > 0);
+    }
+  });
+});
+
+describe("voice re-sync during live", () => {
+  it("a calibration prompt while live is a re-sync", () => {
+    assert.equal(isResyncStep("seat1"), true);
+    assert.equal(isResyncStep("seat2"), true);
+    assert.equal(isResyncStep("done"), false);
+    assert.equal(isResyncStep(null), false);
+  });
+
+  it("the orb says Re-syncing voices instead of Listening", () => {
+    const orb = deriveOrb(engine(), false, true);
+    assert.equal(orb.label, "Re-syncing voices");
+    assert.notEqual(orb.mode, "listening");
+    assert.equal(deriveOrb(engine(), false).label, "Listening");
+    assert.equal(deriveOrb(engine({ listening_paused: true }), false, true).mode, "paused");
+  });
+});
+
+describe("micOnMessage (PRD 7 F2)", () => {
+  it("never claims live transcription before both seats consent", () => {
+    for (const phase of ["lobby", "profiles", "calibrating", "live"]) {
+      assert.doesNotMatch(micOnMessage(phase, false), /transcribed live/);
+    }
+  });
+
+  it("claims it only once audio is actually transcribed (calibrating or live)", () => {
+    assert.doesNotMatch(micOnMessage("profiles", true), /transcribed live/);
+    assert.match(micOnMessage("calibrating", true), /transcribed live and never stored/);
+    assert.match(micOnMessage("live", true), /transcribed live and never stored/);
+  });
+});
+
+describe("staleThreshold (X-ray follows live tuning)", () => {
+  it("uses the live STALE_SWITCH", () => {
+    assert.equal(staleThreshold({ STALE_SWITCH: 0.4 }), 0.4);
+    assert.equal(staleThreshold({ STALE_SWITCH: 0.85, T_LONG_S: 5 }), 0.85);
+  });
+
+  it("falls back to 0.6", () => {
+    assert.equal(staleThreshold({}), 0.6);
+    assert.equal(staleThreshold({ STALE_SWITCH: "x" }), 0.6);
+    assert.equal(staleThreshold({ STALE_SWITCH: Number.NaN }), 0.6);
+  });
+});
+
+describe("speechServiceProblem (calibration must not stall silently)", () => {
+  it("explains a failing speech connection instead of hanging", () => {
+    assert.match(speechServiceProblem("reconnecting", "SSLCertVerificationError"), /Can't reach the speech service.*SSLCertVerificationError/);
+    assert.match(speechServiceProblem("error", "Muse rejected the connection (HTTP 401)"), /HTTP 401/);
+    assert.match(speechServiceProblem("closed"), /Start listening/);
+  });
+  it("stays quiet while the connection is healthy", () => {
+    for (const status of ["connecting", "connected", "resyncing", "mock", null, undefined]) {
+      assert.equal(speechServiceProblem(status), null);
     }
   });
 });

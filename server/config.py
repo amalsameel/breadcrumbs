@@ -17,6 +17,7 @@ load_dotenv(ROOT / ".env")
 # --- Environment -------------------------------------------------------------
 MODEL_API_KEY = os.environ.get("MODEL_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 ASR_MODEL = os.environ.get("ASR_MODEL", "muse-voice-transcribe-1.0")
 EVENT_LOCATION = os.environ.get("EVENT_LOCATION", "Austin, Texas (HackTX at UT Austin)")
@@ -25,6 +26,10 @@ DEV_TOOLS = os.environ.get("DEV_TOOLS", "true").lower() in ("1", "true", "yes")
 # Mock mode: a service without a key returns deterministic canned data (see BUILD_LOG.md).
 MUSE_MOCK = not MODEL_API_KEY
 GEMINI_MOCK = not GEMINI_API_KEY
+CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
+# Text AI (profiles, overlaps, crumbs, classifiers, trail) is mocked only when no text provider has a key.
+AI_MOCK = not (GEMINI_API_KEY or ANTHROPIC_API_KEY)
+AI_PROVIDER = "claude" if ANTHROPIC_API_KEY else "gemini" if GEMINI_API_KEY else "mock"  # first text provider
 
 # --- Models (PRD 9.1) --------------------------------------------------------
 GEMINI_MODEL = "gemini-3.8-flash"
@@ -34,6 +39,9 @@ GEMINI_TTS_FALLBACK_MODEL = "gemini-3.8-flash-lite-tts"
 TTS_VOICE = os.environ.get("TTS_VOICE", "Kore")
 TTS_STYLE = "warm, playful, curious, like a friendly host speaking softly at a small table"
 MUSE_SPARK_MODEL = "muse-spark-1.3"
+# Claude is the first text provider when ANTHROPIC_API_KEY is set (Gemini, then Muse Spark, are fallbacks).
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")  # live path: fast, short crumbs
 MUSE_REALTIME_URL = "wss://api.meta.ai/v1/asr/realtime?sessionId={sid}"
 MUSE_TRANSCRIBE_URL = "https://api.meta.ai/v1/asr/transcribe"
 META_API_BASE = "https://api.meta.ai/v1"

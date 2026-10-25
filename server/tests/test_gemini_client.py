@@ -68,7 +68,9 @@ async def test_json_request_shape_and_parse():
     result = await g.json(model=config.GEMINI_MODEL, system="sys", payload={"x": 1}, schema=Small, max_tokens=123)
     assert result == Small(name="a", count=2)
     call = fake.calls[0]
-    assert set(call) == {"model", "system_instruction", "input", "response_format", "generation_config", "timeout"}
+    assert set(call) == {"model", "system_instruction", "input", "response_format", "generation_config", "timeout",
+                         "store"}
+    assert call["store"] is False
     assert call["model"] == "gemini-3.8-flash" and call["system_instruction"] == "sys"
     assert json.loads(call["input"]) == {"x": 1}
     assert call["response_format"] == {"type": "text", "mime_type": "application/json", "schema": schema_for(Small)}
@@ -198,7 +200,10 @@ async def test_muse_spark_fallback_for_json():
     assert str(request.url) == "https://api.meta.ai/v1/chat/completions"
     assert request.headers["authorization"] == "Bearer meta-key"
     body = json.loads(request.content)
-    assert body["model"] == "muse-spark-1.3" and body["max_tokens"] == 99
+    # Spark reasons before answering: headroom on top of the caller's cap, and minimal reasoning effort,
+    # or the reasoning eats the whole budget and the content comes back empty.
+    assert body["model"] == "muse-spark-1.3" and body["max_tokens"] == 99 + 3000
+    assert body["reasoning_effort"] == "minimal"
     assert not (set(body) & FORBIDDEN)
     assert body["messages"][0]["role"] == "system" and "JSON schema" in body["messages"][0]["content"]
     await g.aclose()

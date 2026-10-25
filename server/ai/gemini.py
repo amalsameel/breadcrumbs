@@ -1,4 +1,7 @@
-"""Async Gemini client (PRD 9.1, 11.3) with retries, a Muse Spark fallback (11.4) and mock mode.
+"""Async AI gateway: Claude (when ANTHROPIC_API_KEY is set), then Gemini (PRD 9.1, 11.3), then Muse Spark (11.4).
+
+Text calls (json/text/grounded) try the providers in that order; TTS is Gemini only. Mock mode applies
+only when no text provider has a key.
 
 Request shapes are the ones verified against google-genai 2.33.0 (`client.aio.interactions.create`).
 Never send temperature, top_p or top_k. Never log prompt or transcript text: only models, timings
@@ -20,12 +23,22 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 import config
+from ai.claude import Claude, ClaudeError
 
 log = logging.getLogger("breadcrumbs.ai.gemini")
 
 T = TypeVar("T", bound=BaseModel)
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+# Billing or auth failures do not fix themselves mid-session: pause Gemini and skip straight to the
+# next provider instead of paying a doomed round trip on every call.
+UNAVAILABLE_STATUS = {401, 402, 403}
+GEMINI_PAUSE_S = 600.0
+# Muse Spark is a reasoning model: hidden reasoning tokens count against max_tokens, so a Gemini-sized
+# cap (400 to 600) left no room for the answer and the content came back empty (finish_reason "length").
+SPARK_REASONING_EFFORT = "minimal"  # Spark rejects "none"; minimal answered in ~1.8 s vs ~3.8 s default
+SPARK_REASONING_HEADROOM_TOKENS = 3000
+SPARK_TIMEOUT_S = 20.0
 _RETRYABLE_ERROR_NAMES = {"APIConnectionError", "APITimeoutError", "ServerError"}
 
 TTS_SAMPLE_RATE = 24_000
@@ -142,14 +155,48 @@ def parse_json(text: str, schema: type[T]) -> T:
         return schema.model_validate_json(cleaned[start : end + 1])
 
 
-def is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException, httpx.TransportError)):
-        return True
+def status_of(exc: BaseException) -> int | None:
     for attr in ("status_code", "code"):
         status = getattr(exc, attr, None)
         if isinstance(status, int):
-            return status in RETRYABLE_STATUS or status >= 500
+            return status
+    return None
+
+
+def is_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException, httpx.TransportError)):
+        return True
+    status = status_of(exc)
+    if status is not None:
+        return status in RETRYABLE_STATUS or status >= 500
     return type(exc).__name__ in _RETRYABLE_ERROR_NAMES
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    return status_of(exc) == 429 or type(exc).__name__ == "RateLimitError"
+
+
+def build_client(api_key: str) -> Any:
+    """genai.Client whose Interactions resource never retries on its own.
+
+    `_create` owns retries (and the Muse Spark fallback on a 429). Left at its defaults the SDK also
+    retries 408/409/429/5xx with 0.5 to 8 s backoff inside every one of our attempts, so one rate
+    limited call became 12 requests and reached Spark only after ~10 s. `HttpRetryOptions(attempts=1)`
+    turns SDK retries off for the classic API; the Interactions client in google-genai 2.33 maps
+    `attempts` to a retry *count* (so 1 still means one retry), hence its retry config is cleared too.
+    """
+    from google import genai  # imported lazily so mock mode never needs credentials
+    from google.genai import types
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1)),
+    )
+    try:
+        client.aio.interactions.sdk_configuration.retry_config = None
+    except AttributeError:  # a future SDK without this attribute: attempts=1 still bounds it
+        log.warning("could not disable SDK-level interactions retries")
+    return client
 
 
 # --- Client ---------------------------------------------------------------------------
@@ -168,6 +215,7 @@ class Gemini:
         timeout_s: float = 8.0,
         retries: int = 2,
         backoff_s: tuple[float, ...] = (0.25, 0.75),
+        claude: Claude | None = None,
     ) -> None:
         self.mock: bool = config.GEMINI_MOCK if mock is None else mock
         self._api_key = api_key if api_key is not None else config.GEMINI_API_KEY
@@ -177,19 +225,27 @@ class Gemini:
         self.retries = retries
         self.backoff_s = backoff_s
         self._http: httpx.AsyncClient | None = None
+        self.claude = claude
+        self._gemini_paused_until = 0.0
 
     # -- plumbing ----------------------------------------------------------------------
 
     @property
     def _interactions(self) -> Any:
         if self._client is None:
-            from google import genai  # imported lazily so mock mode never needs credentials
-
-            self._client = genai.Client(api_key=self._api_key)
+            self._client = build_client(self._api_key)
         return self._client.aio.interactions
 
     async def _create(self, *, timeout_s: float | None = None, retries: int | None = None, **body: Any) -> Any:
-        """interactions.create with a hard timeout and backoff retries on 429/5xx/timeouts."""
+        """interactions.create with a hard timeout and backoff retries on 429/5xx/timeouts.
+
+        Every call sets store=False: Breadcrumbs never reads an interaction back (no
+        previous_interaction_id), so nothing it sends should be kept on Google's side (PRD 15.1).
+        A 429 is not retried when Muse Spark is configured: the caller goes straight to Spark (11.4).
+        """
+        if not self.gemini_available:
+            raise GeminiError("gemini unavailable (no key, or paused after a billing or auth error)")
+        body["store"] = False
         timeout = timeout_s or self.timeout_s
         attempts = 1 + (self.retries if retries is None else retries)
         last: BaseException | None = None
@@ -204,10 +260,16 @@ class Gemini:
             except Exception as exc:  # noqa: BLE001 - classified below, never swallowed silently
                 last = exc
                 retry = is_retryable(exc) and attempt < attempts - 1
+                if retry and self.spark_available and is_rate_limited(exc):
+                    retry = False  # rate limited: hand over to Muse Spark now instead of backing off
                 log.warning(
                     "gemini %s failed (%s), attempt %d/%d%s",
                     body.get("model"), type(exc).__name__, attempt + 1, attempts, ", retrying" if retry else "",
                 )
+                if status_of(exc) in UNAVAILABLE_STATUS:
+                    self._gemini_paused_until = time.monotonic() + GEMINI_PAUSE_S
+                    log.warning("gemini unavailable (HTTP %s); pausing it for %.0f s", status_of(exc), GEMINI_PAUSE_S)
+                    break
                 if not retry:
                     break
                 await asyncio.sleep(self.backoff_s[min(attempt, len(self.backoff_s) - 1)])
@@ -216,12 +278,17 @@ class Gemini:
     async def _spark(self, *, system: str | None, user: str, max_tokens: int) -> str:
         """Muse Spark via the OpenAI-compatible Chat Completions endpoint (PRD 11.4)."""
         if self._http is None:
-            self._http = httpx.AsyncClient(timeout=self.timeout_s)
+            self._http = httpx.AsyncClient(timeout=SPARK_TIMEOUT_S)
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
         resp = await self._http.post(
             f"{config.META_API_BASE}/chat/completions",
             headers={"Authorization": f"Bearer {self._meta_key}"},
-            json={"model": config.MUSE_SPARK_MODEL, "messages": messages, "max_tokens": max_tokens},
+            json={
+                "model": config.MUSE_SPARK_MODEL,
+                "messages": messages,
+                "max_tokens": max_tokens + SPARK_REASONING_HEADROOM_TOKENS,
+                "reasoning_effort": SPARK_REASONING_EFFORT,
+            },
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
@@ -232,6 +299,15 @@ class Gemini:
     @property
     def spark_available(self) -> bool:
         return bool(self._meta_key)
+
+    @property
+    def gemini_available(self) -> bool:
+        has_key = bool(self._api_key) or self._client is not None
+        return has_key and time.monotonic() >= self._gemini_paused_until
+
+    @property
+    def claude_available(self) -> bool:
+        return self.claude is not None and self.claude.available
 
     async def aclose(self) -> None:
         if self._http is not None:
@@ -254,6 +330,11 @@ class Gemini:
         if self.mock:
             raise GeminiError("mock mode: callers use their deterministic mock path")
         user = payload if isinstance(payload, str) else jsonlib.dumps(payload, ensure_ascii=False)
+        if self.claude_available:
+            try:
+                return await self.claude.json(system=system, user=user, schema=schema, max_tokens=max_tokens)
+            except ClaudeError as exc:
+                log.warning("claude json failed (%s); trying the next provider", exc)
         json_schema = schema_for(schema)
         try:
             interaction = await self._create(
@@ -280,6 +361,11 @@ class Gemini:
     async def text(self, *, model: str, input: str, system: str | None = None, max_tokens: int = 300) -> str:
         if self.mock:
             raise GeminiError("mock mode: callers use their deterministic mock path")
+        if self.claude_available:
+            try:
+                return await self.claude.text(system=system, user=input, max_tokens=max_tokens)
+            except ClaudeError as exc:
+                log.warning("claude text failed (%s); trying the next provider", exc)
         body: dict[str, Any] = {
             "model": model,
             "input": input,
@@ -305,6 +391,13 @@ class Gemini:
         """Google Search grounded text: (text, citation_url, citation_title). Never raises."""
         if self.mock:
             return "", None, None
+        if self.claude_available:
+            try:
+                text, url, title = await self.claude.grounded(prompt)
+                if text and url:
+                    return text, url, title
+            except ClaudeError as exc:
+                log.warning("claude grounded failed (%s); trying Gemini", exc)
         try:
             interaction = await self._create(
                 model=config.GEMINI_MODEL,
@@ -353,8 +446,8 @@ _singleton: Gemini | None = None
 
 
 def get_gemini() -> Gemini:
-    """Process-wide Gemini instance (mock when GEMINI_API_KEY is missing)."""
+    """Process-wide AI gateway (mock only when neither GEMINI_API_KEY nor ANTHROPIC_API_KEY is set)."""
     global _singleton
     if _singleton is None:
-        _singleton = Gemini()
+        _singleton = Gemini(mock=config.AI_MOCK, claude=Claude() if config.CLAUDE_ENABLED else None)
     return _singleton

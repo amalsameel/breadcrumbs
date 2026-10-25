@@ -202,7 +202,9 @@ function StatusLine() {
         {config && (
           <>
             <Pill tone={config.mock.muse ? "amber" : "ok"}>Muse: {config.mock.muse ? "mock mode" : "live"}</Pill>
-            <Pill tone={config.mock.gemini ? "amber" : "ok"}>Gemini: {config.mock.gemini ? "mock mode" : "live"}</Pill>
+            <Pill tone={config.mock.gemini ? "amber" : "ok"}>
+              AI: {config.mock.gemini ? "mock mode" : `${config.ai_provider === "claude" ? "Claude" : "Gemini"}, live`}
+            </Pill>
             {!config.ffmpeg && <Pill tone="danger">ffmpeg missing: voice answers can't be converted</Pill>}
             {config.dev_tools && <Pill>Dev tools on</Pill>}
           </>

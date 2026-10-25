@@ -1,5 +1,5 @@
 // Pure helpers for the Table screen: names, captions, durations and orb state derivation.
-import type { Crumb, EngineSnapshot, Mode, Seat, SeatKey, SessionSummary } from "../../lib/types";
+import type { Crumb, EngineSnapshot, Mode, Phase, Seat, SeatKey, SessionSummary } from "../../lib/types";
 
 export const MODE_LABEL: Record<Mode, string> = {
   social: "Social",
@@ -101,6 +101,40 @@ export function isInsecureUrl(url: string): boolean {
   }
 }
 
+// ---- Mic copy (PRD 7 F2, 15.2) ----------------------------------------------
+
+/**
+ * What the Table says once the mic is open. Before both seats consent nothing leaves the laptop, and
+ * nothing is transcribed until calibration starts, so only then does it claim live transcription.
+ */
+export function micOnMessage(phase: Phase | null, bothConsented: boolean): string {
+  if (!bothConsented) return "Mic is ready. Nothing is sent until you have both consented.";
+  if (phase === "calibrating" || phase === "live") return "Mic is on. Audio is transcribed live and never stored.";
+  return "Mic is ready. Nothing is transcribed until you are both ready.";
+}
+
+/**
+ * A visible problem line when live transcription is down. Calibration waits on diarized turns, so
+ * without this a failed speech connection looks like a silent stall.
+ */
+export function speechServiceProblem(status: string | null | undefined, detail?: string): string | null {
+  const why = detail ? ` (${detail})` : "";
+  if (status === "reconnecting") return `Can't reach the speech service. Retrying${why}.`;
+  if (status === "error") return `Speech service error${why}. Check the server log.`;
+  if (status === "closed") return "Speech service disconnected. Tap Start listening again.";
+  return null;
+}
+
+// ---- X-ray thresholds (PRD F18, 16.2) ---------------------------------------
+
+export const DEFAULT_STALE_SWITCH = 0.6;
+
+/** The live-tuned STALE_SWITCH (the engine's "stale" cut-off), else the default. */
+export function staleThreshold(params: Record<string, unknown>): number {
+  const v = params.STALE_SWITCH;
+  return typeof v === "number" && Number.isFinite(v) ? v : DEFAULT_STALE_SWITCH;
+}
+
 // ---- Orb state (PRD 6.6) --------------------------------------------------
 
 export type OrbMode = "idle" | "listening" | "warming" | "crumb" | "holding" | "paused" | "safety";
@@ -111,10 +145,19 @@ export interface OrbView {
   detail: string | null;
 }
 
+/** A calibration prompt during live means the voices are being re-mapped after a reconnect. */
+export function isResyncStep(step: "seat1" | "seat2" | "done" | null): boolean {
+  return step === "seat1" || step === "seat2";
+}
+
 /** Every orb state carries a text label so no information is color-only (PRD 14.3). */
-export function deriveOrb(engine: EngineSnapshot | null, speaking: boolean): OrbView {
+export function deriveOrb(engine: EngineSnapshot | null, speaking: boolean, resyncing = false): OrbView {
   if (!engine) return { mode: "idle", label: "Connecting", detail: null };
   if (engine.listening_paused) return { mode: "paused", label: "Listening paused", detail: null };
+  if (resyncing) {
+    // Auto crumbs wait until both voices are mapped again (CONTRACTS on_muse_reconnect).
+    return { mode: "warming", label: "Re-syncing voices", detail: "Crumbs resume once both of you have spoken" };
+  }
   if (speaking) return { mode: "crumb", label: "Dropping a crumb", detail: null };
   if (engine.auto_paused) {
     return { mode: "safety", label: "Auto crumbs paused", detail: "Drop a crumb whenever you want one" };
