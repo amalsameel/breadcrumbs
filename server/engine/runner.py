@@ -24,6 +24,7 @@ import config
 from ai.classifiers import classify_hold, tag_energy
 from ai.crumbs import ConvoCtx, CrumbService, Delivery
 from ai.profiles import allowed_items
+from ai.elevenlabs import get_elevenlabs
 from ai.tts import synthesize
 from engine.core import Effect, Engine
 from models import Crumb, CrumbKind, EnergyTag, HoldDecision, OverlapSet
@@ -137,6 +138,9 @@ class SessionRunner:
             asyncio.create_task(self._tick_loop(), name="engine-tick"),
             asyncio.create_task(self._broadcast_loop(), name="engine-broadcast"),
         ]
+        # Open the ElevenLabs TLS connection now, so the first live line (calibration, a 1 s miss) skips
+        # the handshake. A no-op without a key.
+        self._spawn(self._warm_voice())
 
     async def stop(self) -> None:
         """Cancel every task and close Muse. Safe to call twice, and from inside a runner task."""
@@ -492,10 +496,18 @@ class SessionRunner:
         self._prefetch_due = now if self._prefetch_due is None else min(self._prefetch_due, now)
         log.info("crumb dispatched (kind=%s, source=%s, cache_hit=%s, %.0f ms)", crumb.kind, crumb.source, delivery.cache_hit, latency_ms)
 
+    async def _warm_voice(self) -> None:
+        try:
+            await get_elevenlabs().warm()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - warming is best effort
+            log.info("voice warm-up failed (%s)", type(exc).__name__)
+
     async def _say(self, speech_id: str, text: str) -> None:
         audio: bytes | None = None
         try:
-            audio = await asyncio.wait_for(synthesize(text), timeout=SAY_TIMEOUT_S)
+            audio = await asyncio.wait_for(synthesize(text, budget_s=SAY_TIMEOUT_S), timeout=SAY_TIMEOUT_S)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the Table falls back to speechSynthesis

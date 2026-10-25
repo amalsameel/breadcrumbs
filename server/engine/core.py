@@ -46,6 +46,9 @@ from engine.policy import (
 from engine.state import (
     BOT_SPEECH_MAX_S,
     COMPLETE_TIMEOUT_S,
+    ECHO_MIN_WORDS,
+    ECHO_REPLY_WORDS,
+    ECHO_WINDOW_S,
     STUCK_TURN_S,
     VAD_GRACE_S,
     BotInterval,
@@ -55,6 +58,8 @@ from engine.state import (
     TurnRecord,
     TurnTracker,
     count_words,
+    echo_overlap,
+    echo_tail_words,
     is_backchannel,
     is_question,
 )
@@ -68,6 +73,8 @@ HOLD_CONTEXT_TURNS = 4
 AWAIT_PLAYBACK_S = 8.0  # dispatched crumb not reported playing by then (chime + decode is ~1 s): stop waiting
 ROUND_WARNING_GAP_S = 5.0  # the 1-minute warning leaves room to answer the previous crumb (no back to back)
 ROUND_WARNING_REASON = "One minute left in the round: time check crumb"
+NOISE_LATCH_CLEAR_S = 4.0  # VAD quiet this long: the next onset gets its own confirmation window again
+BOT_LINES_KEPT = 8  # texts of the latest bot lines, for the echo check
 
 
 @dataclass
@@ -121,6 +128,14 @@ class Engine:
         self._vad_active = False
         self._vad_human = False  # current VAD stretch already counted as human speech
         self._last_human_activity_at = -math.inf
+        # Background noise (PRD 8.3): local VAD only counts as speech while Muse confirms it, or for
+        # VAD_UNCONFIRMED_S after its onset. Once a stretch outlives that unconfirmed, the room is noisy:
+        # later onsets need Muse too, until Muse hears someone or the VAD rests for NOISE_LATCH_CLEAR_S.
+        self._vad_since: float | None = None
+        self._vad_quiet_since = -math.inf
+        self._muse_heard_at = -math.inf
+        self._noise_latched = False
+        self._bot_lines: dict[str, str] = {}  # speech id -> text of recent crumbs and sys_ lines (echo check)
 
         self._listening_paused = False
         self._auto_paused = False
@@ -210,7 +225,7 @@ class Engine:
         if kind == "speechStart":
             return self._on_speech_start(self._turn_id(evt), now)
         if kind == "transcript":
-            return self._on_transcript(str(evt.get("transcript") or ""))
+            return self._on_transcript(str(evt.get("transcript") or ""), now)
         if kind == "speaker":
             label = evt.get("label")
             return self._on_speaker(str(label), now) if label is not None else []
@@ -233,6 +248,14 @@ class Engine:
             return []
         rec.turn.gap_before = self._gap_before(now)
         effects: list[Effect] = []
+        if self._echo_lines(rec, now):
+            # Muse transcribes our own voice (PRD 8.11): a turn that starts during a bot line, or within
+            # ECHO_WINDOW_S after it, waits for its first words. If they repeat the line it is echo (no
+            # barge-in, dropped as bot); otherwise it is handled like any other turn (_echo_verdict).
+            rec.echo_check = True
+            rec.provisional = True
+            rec.suspect_at_start = self._bot.suspect(now, self._tail_s)
+            return effects
         crumb_iv = self._bot.crumb_playing()
         if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_active:
             # Local VAD hears the room too: a real voice, so fade the crumb now. A Muse speechStart alone
@@ -242,8 +265,62 @@ class Engine:
         elif self._bot.suspect(now, self._tail_s):
             rec.provisional = True  # may be our own voice: decided at speechEnd (PRD 8.11)
         if not rec.provisional:
+            self._muse_heard(now)
             effects += self._human_activity(now)
         return effects
+
+    def _echo_lines(self, rec: TurnRecord, now: float) -> list[str]:
+        """Texts of the bot lines that may be sounding in the room since this turn started."""
+        sources = self._bot.echo_sources(rec.turn.started_at, now, ECHO_WINDOW_S)
+        return [self._bot_lines[iv.speech_id] for iv in sources if iv.speech_id in self._bot_lines]
+
+    def _echo_verdict(self, rec: TurnRecord, now: float, *, closing: bool = False) -> list[Effect]:
+        """Decide an echo-checked turn from its words: the bot's own line, or a person."""
+        text = rec.best_text
+        if count_words(text) < ECHO_MIN_WORDS:
+            return []  # not enough words yet (at speechEnd: decided by time overlap instead)
+        lines = self._echo_lines(rec, now)
+        overlap = max((echo_overlap(text, line) for line in lines), default=0.0)
+        rec.echo_check = False
+        if lines and overlap + EPS >= self.params.ECHO_TEXT_OVERLAP:
+            rec.echo = True
+            return []
+        rec.echo = False
+        effects: list[Effect] = []
+        crumb_iv = self._bot.crumb_playing()
+        if (not closing and crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S
+                and self._vad_active):
+            # Words that are not the line, and the room is loud too: a real voice (barge-in as before).
+            rec.provisional = False
+            self._muse_heard(now)
+            return self._barge_in(now, source="speechStart")
+        if not rec.suspect_at_start:
+            rec.provisional = False
+            self._muse_heard(now)
+            effects += self._human_activity(now)
+        return effects
+
+    def _echo_reply_check(self, rec: TurnRecord, now: float) -> list[Effect]:
+        """An open echo-marked turn whose transcript now ends in words the line never said: Muse kept one
+        turn open while our echo ran straight into a person's answer. From here on the turn is theirs
+        (captions, a held pause timer, a reset unanswered count). Without this the whole answer was
+        dropped as echo and a crumb could fire over the person while they talked."""
+        if echo_tail_words(rec.best_text, self._echo_lines(rec, now)) < ECHO_REPLY_WORDS:
+            return []
+        rec.echo = False
+        rec.provisional = False
+        rec.reply_after_echo = True
+        self._muse_heard(now)
+        crumb_iv = self._bot.crumb_playing()
+        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_active:
+            return self._barge_in(now, source="speechStart")  # cutting in while the line still plays
+        return self._human_activity(now)
+
+    def _note_bot_line(self, speech_id: str, text: str) -> None:
+        self._bot_lines.pop(speech_id, None)
+        self._bot_lines[speech_id] = text
+        while len(self._bot_lines) > BOT_LINES_KEPT:
+            self._bot_lines.pop(next(iter(self._bot_lines)))
 
     def _gap_before(self, now: float) -> float | None:
         others_open = sum(1 for r in self._tracker.open_records()) > 1
@@ -255,7 +332,7 @@ class Engine:
             prev = self._tracker.last_human_end
         return None if prev is None else max(0.0, now - prev)
 
-    def _on_transcript(self, text: str) -> list[Effect]:
+    def _on_transcript(self, text: str, now: float) -> list[Effect]:
         rec = self._tracker.current_open() or self._tracker.latest_uncommitted()
         if rec is None:
             return [{"type": "partial", "text": text, "label": None}]
@@ -263,7 +340,16 @@ class Engine:
         if rec.final is None:
             rec.turn.text = text
         rec.pre_hold = match_hold(text, self.params.HOLD_TAIL_WORDS)
-        return [{"type": "partial", "text": text, "label": rec.turn.label}]
+        effects: list[Effect] = []
+        if rec.open and rec.echo_check:
+            effects += self._echo_verdict(rec, now)
+        elif rec.open and rec.echo:
+            effects += self._echo_reply_check(rec, now)
+        elif rec.open and not rec.provisional:
+            self._muse_heard(now)  # Muse hears a person: local VAD activity right now is speech
+        if rec.echo:
+            return effects  # our own line coming back: not a caption for the people at the table
+        return [{"type": "partial", "text": text, "label": rec.turn.label}] + effects
 
     def _on_speaker(self, label: str, now: float) -> list[Effect]:
         rec = self._tracker.latest_unlabeled()
@@ -304,8 +390,18 @@ class Engine:
         self._tracker.mark_closed(rec)
         rec.turn.ended_at = now
         effects: list[Effect] = []
+        if rec.echo_check or rec.echo:
+            rec.echo_check = True  # re-checked on the whole turn: an echo start with a reply after it is human
+            effects += self._echo_verdict(rec, now, closing=True)
         ratio = self._bot.overlap_ratio(rec.turn.started_at, now, now, self._tail_s)
-        if ratio > BOT_OVERLAP_DROP:
+        if rec.echo:
+            rec.turn.dropped_as_bot = True
+            effects.append(self._decision(
+                "dropped_bot_turn", "Turn repeated the line Breadcrumbs was saying, not counted as human speech", now,
+                overlap_ratio=round(ratio, 3), duration_s=round(now - rec.turn.started_at, 2), turn_id=rec.turn.turn_id,
+                trigger="echo_text",
+            ))
+        elif ratio > BOT_OVERLAP_DROP and not rec.reply_after_echo:  # a reply after the echo is a person
             rec.turn.dropped_as_bot = True
             effects.append(self._decision(
                 "dropped_bot_turn", "Turn overlapped Breadcrumbs' own voice, not counted as human speech", now,
@@ -315,6 +411,7 @@ class Engine:
             if rec.provisional:
                 rec.provisional = False
                 effects += self._human_activity(now)
+            self._muse_heard(now)
             self._timer.reset(now)
             self._tracker.last_human_end = now
             if self._is_live_turn(rec.turn):
@@ -473,11 +570,27 @@ class Engine:
         self._touch(now)
         if self._phase == "ended" or self._listening_paused:
             return []  # mic stream stopped: frames are stale
-        self._vad_active = bool(active)
+        was_active, self._vad_active = self._vad_active, bool(active)
         if not active:
             self._vad_human = False
+            if was_active:
+                self._vad_quiet_since = now
             return []
+        if not was_active or self._vad_since is None:
+            rested = now - self._vad_quiet_since + EPS >= NOISE_LATCH_CLEAR_S
+            if rested:
+                self._noise_latched = False
+            # The confirmation window is kept through short releases: bursts of noise (nearby talk, dishes,
+            # a TV) share one, so they cannot each count as fresh speech and hold the timer forever. A new
+            # window opens after a quiet spell of NOISE_LATCH_CLEAR_S, or once Muse heard someone since.
+            if self._vad_since is None or rested or self._muse_heard_at > self._vad_since:
+                self._vad_since = now
         effects: list[Effect] = []
+        if not self._vad_speech(now):
+            # Unconfirmed past VAD_UNCONFIRMED_S: background noise, not a person. It no longer holds the
+            # pause timer, cancels crumbs, or barges in (issue: steady room noise froze every crumb).
+            self._noise_latched = True
+            return effects
         crumb_iv = self._bot.crumb_playing()
         if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S:
             effects += self._barge_in(now, source="vad")
@@ -556,6 +669,8 @@ class Engine:
             if self._listening_paused:
                 self._listening_paused = False
                 self._vad_active = self._vad_human = False
+                self._vad_since = None
+                self._noise_latched = False
                 self._timer.unfreeze(now)
             return []
         return []  # end / xray are handled by the runner
@@ -612,8 +727,8 @@ class Engine:
         return (
             self._phase == "live"
             and self._pending is None
-            and not self._tracker.any_open()
-            and not self._vad_active
+            and not self._turn_open()
+            and not self._vad_speech(self._now)
             and not self._bot.playing
             and self._awaiting_playback(self._now) is None
         )
@@ -658,6 +773,7 @@ class Engine:
                 if pending.auto:
                     self._ledger.cancel_auto_decision()  # faded at playback start: not a delivered crumb
         self._ledger.add(rec)
+        self._note_bot_line(crumb.id, crumb.text)
         self._awaiting = (crumb.id, now)
         spoke_since = pending is not None and self._last_human_activity_at > pending.decided_at
         if not spoke_since and not rec.cancelled:
@@ -819,7 +935,7 @@ class Engine:
         pre_existing = any(
             not r.provisional and r.turn.started_at < crumb_iv.start for r in self._tracker.open_records()
         )
-        if pre_existing or (self._vad_active and self._vad_human):
+        if pre_existing or (self._vad_human and self._vad_speech(now)):
             return self._barge_in(now, source="talking at playback start")
         return []
 
@@ -860,8 +976,8 @@ class Engine:
             listening_paused=self._listening_paused,
             seats_unmapped=not self._calib.complete,
             auto_paused=self._auto_paused,
-            turn_active=self._tracker.any_open(),
-            vad_active=self._vad_active,
+            turn_active=self._turn_open(),
+            vad_active=self._vad_speech(now),
             tts_playing=self._bot.playing or self._awaiting_playback(now) is not None,
             hold=hold.kind if hold is not None else None,
             silence_s=self.silence_s(now),
@@ -963,8 +1079,32 @@ class Engine:
         return effects
 
     def _human_talking(self) -> bool:
-        open_human = any(not r.provisional for r in self._tracker.open_records())
-        return open_human or (self._vad_active and self._vad_human)
+        return self._human_turn_open() or (self._vad_human and self._vad_speech(self._now))
+
+    def _human_turn_open(self) -> bool:
+        return any(not r.provisional for r in self._tracker.open_records())
+
+    def _turn_open(self) -> bool:
+        """A Muse turn is open (our own line echoed back by Muse does not count)."""
+        return any(not r.echo for r in self._tracker.open_records())
+
+    def _muse_heard(self, now: float) -> None:
+        """Muse heard a person: the local VAD activity around now is speech, not background noise."""
+        self._muse_heard_at = max(self._muse_heard_at, now)
+        self._noise_latched = False
+
+    def _vad_speech(self, now: float) -> bool:
+        """Local VAD activity that counts as speech: Muse confirms it (a human turn is open or was heard
+        within VAD_UNCONFIRMED_S), or the stretch is younger than that and the room is not known noisy."""
+        if not self._vad_active:
+            return False
+        if self._human_turn_open():
+            return True
+        window = self.params.VAD_UNCONFIRMED_S
+        ref = self._muse_heard_at
+        if not self._noise_latched and self._vad_since is not None:
+            ref = max(ref, self._vad_since)
+        return now - ref + EPS < window
 
     # ------------------------------------------------------------------ calibration (PRD 6.5)
 
@@ -989,6 +1129,7 @@ class Engine:
         else:
             speech_id = "sys_resync2" if resync else "sys_cal2"
             text = "Seat 2, your turn."
+        self._note_bot_line(speech_id, text)
         return [
             {"type": "calibration", "step": step, "label_map": self.label_map},
             {"type": "say", "id": speech_id, "text": text},
@@ -1051,7 +1192,7 @@ class Engine:
         return self.params.TTS_TAIL_MS / 1000.0
 
     def silence_s(self, now: float) -> float:
-        running = not (self._tracker.any_open() or self._vad_active or self._bot.playing)
+        running = not (self._turn_open() or self._vad_speech(now) or self._bot.playing)
         return self._timer.silence(now, running)
 
     def _recompute_staleness(self, now: float) -> None:
@@ -1137,6 +1278,7 @@ class Engine:
             "auto_paused": self._auto_paused,
             "turn_active": inp.turn_active,
             "vad_active": self._vad_active,
+            "noise_suspected": self._vad_active and not inp.vad_active,
             "tts_playing": inp.tts_playing,
             "pending_delivery": inp.pending_delivery,
             "crumbs_this_silence": self._crumbs_this_silence,

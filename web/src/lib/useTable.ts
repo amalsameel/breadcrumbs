@@ -1,9 +1,9 @@
 // Table state + I/O (PRD 6.5 to 6.7, 12.1, 14.1): the events socket (role=table), the mic capture,
 // the PCM uplink, crumb playback with barge-in, and every piece of Table UI state.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { startCapture, type CaptureHandle } from "../audio/capture";
+import { startCapture, type CaptureHandle, type VadReading } from "../audio/capture";
 import { CrumbPlayer } from "../audio/player";
-import { estimateSpeechS } from "../components/table/format";
+import { captionStage, estimateSpeechS } from "../components/table/format";
 import { BARGE_IN_FADE_MS, PlaybackGate, speakLine } from "../components/table/playback";
 import { initialState, tableReducer, type TableState } from "../components/table/tableState";
 import { api, ApiError } from "./api";
@@ -252,13 +252,17 @@ export function useTable(sid: string): [TableView, TableActions] {
   );
 
   const onVad = useCallback(
-    (active: boolean, rms: number) => {
+    (active: boolean, rms: number, reading?: VadReading) => {
       // Nothing about the room leaves the laptop until both seats consent (PRD 7 F2).
       if (pausedRef.current || !bothConsentedRef.current) return;
       const now = performance.now();
-      // Chime and first 300 ms of the voice: a new VAD onset there is held back (PRD 8.11.3).
-      if (gate.forward(active, now)) send({ type: "vad", active, rms });
-      if (gate.shouldFade(active, now)) playerRef.current?.fadeOut(BARGE_IN_FADE_MS);
+      // While a line sounds (and just after), activity at the level of our own echo is held back from the
+      // server and never fades the line; a voiced reading clearly louder than the echo is a person
+      // (barge-in, PRD 6.7). The chime and first 300 ms of the voice stay a grace (PRD 8.11.3).
+      const levelDb = reading?.levelDb ?? 20 * Math.log10(Math.max(rms, 1e-9));
+      const verdict = gate.observe({ active, levelDb, voiced: reading?.voiced ?? active }, now);
+      if (verdict.send) send({ type: "vad", active, rms });
+      if (verdict.fade) playerRef.current?.fadeOut(BARGE_IN_FADE_MS);
     },
     [send, gate],
   );
@@ -300,6 +304,12 @@ export function useTable(sid: string): [TableView, TableActions] {
 
   const control = useCallback((action: ControlAction) => send({ type: "control", action }), [send]);
 
+  // Latest state for actions that read it (Skip) without rebuilding the actions object on every event.
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
   const actions = useMemo<TableActions>(
     () => ({
       startListening,
@@ -309,6 +319,11 @@ export function useTable(sid: string): [TableView, TableActions] {
         // A crumb still in its chime is skipped too: it must not start afterwards.
         const current = gate.currentId;
         if (current) interruptedRef.current.add(current);
+        // Take the skipped line's caption down at once (no reading time, no "last crumb" recap).
+        const now = performance.now();
+        const last = stateRef.current.crumbs.at(-1);
+        const shown = current ?? (last && captionStage(last, now) === "full" ? last.id : null);
+        if (shown) dispatch({ type: "line_skipped", id: shown, at: now });
         fadeIfPlaying();
         control("skip");
       },

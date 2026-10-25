@@ -9,10 +9,13 @@ the opener. By default it then fast-forwards, without ticking, past the opener's
 script time 0 starts clean (`"skip_warmup": false` keeps the warm-up: script time 0 = opener end).
 Scripts should start with a turn at 0.0.
 
-Script keys: name, mode, turns[{seat, text, start, end, label?, echo?, complete_delay?}],
+Script keys: name, mode, turns[{seat, text, start, end, label?, echo?, vad_from?, complete_delay?}],
 expect[{between: [a, b], action, kind?, count?, at?, tolerance?}], and optional duration, prior_crumb_at,
 controls[{t, action}], hold_results{"<turn index>": HoldDecision fields + delay_s?}, energy_results[...],
-tts_seconds (3.0), gen_latency_s (0), skip_warmup (true), names.
+tts_seconds (3.0), gen_latency_s (0), skip_warmup (true), names, noise[{start, end}] (local VAD active
+with no Muse turn: background noise), crumb_text (the text of every simulated crumb, so an `echo` turn can
+repeat the line the way Muse transcribes the bot's own voice). An `echo` turn has no local VAD, except
+from `vad_from` (script time) to its end: a person answering in the same Muse turn as the echo.
 
 CLI: python -m sim.replay sim/scripts/<name>.json [more.json ...]
 """
@@ -76,6 +79,7 @@ class _Sim:
         self.tts_seconds = float(script.get("tts_seconds", 3.0))
         self.gen_latency_s = float(script.get("gen_latency_s", 0.0))
         self.energy_results = list(script.get("energy_results") or [])
+        self.crumb_text = str(script.get("crumb_text") or "Simulated crumb.")
 
         self._heap: list[tuple[float, int, Callable[..., None], tuple]] = []
         self._seq = itertools.count()
@@ -195,7 +199,7 @@ class _Sim:
             return
         self._crumb_n += 1
         crumb = Crumb(
-            id=f"c_{self._crumb_n}", kind=kind, format="question", text="Simulated crumb.",
+            id=f"c_{self._crumb_n}", kind=kind, format="question", text=self.crumb_text,
             addressed_to="both", source="conversation", topic=f"sim topic {self._crumb_n}", depth=1,
             why="Simulator crumb.",
         )
@@ -301,8 +305,13 @@ class _Sim:
             label = turn.get("label", SEAT_LABELS.get(seat) if seat is not None else None)
             start, end = self.base + float(turn["start"]), self.base + float(turn["end"])
             self._turn_index_by_start[round(float(turn["start"]), 3)] = i
-            self.schedule_turn(label, turn["text"], start, end, echo=bool(turn.get("echo", False)),
+            echo = bool(turn.get("echo", False))
+            self.schedule_turn(label, turn["text"], start, end, echo=echo,
                                complete_delay=float(turn.get("complete_delay", COMPLETE_DELAY_S)))
+            if echo and turn.get("vad_from") is not None:
+                self._vad_spans.append((self.base + float(turn["vad_from"]), end))
+        for span in self.script.get("noise") or []:
+            self._vad_spans.append((self.base + float(span["start"]), self.base + float(span["end"])))
         controls = list(self.script.get("controls") or [])
         if "prior_crumb_at" in self.script:
             controls.append({"t": self.script["prior_crumb_at"], "action": "spark"})
@@ -318,6 +327,7 @@ def script_duration(script: dict) -> float:
     ends = [float(t["end"]) for t in script.get("turns", [])]
     ends += [float(e["between"][1]) for e in script.get("expect", [])]
     ends += [float(c["t"]) for c in script.get("controls", []) or []]
+    ends += [float(n["end"]) for n in script.get("noise", []) or []]
     return (max(ends) if ends else 0.0) + 1.0
 
 

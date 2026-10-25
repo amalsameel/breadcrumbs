@@ -45,8 +45,10 @@ def test_speech_start_barges_in_only_with_local_vad() -> None:
     e.crumb_dispatched(crumb("c_2"), 30.0, 300.0, True)
     e.on_tts_state("c_2", True, 30.0)
     e.on_vad(True, 0.2, 30.1)  # inside the chime grace
-    fx = e.on_muse_event({"type": "speechStart", "turnId": 61}, 30.5)  # Muse + VAD agree: barge at once
-    assert of_type(fx, "barge_in") == [{"type": "barge_in", "crumb_id": "c_2"}]
+    fx = e.on_muse_event({"type": "speechStart", "turnId": 61}, 30.5)
+    assert of_type(fx, "barge_in") == []  # round 2: during a line Muse waits for the first words (echo check)
+    fx = e.on_muse_event({"type": "transcript", "transcript": "Wait, can I", "final": False}, 30.6)
+    assert of_type(fx, "barge_in") == [{"type": "barge_in", "crumb_id": "c_2"}]  # not the line + VAD: barge
 
 
 # --- hold negatives apply only to the matches they target (PRD 8.6, Appendix A) ----------------------

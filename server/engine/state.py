@@ -17,6 +17,9 @@ VAD_GRACE_S = 0.3  # PRD 8.11: barge-in ignored for the first 300 ms of playback
 BOT_INTERVAL_KEEP_S = 300.0
 BOT_SPEECH_MAX_S = 20.0  # longest crumb (28 words) or system line, even via slow speechSynthesis, plus margin
 SYS_PREFIX = "sys_"
+ECHO_WINDOW_S = 1.0  # a Muse turn starting during bot speech or this soon after may be the bot's own voice
+ECHO_MIN_WORDS = 2  # words needed before the echo check decides (the first partial is often one word)
+ECHO_REPLY_WORDS = 3  # new words at the end of an echo-marked turn that make it a person's reply (same Muse turn)
 
 QUESTION_WORDS = frozenset({
     "what", "why", "how", "when", "where", "who", "whom", "whose", "which",
@@ -65,6 +68,61 @@ def _normalize_backchannel(text: str) -> list[str]:
     return out
 
 
+def _echo_words(text: str) -> list[str]:
+    """Lowercased words with simple ASR variants folded (possessive 's, plural s)."""
+    out: list[str] = []
+    for w in _WORD_RE.findall(text.lower().replace("’", "'")):
+        if w.endswith("'s"):
+            w = w[:-2]
+        if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        out.append(w)
+    return out
+
+
+def _line_pairs(lines: list[str]) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for line in lines:
+        words = _echo_words(line)
+        pairs.update(zip(words, words[1:]))
+    return pairs
+
+
+def _echo_covered(words: list[str], pairs: set[tuple[str, str]]) -> list[bool]:
+    """Per word: it sits in an adjacent word pair that also occurs in the line(s)."""
+    covered = [False] * len(words)
+    for i in range(len(words) - 1):
+        if (words[i], words[i + 1]) in pairs:
+            covered[i] = covered[i + 1] = True
+    return covered
+
+
+def echo_overlap(text: str, line: str) -> float:
+    """How much of `text` repeats `line` (0 to 1): the share of the text's words that sit in a word pair
+    (adjacent bigram) that also occurs in the line. Echo transcripts are runs of the line, so they score
+    high even with a few ASR errors; a reply that merely shares words with it ("Hi, I'm from Austin" after
+    "say hi and tell Dev where you're from") scores low. Fewer than 2 words gives 0 (undecidable)."""
+    words = _echo_words(text)
+    if len(words) < 2:
+        return 0.0
+    covered = _echo_covered(words, _line_pairs([line]))
+    return sum(covered) / len(words)
+
+
+def echo_tail_words(text: str, lines: list[str]) -> int:
+    """How many words at the end of `text` repeat none of `lines` (no shared adjacent word pair). Muse can
+    keep one turn open when the bot's echo runs straight into a person's answer: the transcript is then the
+    line followed by the reply, and this counts the reply words after the echo. A single ASR slip inside an
+    echo uncovers one word, so a run of several uncovered words at the end is a person talking."""
+    words = _echo_words(text)
+    n = 0
+    for c in reversed(_echo_covered(words, _line_pairs(lines))):
+        if c:
+            break
+        n += 1
+    return n
+
+
 def is_backchannel(text: str) -> bool:
     words = _normalize_backchannel(text)
     if not words or len(words) > 4:
@@ -92,6 +150,10 @@ class TurnRecord:
     pre_hold: HoldKind | None = None  # lexical hold seen on the latest partial
     hold_kind: HoldKind | None = None  # hold armed by this turn (for the `turn` effect)
     classified: bool = False
+    echo_check: bool = False  # started during (or just after) a bot line: wait for words before acting
+    echo: bool = False  # its words repeat the bot line being spoken: our own voice, never a human turn
+    suspect_at_start: bool = False  # started inside bot speech or its tail (provisional before the echo check)
+    reply_after_echo: bool = False  # echo-marked first, then a person's reply in the same Muse turn
 
     @property
     def best_text(self) -> str:
@@ -245,6 +307,16 @@ class BotSpeech:
             if iv.end is None and iv.is_crumb:
                 return iv
         return None
+
+    def echo_sources(self, since: float, now: float, window_s: float) -> list[BotInterval]:
+        """Bot lines that may still be sounding in the room at `since`: playing, or ended less than
+        `window_s` before it. A line a human barged in on before `since` is theirs from then on."""
+        return [
+            iv for iv in self.intervals
+            if iv.start <= now
+            and (iv.end is None or since < iv.end + window_s)
+            and (iv.barged_at is None or iv.barged_at > since)
+        ]
 
     def suspect(self, now: float, tail_s: float) -> bool:
         """True while the bot is speaking or within the tail after it stopped (speech may be echo)."""

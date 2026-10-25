@@ -13,7 +13,7 @@ SCRIPT_PATHS = sorted(SCRIPTS_DIR.glob("*.json"))
 
 
 def test_all_prd_scripts_present() -> None:
-    assert {p.stem for p in SCRIPT_PATHS} == REQUIRED
+    assert REQUIRED <= {p.stem for p in SCRIPT_PATHS}
     for p in SCRIPT_PATHS:
         s = load_script(p)
         assert s["name"] == p.stem and s["expect"] and s["turns"]

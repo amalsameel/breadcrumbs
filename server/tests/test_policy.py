@@ -592,6 +592,8 @@ def test_barge_in_by_speech_start_and_never_for_system_lines() -> None:
     e.on_tts_state("c_2", True, 30.0)
     assert of_type(e.on_vad(True, 0.2, 30.1), "barge_in") == []  # chime grace: VAD alone does not barge yet
     fx = e.on_muse_event({"type": "speechStart", "turnId": 61}, 30.4)  # Muse speechStart + local VAD
+    assert of_type(fx, "barge_in") == []  # waits for the first words: they might be the crumb's own echo
+    fx = e.on_muse_event({"type": "transcript", "transcript": "Oh wait actually", "final": False}, 30.6)
     assert of_type(fx, "barge_in") == [{"type": "barge_in", "crumb_id": "c_2"}]
     assert decisions(fx, "barge_in")[0]["inputs"]["trigger"] == "speechStart"
 

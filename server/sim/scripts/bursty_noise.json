@@ -1,0 +1,137 @@
+{
+  "name": "bursty_noise",
+  "mode": "social",
+  "description": "Noise in bursts (2.0 s on, 0.6 s off, like nearby talk or dishes) from 50 s on, with no Muse turn after the exchange ends at 53.9 s. The bursts share one confirmation window instead of each getting a fresh 2.5 s: the burst that starts at 55.2 s, right after Muse last heard someone, still counts (it could be the same person), then the room is marked noisy and a steer fires at 62.1 s (57.2 + 5.0 - 0.1), without barging in. Before the fix no crumb ever fired.",
+  "noise": [
+    {
+      "start": 50.0,
+      "end": 52.0
+    },
+    {
+      "start": 52.6,
+      "end": 54.6
+    },
+    {
+      "start": 55.2,
+      "end": 57.2
+    },
+    {
+      "start": 57.8,
+      "end": 59.8
+    },
+    {
+      "start": 60.4,
+      "end": 62.4
+    },
+    {
+      "start": 63.0,
+      "end": 65.0
+    },
+    {
+      "start": 65.6,
+      "end": 67.6
+    },
+    {
+      "start": 68.2,
+      "end": 70.2
+    },
+    {
+      "start": 70.8,
+      "end": 72.8
+    },
+    {
+      "start": 73.4,
+      "end": 75.0
+    }
+  ],
+  "duration": 75.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 49.2,
+      "end": 53.9
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        53.9,
+        57.2
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        57.2,
+        66.0
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 62.1,
+      "tolerance": 0.3
+    },
+    {
+      "between": [
+        53.9,
+        75.0
+      ],
+      "action": "crumb_interrupted",
+      "count": 0
+    }
+  ]
+}

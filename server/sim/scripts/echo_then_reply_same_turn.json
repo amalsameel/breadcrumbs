@@ -1,0 +1,112 @@
+{
+  "name": "echo_then_reply_same_turn",
+  "mode": "social",
+  "description": "Muse keeps one turn open while the steer's echo (59.4 s) runs straight into seat 2's answer: the partials are the line, then the reply, until 78 s. Once three words the line never said arrive the turn is a person's, so no crumb fires while they talk, nothing barges in, and the turn is not dropped as bot speech. Before the fix the whole answer was treated as echo and a switch fired over it at 76.9 s.",
+  "crumb_text": "So what is something you both love doing on the weekends?",
+  "duration": 80.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 49.2,
+      "end": 53.9
+    },
+    {
+      "seat": 2,
+      "label": "B",
+      "echo": true,
+      "vad_from": 62.4,
+      "text": "So what is something you both love doing on the weekends? Oh that is easy, we both love going to the farmers market on Saturday mornings and then cooking a huge brunch together with whatever we found there. It started as a once a month thing during sophomore year, and now we basically plan the whole week around it, which sounds a little silly, but it is honestly the best part of the weekend for both of us and our roommates keep asking to come along",
+      "start": 59.4,
+      "end": 78.0
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        53.9,
+        59.4
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 58.9
+    },
+    {
+      "between": [
+        59.4,
+        78.0
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        53.9,
+        80.0
+      ],
+      "action": "crumb_interrupted",
+      "count": 0
+    },
+    {
+      "between": [
+        59.4,
+        80.0
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}

@@ -119,6 +119,8 @@ export interface EngineSnapshot {
   auto_paused: boolean; // safety pause (PRD 15.3)
   turn_active: boolean;
   vad_active: boolean;
+  /** Local VAD is active but Muse has not confirmed speech within VAD_UNCONFIRMED_S: likely background noise. */
+  noise_suspected: boolean;
   tts_playing: boolean;
   pending_delivery: boolean;
   crumbs_this_silence: number;
