@@ -790,3 +790,9 @@ Results (keys blanked: MODEL_API_KEY= GEMINI_API_KEY= ANTHROPIC_API_KEY= ELEVENL
 - ⚠️ Not verified live: the noise margins (8 / 12 dB, 6 dB rise) in a real room, fast mode on this account (needs a billed probe), and the Just talk setup end to end with real keys. Deferred on purpose: worklet pitch / music classifier, auto-gain changes, audio while listening is paused, Muse queue changes
 - Tests (re-run for this entry, every key blanked): `pytest -q` → 762 passed; `sim.replay` → 41/41 PASS; `sim.usage --setup both` → with profiles 63 Claude calls (~54,944 input tokens) / 10 ElevenLabs calls / 812.5 credits, Just talk 62 calls (~55,287 tokens) / 8 calls / 769.5 credits, steers decided at 3.05 s p50 (max 3.07) in both, 7 of 8 crumbs from cache; `sim.usage --bystanders` → gating on 77 "turn committed" prefetches / 64 Claude calls, off 123 / 95; `sim.smoke_e2e --setup both` on a keyless mock server at 8133 (stopped afterwards; port 8000 untouched) → 46/46 (Just talk: icebreaker 3.10 s after live, steer 3.07 s); web table 130, audio 14, phone 26 pass; `web/dist` bundle 575,731 bytes (Vite reported 575.73 kB, 183.72 kB gzip; not rebuilt for this entry)
 - Requests: none
+
+## 2026-10-25: Noise + Just talk round shipped and live
+
+- Committed `92a4746` (noise gating, 3 s timing, Just talk setup, one-orb Home) and `99fece6` (README hash). Pushed to main.
+- Re-verified locally with keys blanked: pytest 762 passed, sim.replay 41/41, web build OK, web tests 130 + 14 + 26. Home and the Just talk consent card checked in Chrome on a keyless preview server (port 8133, stopped afterwards).
+- The old quick tunnel had expired ("Tunnel not found"); started a new one, updated `PUBLIC_BASE_URL` in `.env`, restarted the live server with real keys.
