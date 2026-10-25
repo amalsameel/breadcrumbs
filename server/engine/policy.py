@@ -77,6 +77,7 @@ class CrumbRecord:
     ended_at: float | None = None
     interrupted: bool = False
     skipped: bool = False
+    cancelled: bool = False  # cancelled while generating but sent anyway: faded at playback start
     human_turns_after: int = 0
     human_turns_within_window: int = 0
 
@@ -110,7 +111,12 @@ class CrumbLedger:
 
     @property
     def last(self) -> CrumbRecord | None:
-        return self.records[-1] if self.records else None
+        """The last crumb that was actually delivered (cooldowns, steer landing). A crumb cancelled while it
+        was generated never reached the room, so it does not restart the cooldown."""
+        for rec in reversed(self.records):
+            if not rec.cancelled:
+                return rec
+        return None
 
     def note_auto_decision(self, now: float) -> None:
         self.auto_decisions.append(now)

@@ -587,10 +587,13 @@ def test_barge_in_by_speech_start_and_never_for_system_lines() -> None:
     assert of_type(e.on_muse_event({"type": "speechStart", "turnId": 60}, 21.0), "barge_in") == []
     e.on_tts_state("sys_line", False, 22.0)
     e.on_muse_event({"type": "speechEnd", "turnId": 60}, 22.5)
+    e.on_vad(False, 0.0, 22.5)
     e.crumb_dispatched(crumb("c_2"), 30.0, 300.0, True)
     e.on_tts_state("c_2", True, 30.0)
-    fx = e.on_muse_event({"type": "speechStart", "turnId": 61}, 31.0)
+    assert of_type(e.on_vad(True, 0.2, 30.1), "barge_in") == []  # chime grace: VAD alone does not barge yet
+    fx = e.on_muse_event({"type": "speechStart", "turnId": 61}, 30.4)  # Muse speechStart + local VAD
     assert of_type(fx, "barge_in") == [{"type": "barge_in", "crumb_id": "c_2"}]
+    assert decisions(fx, "barge_in")[0]["inputs"]["trigger"] == "speechStart"
 
 
 def test_crumb_overtaken_by_speech_is_cancelled_at_playback_start() -> None:

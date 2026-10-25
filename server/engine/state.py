@@ -15,6 +15,7 @@ STUCK_TURN_S = 30.0  # speechStart with no speechEnd for this long is force-clos
 COMPLETE_TIMEOUT_S = 5.0  # a closed turn with no speechComplete is committed with its best partial
 VAD_GRACE_S = 0.3  # PRD 8.11: barge-in ignored for the first 300 ms of playback (chime)
 BOT_INTERVAL_KEEP_S = 300.0
+BOT_SPEECH_MAX_S = 20.0  # longest crumb (28 words) or system line, even via slow speechSynthesis, plus margin
 SYS_PREFIX = "sys_"
 
 QUESTION_WORDS = frozenset({
@@ -235,6 +236,9 @@ class BotSpeech:
     @property
     def playing(self) -> bool:
         return any(iv.end is None for iv in self.intervals)
+
+    def open_intervals(self) -> list[BotInterval]:
+        return [iv for iv in self.intervals if iv.end is None]
 
     def crumb_playing(self) -> BotInterval | None:
         for iv in reversed(self.intervals):

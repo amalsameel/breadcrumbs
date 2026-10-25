@@ -181,7 +181,18 @@ class _Sim:
         self._tts_token[speech_id] = token
         self.at(self.now + BARGE_IN_FADE_MS / 1000.0, self._end_play, speech_id, token)
 
+    def _generate(self, kind: CrumbKind) -> None:
+        """A `deliver` (or `round_warning`) effect: the crumb is ready after `gen_latency_s`."""
+        if self.gen_latency_s > 0:
+            self.at(self.now + self.gen_latency_s, self._dispatch, kind)
+        else:
+            self._dispatch(kind)
+
     def _dispatch(self, kind: CrumbKind) -> None:
+        if self.engine.pending_cancelled:  # PRD 8.1: speech or Skip arrived while it was generated
+            self._record("crumb_cancelled", kind, "cancelled while generating")
+            self.handle(self.engine.crumb_cancelled(self.now))
+            return
         self._crumb_n += 1
         crumb = Crumb(
             id=f"c_{self._crumb_n}", kind=kind, format="question", text="Simulated crumb.",
@@ -206,10 +217,7 @@ class _Sim:
         typ = eff.get("type")
         if typ == "deliver":
             self._record(eff["kind"], eff["kind"], eff.get("reason", ""))
-            if self.gen_latency_s > 0:
-                self.at(self.now + self.gen_latency_s, self._dispatch, eff["kind"])
-            else:
-                self._dispatch(eff["kind"])
+            self._generate(eff["kind"])
         elif typ == "barge_in":
             self._record("crumb_interrupted", None, "barge-in", crumb_id=eff.get("crumb_id"))
             self._fade(eff.get("crumb_id"))
@@ -228,6 +236,8 @@ class _Sim:
             self._on_decision(eff["decision"])
         elif typ in ("round_warning", "round_end"):
             self._record(typ, None, typ)
+            if typ == "round_warning":  # the runner turns it into a switch crumb with a time instruction
+                self._generate("switch")
             if typ == "round_end":
                 self.handle(self.engine.end(self.now))
                 self.stopped = True
@@ -266,9 +276,16 @@ class _Sim:
 
     def preroll(self) -> None:
         self.at(0.0, lambda: self.handle(self.engine.start_calibration(self.now)))
-        self.run_window(0.0, PREROLL_LIMIT_S, until=lambda: self.opener_end is not None)
+        self.run_window(0.0, PREROLL_LIMIT_S, until=self._preroll_done)
         if self.engine.phase != "live" or self.opener_end is None:
             raise RuntimeError("simulator: calibration or opener did not complete")
+
+    def _preroll_done(self) -> bool:
+        if self.opener_end is None and self.engine.phase == "live" and self._opener_id is None:
+            snap = self.engine.snapshot(self.now)
+            if not snap["pending_delivery"] and not snap["tts_playing"]:
+                self.opener_end = self.now  # no opener (safety pause during calibration): live starts now
+        return self.opener_end is not None
 
     def run_script(self) -> None:
         skip = bool(self.script.get("skip_warmup", True))

@@ -45,7 +45,8 @@ NEGATIVE_PATTERNS: list[str] = [
 # PRD 15.3: a small distress lexicon. A hit pauses automatic crumbs for the rest of the session.
 SAFETY_PATTERNS: list[str] = [
     r"\b(kill|hurt|harm|cut) myself\b",
-    r"\b(want|wanna) to die\b",
+    r"\b(want to|wanna) die\b",
+    r"\bdon'?t want to (live|be alive|be here) anymore\b",
     r"\bend (my life|it all)\b",
     r"\bsuicid(e|al)\b",
     r"\bself[- ]harm\b",
@@ -60,6 +61,9 @@ _KIND_PRIORITY: dict[str, int] = {"think": 1, "show": 2, "external": 3}
 
 _HOLD_RES = {kind: [re.compile(p, re.IGNORECASE) for p in pats] for kind, pats in HOLD_PATTERNS.items()}
 _NEGATIVE_RES = [re.compile(p, re.IGNORECASE) for p in NEGATIVE_PATTERNS]
+_SURPRISE_RE, _CANT_WAIT_RE = _NEGATIVE_RES
+SURPRISE_TERMINAL_SLACK_WORDS = 2  # after a surprise, a hold phrase must end the turn (at most 2 more words)
+SURPRISE_LOOKBACK_WORDS = 3  # "wait, really?" may start just before the 8-word tail
 _SAFETY_RES = [re.compile(p, re.IGNORECASE) for p in SAFETY_PATTERNS]
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -75,21 +79,71 @@ def tail(text: str, n_words: int = HOLD_TAIL_WORDS) -> str:
     return " ".join(tokens[-n_words:]) if n_words > 0 else ""
 
 
-def match_hold(text: str, n_words: int = HOLD_TAIL_WORDS) -> HoldKind | None:
-    """Lexical hold kind in the tail of a turn, or None. When several kinds match, the phrase closest
-    to the end of the turn wins (ties: external > show > think)."""
+def _words_after(t: str, pos: int) -> int:
+    return len(_WORD_RE.findall(t[pos:]))
+
+
+def _vetoed(t: str, start: int, end: int, surprise_end: int | None) -> bool:
+    """Appendix A negatives, each applied only to the matches it is about.
+
+    - "can't wait" vetoes a match that overlaps it (the trailing-"wait" pattern), not the whole tail:
+      "I can't wait, hold on, let me show you." is still a show hold.
+    - "wait, really/what/... + more speech" means the speaker kept going. A hold phrase only survives if it
+      comes after the surprise and ends the turn ("Wait, really? Let me pull it up."), so "Wait, really?
+      Hold on, that's insane, how did you..." stays a non-hold.
+    """
+    for m in _CANT_WAIT_RE.finditer(t):
+        if start < m.end() and m.start() < end:
+            return True
+    if surprise_end is not None:
+        if start < surprise_end or _words_after(t, end) > SURPRISE_TERMINAL_SLACK_WORDS:
+            return True
+    return False
+
+
+def _surprise_end(text: str, t: str, n_words: int) -> int | None:
+    """End of "wait, really" (in tail coordinates, may be <= 0) when a surprise followed by more speech is
+    in or just before the tail: the 8-word window can cut off the "wait" of "Wait, what? Hold on, ...". """
+    wide = tail(text, n_words + SURPRISE_LOOKBACK_WORDS)
+    m = _SURPRISE_RE.search(wide)
+    return None if m is None else m.end(1) - (len(wide) - len(t))
+
+
+def _lexical_hits(text: str, n_words: int) -> list[tuple[int, int, HoldKind, bool]]:
+    """Every positive match in the tail: (start, end, kind, vetoed)."""
     t = tail(text, n_words)
-    if not t or any(r.search(t) for r in _NEGATIVE_RES):
-        return None
-    best: tuple[int, int] | None = None
-    best_kind: HoldKind | None = None
+    surprise_end = _surprise_end(text, t, n_words)
+    hits: list[tuple[int, int, HoldKind, bool]] = []
     for kind, regexes in _HOLD_RES.items():
         for regex in regexes:
             for m in regex.finditer(t):
-                key = (m.end(), _KIND_PRIORITY[kind])
-                if best is None or key > best:
-                    best, best_kind = key, kind  # type: ignore[assignment]
+                vetoed = _vetoed(t, m.start(), m.end(), surprise_end)
+                hits.append((m.start(), m.end(), kind, vetoed))  # type: ignore[arg-type]
+    return hits
+
+
+def match_hold(text: str, n_words: int = HOLD_TAIL_WORDS) -> HoldKind | None:
+    """Lexical hold kind in the tail of a turn, or None. When several kinds match, the phrase closest
+    to the end of the turn wins (ties: external > show > think)."""
+    if not tail(text, n_words):
+        return None
+    best: tuple[int, int] | None = None
+    best_kind: HoldKind | None = None
+    for _, end, kind, vetoed in _lexical_hits(text, n_words):
+        if vetoed:
+            continue
+        key = (end, _KIND_PRIORITY[kind])
+        if best is None or key > best:
+            best, best_kind = key, kind
     return best_kind
+
+
+def hold_vetoed(text: str, n_words: int = HOLD_TAIL_WORDS) -> bool:
+    """A hold phrase is in the tail but a negative pattern overrode it: worth a classifier check (PRD 8.6
+    step 2), since the lexicon alone cannot tell surprise from an intentional pause every time."""
+    if not tail(text, n_words) or match_hold(text, n_words) is not None:
+        return False
+    return any(v for *_, v in _lexical_hits(text, n_words))
 
 
 def is_ambiguous_fragment(text: str) -> bool:

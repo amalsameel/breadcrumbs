@@ -25,6 +25,7 @@ from engine import staleness as stale_mod
 from engine.hold import (
     HOLD_CONFIDENCE_MIN,
     Hold,
+    hold_vetoed,
     is_ambiguous_fragment,
     is_distress,
     match_hold,
@@ -43,6 +44,7 @@ from engine.policy import (
     thresholds,
 )
 from engine.state import (
+    BOT_SPEECH_MAX_S,
     COMPLETE_TIMEOUT_S,
     STUCK_TURN_S,
     VAD_GRACE_S,
@@ -63,6 +65,9 @@ EnginePhase = Literal["calibrating", "live", "ended"]
 BOT_OVERLAP_DROP = 0.5  # PRD 8.11: a turn overlapping bot speech by more than 50% is not human
 ENERGY_CONTEXT_TURNS = 8
 HOLD_CONTEXT_TURNS = 4
+AWAIT_PLAYBACK_S = 8.0  # dispatched crumb not reported playing by then (chime + decode is ~1 s): stop waiting
+ROUND_WARNING_GAP_S = 5.0  # the 1-minute warning leaves room to answer the previous crumb (no back to back)
+ROUND_WARNING_REASON = "One minute left in the round: time check crumb"
 
 
 @dataclass
@@ -70,6 +75,10 @@ class _Pending:
     kind: CrumbKind
     auto: bool
     decided_at: float
+    reason: str = ""
+    round_warning: bool = False
+    cancelled: bool = False  # PRD 8.1: speech or Skip arrived while generating; the runner must not send it
+    requeued: bool = False  # cancelled by speech but still wanted (manual, opener, round warning)
 
 
 def _r(x: float | None, nd: int = 2) -> float | None:
@@ -119,6 +128,8 @@ class Engine:
         self._quiet_announced = False
         self._pending: _Pending | None = None
         self._queued: tuple[CrumbKind, str] | None = None
+        self._awaiting: tuple[str, float] | None = None  # (crumb_id, dispatched_at) until the Table plays it
+        self._force_closed: set[str] = set()  # bot speech the engine closed itself (lost playing:false)
         self._barged: set[str] = set()
         self._warmup_ref: float | None = None
         self._last_wildcard_at: float | None = None
@@ -186,6 +197,7 @@ class Engine:
             self._ended_at = now
             self._pending = None
             self._queued = None
+            self._awaiting = None
         return []
 
     # ------------------------------------------------------------------ inputs: Muse
@@ -222,7 +234,10 @@ class Engine:
         rec.turn.gap_before = self._gap_before(now)
         effects: list[Effect] = []
         crumb_iv = self._bot.crumb_playing()
-        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S:
+        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_active:
+            # Local VAD hears the room too: a real voice, so fade the crumb now. A Muse speechStart alone
+            # during a crumb is usually the crumb's own echo (Muse reports it a few hundred ms late), so it
+            # stays provisional and local VAD decides barge-in (PRD 8.11, F19).
             effects += self._barge_in(now, source="speechStart")
         elif self._bot.suspect(now, self._tail_s):
             rec.provisional = True  # may be our own voice: decided at speechEnd (PRD 8.11)
@@ -333,6 +348,7 @@ class Engine:
                 "Possible distress detected: automatic crumbs paused for this session (manual Drop still works)",
                 now, turn_id=t.turn_id,
             ))
+            effects += self._drop_opener(now)
         counted = self._is_live_turn(t)
         if counted:
             self._live_turns.append(t)
@@ -388,7 +404,8 @@ class Engine:
         elif kind is None and mine is not None and mine.source == "lexical":
             effects += self._release_hold(now, "Final transcript has no hold phrase")
             rec.hold_kind = None
-        if (kind is not None or is_ambiguous_fragment(text)) and not rec.classified:
+        vetoed = kind is None and hold_vetoed(text, self.params.HOLD_TAIL_WORDS)
+        if (kind is not None or vetoed or is_ambiguous_fragment(text)) and not rec.classified:
             rec.classified = True
             effects.append({"type": "classify_hold", "turn_id": rec.turn.turn_id, "context": self._context(HOLD_CONTEXT_TURNS)})
         return effects
@@ -478,20 +495,43 @@ class Engine:
         """Crumb ids starting with "sys_" are system lines: bot speech, but not crumbs."""
         self._touch(now)
         rec = self._ledger.get(crumb_id)
+        if self._awaiting is not None and self._awaiting[0] == crumb_id:
+            self._awaiting = None
         if playing:
+            self._force_closed.discard(crumb_id)
             iv = self._bot.start(crumb_id, now)
             if rec is not None and rec.play_started_at is None:
                 rec.play_started_at = now
                 if self._human_talking():
                     return self._cancel_overtaken(rec, iv, now)
+                if rec.skipped or rec.cancelled:
+                    return self._fade_unwanted(rec, iv, now)
             return []
-        self._bot.stop(crumb_id, now)
+        if crumb_id in self._force_closed:
+            self._force_closed.discard(crumb_id)
+            if self._bot.playing_interval(crumb_id) is None:
+                return []  # a late end for speech already closed: the timer must not restart again
+        self._end_bot_speech(crumb_id, now)
+        return []
+
+    def on_table_disconnect(self, now: float) -> list[Effect]:
+        """The last Table events socket closed (reload, closed tab): nobody will report the end of the
+        speech that was playing, so close it now instead of freezing the engine as "bot speaking"."""
+        self._touch(now)
+        self._awaiting = None
+        for iv in self._bot.open_intervals():
+            self._force_closed.add(iv.speech_id)
+            self._end_bot_speech(iv.speech_id, now)
+        return []
+
+    def _end_bot_speech(self, speech_id: str, now: float) -> None:
+        self._bot.stop(speech_id, now)
         self._timer.reset(now)  # PRD 8.3: when a crumb finishes, the silence timer restarts at 0
+        rec = self._ledger.get(speech_id)
         if rec is not None:
             rec.ended_at = now
             if rec.kind == "opener":
                 self._warmup_ref = now
-        return []
 
     def on_control(self, action: str, now: float) -> list[Effect]:
         self._touch(now)
@@ -524,20 +564,39 @@ class Engine:
         if self._phase != "live":
             return []
         effects = self._release_hold(now, "Drop a crumb tapped")
+        if self._manual_on_its_way(now):
+            return effects  # double tap: the crumb from the first tap has not started playing yet
         return effects + self._request_manual("manual", "Drop a crumb tapped: context switch", now)
+
+    def _manual_on_its_way(self, now: float) -> bool:
+        if self._pending is not None and self._pending.kind == "manual" and not self._pending.cancelled:
+            return True
+        if self._queued is not None and self._queued[0] in ("manual", "opener"):
+            return True  # a queued opener is the crumb the tap asked for: do not replace it
+        awaiting = self._awaiting_playback(now)
+        rec = self._ledger.get(awaiting) if awaiting is not None else None
+        return rec is not None and rec.kind == "manual"
 
     def _on_skip(self, now: float) -> list[Effect]:
         if self._phase != "live":
             return []
         crumb_iv = self._bot.crumb_playing()
         crumb_id = crumb_iv.speech_id if crumb_iv is not None else None
+        if crumb_id is None:
+            # Dispatched but still in its chime: interrupt it before it starts (the Table drops it).
+            crumb_id = self._awaiting_playback(now)
+            self._awaiting = None
         if crumb_id is not None:
             rec = self._ledger.get(crumb_id)
             if rec is not None:
                 rec.skipped = True
+        generating = crumb_id is None and self._pending is not None and not self._pending.cancelled
+        if generating:
+            self._cancel_pending(requeue=False)  # PRD 6.6: discard the crumb that is still being generated
         effects: list[Effect] = [
             {"type": "skip", "crumb_id": crumb_id},
-            self._decision("skip", "Skip tapped: discarding the current crumb", now, crumb_playing=crumb_id is not None),
+            self._decision("skip", "Skip tapped: discarding the current crumb", now, crumb_playing=crumb_id is not None,
+                           crumb_generating=generating),
         ]
         return effects + self._request_manual("switch", "Skip tapped: a different context switch", now)
 
@@ -556,7 +615,14 @@ class Engine:
             and not self._tracker.any_open()
             and not self._vad_active
             and not self._bot.playing
+            and self._awaiting_playback(self._now) is None
         )
+
+    def _awaiting_playback(self, now: float) -> str | None:
+        """A crumb sent to the Table that has not reported playing yet (its chime is still on)."""
+        if self._awaiting is None or now - self._awaiting[1] >= AWAIT_PLAYBACK_S:
+            return None
+        return self._awaiting[0]
 
     # ------------------------------------------------------------------ async results
 
@@ -569,6 +635,12 @@ class Engine:
             return [{"type": "prefetch", "reason": "topic changed"}]
         return []
 
+    @property
+    def pending_cancelled(self) -> bool:
+        """The crumb being generated was cancelled (someone spoke, or Skip): the runner should call
+        `crumb_cancelled` instead of sending it to the Table (PRD 8.1)."""
+        return self._pending is not None and self._pending.cancelled
+
     def crumb_dispatched(self, crumb: Crumb, now: float, latency_ms: float, cache_hit: bool) -> None:
         self._touch(now)
         pending, self._pending = self._pending, None
@@ -576,9 +648,19 @@ class Engine:
             crumb_id=crumb.id, kind=crumb.kind, auto=bool(pending and pending.auto),
             dispatched_at=now, latency_ms=float(latency_ms), cache_hit=bool(cache_hit),
         )
+        if pending is not None and pending.cancelled:
+            # Sent although it was cancelled. Still wanted (manual, opener, warning) and nobody is talking:
+            # it stands in for the re-queued request. Otherwise it is faded the moment it starts playing.
+            if pending.requeued and not self._human_talking():
+                self._take_back_requeue(pending)
+            else:
+                rec.cancelled = True
+                if pending.auto:
+                    self._ledger.cancel_auto_decision()  # faded at playback start: not a delivered crumb
         self._ledger.add(rec)
+        self._awaiting = (crumb.id, now)
         spoke_since = pending is not None and self._last_human_activity_at > pending.decided_at
-        if not spoke_since:
+        if not spoke_since and not rec.cancelled:
             self._crumbs_this_silence += 1
         self._timer.reset(now)
         if crumb.kind == "opener":
@@ -594,6 +676,49 @@ class Engine:
         if pending.kind == "opener":
             self._warmup_ref = now
 
+    def crumb_cancelled(self, now: float) -> list[Effect]:
+        """The runner dropped a cancelled crumb without sending it: nothing was delivered. An automatic
+        decision does not count toward the rate limit; a still-wanted request is already re-queued."""
+        self._touch(now)
+        pending, self._pending = self._pending, None
+        if pending is not None and pending.auto:
+            self._ledger.cancel_auto_decision()
+        return []
+
+    def _cancel_pending(self, *, requeue: bool) -> None:
+        p = self._pending
+        if p is None or p.cancelled:
+            return
+        p.cancelled = True
+        if not requeue or p.auto:
+            return
+        p.requeued = True
+        if p.round_warning:
+            self._round_warned = False  # re-armed: the warning goes out at the next quiet moment
+        elif self._queued is None:
+            self._queued = (p.kind, p.reason)
+
+    def _drop_opener(self, now: float) -> list[Effect]:
+        """PRD 15.3: the opener is automatic, so after a distress signal one still waiting for silence or
+        being generated is dropped (a generating one is vetoed or faded like any cancelled crumb)."""
+        queued = self._queued is not None and self._queued[0] == "opener"
+        p = self._pending
+        generating = p is not None and p.kind == "opener"
+        if queued:
+            self._queued = None
+        if generating:
+            self._cancel_pending(requeue=False)
+            p.requeued = False  # a re-queue made when the speech started is withdrawn too
+        if not (queued or generating):
+            return []
+        return [self._decision("calibration", "Opening crumb skipped: automatic crumbs are paused", now, step="done")]
+
+    def _take_back_requeue(self, p: _Pending) -> None:
+        if p.round_warning:
+            self._round_warned = True
+        elif self._queued == (p.kind, p.reason):
+            self._queued = None
+
     # ------------------------------------------------------------------ tick (PRD 8.7)
 
     def tick(self, now: float) -> list[Effect]:
@@ -602,6 +727,7 @@ class Engine:
             return []
         effects: list[Effect] = []
         effects += self._close_stuck_turns(now)
+        effects += self._expire_bot_speech(now)
         effects += self._expire_hold(now)
         effects += self._calibration_fallback(now)
         effects += self._round_timer(now)
@@ -620,6 +746,17 @@ class Engine:
             if not rec.open and not rec.committed and now - rec.turn.ended_at >= COMPLETE_TIMEOUT_S:
                 effects += self._commit(rec, now)
         return effects
+
+    def _expire_bot_speech(self, now: float) -> list[Effect]:
+        """A lost `tts_state playing:false` (Table reload or crash mid-crumb) must not leave the engine
+        "bot speaking" forever: no crumb or system line runs longer than BOT_SPEECH_MAX_S."""
+        if self._awaiting is not None and self._awaiting_playback(now) is None:
+            self._awaiting = None
+        for iv in self._bot.open_intervals():
+            if now - iv.start + EPS >= BOT_SPEECH_MAX_S:
+                self._force_closed.add(iv.speech_id)
+                self._end_bot_speech(iv.speech_id, now)
+        return []
 
     def _expire_hold(self, now: float) -> list[Effect]:
         h = self._hold
@@ -642,10 +779,31 @@ class Engine:
         if remaining <= EPS:
             self._round_ended = True
             return [{"type": "round_end"}]
-        if not self._round_warned and remaining <= ROUND_WARNING_S + EPS and self._can_deliver_now():
-            self._round_warned = True
-            return [{"type": "round_warning"}]
-        return []
+        if self._round_warned or remaining > ROUND_WARNING_S + EPS:
+            return []
+        if self._auto_paused:
+            self._round_warned = True  # PRD 15.3: no automatic crumb after a distress signal, this one included
+            return []
+        if not self._round_warning_ready(now):
+            return []  # deferred to the next quiet moment, never dropped
+        self._round_warned = True
+        # The runner generates this switch itself; tracking it as the pending delivery keeps the policy
+        # from deciding a second crumb while it is in flight and keeps the ledger's auto/manual labels right.
+        self._pending = _Pending(kind="switch", auto=False, decided_at=now, reason=ROUND_WARNING_REASON,
+                                 round_warning=True)
+        return [{"type": "round_warning"}, self._decision("switch", ROUND_WARNING_REASON, now,
+                                                          remaining_s=round(remaining, 1))]
+
+    def _round_warning_ready(self, now: float) -> bool:
+        if not self._can_deliver_now():
+            return False
+        hold = self._active_hold(now)
+        if hold is not None and hold.suppresses:
+            return False
+        if self._crumbs_this_silence >= self.params.MAX_UNANSWERED_CRUMBS:
+            return False  # quiet after 2 unanswered crumbs, until someone speaks
+        since = self._ledger.since_last_end(now)
+        return since is None or since + EPS >= ROUND_WARNING_GAP_S
 
     def _round_remaining(self, now: float) -> float | None:
         total = ROUND_TIMER_S.get(self.mode)
@@ -704,7 +862,7 @@ class Engine:
             auto_paused=self._auto_paused,
             turn_active=self._tracker.any_open(),
             vad_active=self._vad_active,
-            tts_playing=self._bot.playing,
+            tts_playing=self._bot.playing or self._awaiting_playback(now) is not None,
             hold=hold.kind if hold is not None else None,
             silence_s=self.silence_s(now),
             base=thresholds(self.params, self.mode, self._staleness.gap_ref),
@@ -725,7 +883,7 @@ class Engine:
         return max(0.0, self._warmup_ref + self.params.WARMUP_S - now - EPS)
 
     def _deliver(self, kind: CrumbKind, reason: str, now: float, *, auto: bool, inputs: dict | None = None) -> list[Effect]:
-        self._pending = _Pending(kind=kind, auto=auto, decided_at=now)
+        self._pending = _Pending(kind=kind, auto=auto, decided_at=now, reason=reason)
         if auto:
             self._ledger.note_auto_decision(now)
             hold = self._active_hold(now)
@@ -774,14 +932,35 @@ class Engine:
             ),
         ]
 
+    def _fade_unwanted(self, rec: CrumbRecord, iv: BotInterval, now: float) -> list[Effect]:
+        """A crumb that was skipped or cancelled before it started still reached playback: fade it now."""
+        self._barged.add(rec.crumb_id)
+        iv.barged_at = now
+        return [
+            {"type": "barge_in", "crumb_id": rec.crumb_id},
+            self._decision(
+                "barge_in", "Crumb was skipped or cancelled before it started: fading it out", now,
+                trigger="skipped" if rec.skipped else "cancelled",
+            ),
+        ]
+
     def _human_activity(self, now: float) -> list[Effect]:
-        """Human speech: crumbs_this_silence resets, the quiet state ends, automatic holds release."""
+        """Human speech: crumbs_this_silence resets, the quiet state ends, automatic holds release, and a
+        crumb still being generated is cancelled (PRD 8.1: it was meant for a silence that just ended)."""
         self._last_human_activity_at = now
         self._crumbs_this_silence = 0
         self._quiet_announced = False
+        effects: list[Effect] = []
+        p = self._pending
+        if p is not None and not p.cancelled:
+            self._cancel_pending(requeue=True)
+            effects.append(self._decision(
+                "barge_in", "Someone started talking while the crumb was being prepared: cancelling it", now,
+                trigger="pending", kind=p.kind, requeued=p.requeued,
+            ))
         if self._hold is not None and self._hold.source != "manual":
-            return self._release_hold(now, "Speech resumed")
-        return []
+            effects += self._release_hold(now, "Speech resumed")
+        return effects
 
     def _human_talking(self) -> bool:
         open_human = any(not r.provisional for r in self._tracker.open_records())
@@ -857,7 +1036,13 @@ class Engine:
         self._timer.reset(now)
         effects.append(self._decision("calibration", "Both voices mapped: going live", now, step="done"))
         effects.append({"type": "live"})
-        return effects + self._deliver("opener", "Calibration done: opening crumb from a shared overlap", now, auto=False)
+        if self._auto_paused:  # PRD 15.3: distress during calibration, so no automatic opener (Drop still works)
+            effects.append(self._decision("calibration", "Opening crumb skipped: automatic crumbs are paused", now,
+                                          step="done"))
+            return effects
+        # PRD 8.7: the opener only ever fires into silence. The 15 s fallback can go live mid-turn, so it is
+        # queued like a manual crumb and goes out at the first quiet tick.
+        return effects + self._request_manual("opener", "Calibration done: opening crumb from a shared overlap", now)
 
     # ------------------------------------------------------------------ views
 
