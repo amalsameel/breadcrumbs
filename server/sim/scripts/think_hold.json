@@ -1,0 +1,100 @@
+{
+  "name": "think_hold",
+  "mode": "social",
+  "description": "'hmm, good question' + 8 s silence: no crumb (thresholds doubled to 10 s / 13 s).",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Okay, what is one place you would move to tomorrow if you could?",
+      "start": 32.4,
+      "end": 36.7
+    },
+    {
+      "seat": 2,
+      "text": "Hmm, good question.",
+      "start": 37.4,
+      "end": 38.6
+    },
+    {
+      "seat": 2,
+      "text": "Probably Lisbon, the food and the light there are unreal.",
+      "start": 46.6,
+      "end": 49.9
+    },
+    {
+      "seat": 1,
+      "text": "Lisbon is on my list too, my cousin studied abroad there.",
+      "start": 50.7,
+      "end": 54.4
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        38.6,
+        46.6
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        38.6,
+        38.7
+      ],
+      "action": "hold",
+      "kind": "think",
+      "count": 1
+    },
+    {
+      "between": [
+        46.6,
+        46.7
+      ],
+      "action": "release",
+      "count": 1
+    },
+    {
+      "between": [
+        0.0,
+        55.4
+      ],
+      "action": "none"
+    }
+  ]
+}

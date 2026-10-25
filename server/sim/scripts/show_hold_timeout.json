@@ -1,0 +1,77 @@
+{
+  "name": "show_hold_timeout",
+  "mode": "social",
+  "description": "'let me pull it up' + 80 s silence: no crumb before 60 s, then normal thresholds counted from the timeout.",
+  "duration": 89.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "You would not believe the sunset we saw from the summit.",
+      "start": 0.0,
+      "end": 3.0
+    },
+    {
+      "seat": 2,
+      "text": "Oh really, how high up were you?",
+      "start": 3.6,
+      "end": 5.0
+    },
+    {
+      "seat": 1,
+      "text": "Super high, and I actually have a video of it, let me pull it up.",
+      "start": 5.7,
+      "end": 9.0
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        9.0,
+        68.9
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        9.0,
+        9.1
+      ],
+      "action": "hold",
+      "kind": "show",
+      "count": 1
+    },
+    {
+      "between": [
+        69.0,
+        69.1
+      ],
+      "action": "release",
+      "count": 1
+    },
+    {
+      "between": [
+        69.0,
+        73.9
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        69.0,
+        74.5
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 74.0
+    },
+    {
+      "between": [
+        77.0,
+        89.0
+      ],
+      "action": "switch",
+      "count": 1,
+      "at": 83.5
+    }
+  ]
+}

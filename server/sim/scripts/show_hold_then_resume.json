@@ -1,0 +1,57 @@
+{
+  "name": "show_hold_then_resume",
+  "mode": "social",
+  "description": "PRD 16.1 example: 'let me show you' + 25 s silence: no crumb during the hold.",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "I did this crazy climb last summer.",
+      "start": 0.0,
+      "end": 2.1
+    },
+    {
+      "seat": 2,
+      "text": "No way, where?",
+      "start": 2.8,
+      "end": 3.6
+    },
+    {
+      "seat": 1,
+      "text": "Wait, let me show you, I have a picture.",
+      "start": 4.2,
+      "end": 6.0
+    },
+    {
+      "seat": 1,
+      "text": "Okay here, this is the top.",
+      "start": 31.0,
+      "end": 33.0
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        6.0,
+        31.0
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        6.0,
+        6.1
+      ],
+      "action": "hold",
+      "kind": "show",
+      "count": 1
+    },
+    {
+      "between": [
+        31.0,
+        31.1
+      ],
+      "action": "release",
+      "count": 1
+    }
+  ]
+}

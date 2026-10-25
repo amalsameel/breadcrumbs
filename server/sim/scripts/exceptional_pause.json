@@ -1,0 +1,90 @@
+{
+  "name": "exceptional_pause",
+  "mode": "social",
+  "description": "A 7 s pause starting 20 s after a previous crumb: the regular cooldown blocks the 5 s steer, so one switch at 6.5 s.",
+  "prior_crumb_at": 21.5,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 25.0,
+      "end": 29.7
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 30.5,
+      "end": 34.8
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 35.6,
+      "end": 41.5
+    },
+    {
+      "seat": 2,
+      "text": "Okay that is a fun one, I would pick the ocean every single time.",
+      "start": 48.5,
+      "end": 53.2
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        41.5,
+        48.5
+      ],
+      "action": "switch",
+      "count": 1,
+      "at": 48.0
+    },
+    {
+      "between": [
+        41.5,
+        48.5
+      ],
+      "action": "steer",
+      "count": 0
+    },
+    {
+      "between": [
+        41.5,
+        47.9
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        0.0,
+        53.5
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}

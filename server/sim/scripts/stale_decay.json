@@ -1,0 +1,148 @@
+{
+  "name": "stale_decay",
+  "mode": "social",
+  "description": "Lively baseline of 10 turns, then replies shrink to 1 to 3 words and gaps grow, then a 5.5 s pause: one switch at 5.0 s.",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 5.1,
+      "end": 9.4
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.1,
+      "end": 14.8
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.7,
+      "end": 20.4
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.2,
+      "end": 25.9
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 26.5,
+      "end": 30.8
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 31.6,
+      "end": 36.6
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 37.6,
+      "end": 42.3
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.0,
+      "end": 47.7
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 48.5,
+      "end": 53.2
+    },
+    {
+      "seat": 1,
+      "text": "Yeah.",
+      "start": 54.2,
+      "end": 54.8
+    },
+    {
+      "seat": 2,
+      "text": "Cool.",
+      "start": 57.0,
+      "end": 57.6
+    },
+    {
+      "seat": 1,
+      "text": "Nice.",
+      "start": 60.2,
+      "end": 60.8
+    },
+    {
+      "seat": 2,
+      "text": "Mm.",
+      "start": 63.2,
+      "end": 63.8
+    },
+    {
+      "seat": 1,
+      "text": "Sure.",
+      "start": 66.6,
+      "end": 67.2
+    },
+    {
+      "seat": 2,
+      "text": "I guess.",
+      "start": 69.5,
+      "end": 70.1
+    },
+    {
+      "seat": 1,
+      "text": "Totally.",
+      "start": 72.8,
+      "end": 73.4
+    },
+    {
+      "seat": 2,
+      "text": "Sure.",
+      "start": 78.9,
+      "end": 79.5
+    },
+    {
+      "seat": 1,
+      "text": "Yeah.",
+      "start": 81.9,
+      "end": 82.5
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        73.4,
+        78.9
+      ],
+      "action": "switch",
+      "count": 1,
+      "at": 78.4
+    },
+    {
+      "between": [
+        0.0,
+        83.5
+      ],
+      "action": "steer",
+      "count": 0
+    },
+    {
+      "between": [
+        0.0,
+        83.5
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}

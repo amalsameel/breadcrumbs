@@ -1,0 +1,72 @@
+{
+  "name": "wait_really_false_positive",
+  "mode": "social",
+  "description": "'Wait, really? That's insane, how did...' keeps talking: no hold (and 'can't wait' is not a hold either).",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 2,
+      "text": "Wait, really? That's insane, how did you even get in?",
+      "start": 21.2,
+      "end": 24.5
+    },
+    {
+      "seat": 1,
+      "text": "My friend knew the guide, so we just showed up early and asked nicely.",
+      "start": 28.5,
+      "end": 33.2
+    },
+    {
+      "seat": 1,
+      "text": "Honestly the next trip is in two weeks and I can't wait.",
+      "start": 33.8,
+      "end": 37.8
+    },
+    {
+      "seat": 2,
+      "text": "Two weeks is so soon, you have to send me pictures from the top.",
+      "start": 41.3,
+      "end": 46.0
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        0.0,
+        47.0
+      ],
+      "action": "hold",
+      "count": 0
+    },
+    {
+      "between": [
+        0.0,
+        47.0
+      ],
+      "action": "none"
+    }
+  ]
+}

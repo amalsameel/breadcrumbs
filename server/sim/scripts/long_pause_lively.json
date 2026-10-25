@@ -1,0 +1,131 @@
+{
+  "name": "long_pause_lively",
+  "mode": "social",
+  "description": "Lively, then a 5.5 s pause, then speech: one steer at 5.0 s.",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 49.2,
+      "end": 53.9
+    },
+    {
+      "seat": 1,
+      "text": "Three short runs and one long run on Sundays, plus a lot of stretching.",
+      "start": 55.0,
+      "end": 59.7
+    },
+    {
+      "seat": 2,
+      "text": "I respect that so much, I can barely get up for my eight am class.",
+      "start": 60.5,
+      "end": 65.5
+    },
+    {
+      "seat": 1,
+      "text": "Oh good one, it has to be the trip where we got snowed in at the cabin.",
+      "start": 71.0,
+      "end": 76.7
+    },
+    {
+      "seat": 2,
+      "text": "Snowed in sounds terrifying and also kind of cozy, how long were you stuck?",
+      "start": 77.4,
+      "end": 82.1
+    },
+    {
+      "seat": 1,
+      "text": "Three whole days, we played every board game in the closet twice.",
+      "start": 83.0,
+      "end": 87.0
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        65.5,
+        71.0
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 70.5
+    },
+    {
+      "between": [
+        65.5,
+        71.0
+      ],
+      "action": "switch",
+      "count": 0
+    },
+    {
+      "between": [
+        70.6,
+        88.0
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        0.0,
+        88.0
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}

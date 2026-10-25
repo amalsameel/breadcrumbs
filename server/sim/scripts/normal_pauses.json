@@ -1,0 +1,204 @@
+{
+  "name": "normal_pauses",
+  "mode": "social",
+  "description": "3 minutes of lively turns with pauses up to 3 s: no automatic crumbs.",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 33.8,
+      "end": 38.8
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 39.7,
+      "end": 44.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 47.4,
+      "end": 52.1
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 53.3,
+      "end": 58.0
+    },
+    {
+      "seat": 1,
+      "text": "Three short runs and one long run on Sundays, plus a lot of stretching.",
+      "start": 58.5,
+      "end": 63.2
+    },
+    {
+      "seat": 2,
+      "text": "I respect that so much, I can barely get up for my eight am class.",
+      "start": 65.8,
+      "end": 70.8
+    },
+    {
+      "seat": 1,
+      "text": "The trick is coffee and a playlist that makes you feel like a movie hero.",
+      "start": 71.8,
+      "end": 76.8
+    },
+    {
+      "seat": 2,
+      "text": "Okay what is on the playlist, I need to know the hero songs immediately.",
+      "start": 77.4,
+      "end": 82.1
+    },
+    {
+      "seat": 1,
+      "text": "Lots of old film scores, and a weird amount of nineties pop if I am honest.",
+      "start": 83.2,
+      "end": 88.5
+    },
+    {
+      "seat": 2,
+      "text": "Nineties pop is elite, my parents played it in the car on every road trip.",
+      "start": 89.3,
+      "end": 94.3
+    },
+    {
+      "seat": 1,
+      "text": "Where did you go on road trips growing up, anywhere really memorable?",
+      "start": 95.7,
+      "end": 99.7
+    },
+    {
+      "seat": 2,
+      "text": "We drove to the Grand Canyon once and my brother got carsick the entire way.",
+      "start": 100.4,
+      "end": 105.4
+    },
+    {
+      "seat": 1,
+      "text": "Oh no, that sounds like a classic family story you get to tell forever.",
+      "start": 107.6,
+      "end": 112.3
+    },
+    {
+      "seat": 2,
+      "text": "He still refuses to talk about it, which makes it even funnier at dinner.",
+      "start": 113.2,
+      "end": 117.9
+    },
+    {
+      "seat": 1,
+      "text": "My family stories are mostly about my grandma and her very competitive card games.",
+      "start": 120.9,
+      "end": 125.6
+    },
+    {
+      "seat": 2,
+      "text": "Competitive card games are the best, what does she play with everyone?",
+      "start": 126.8,
+      "end": 130.8
+    },
+    {
+      "seat": 1,
+      "text": "Mostly rummy, and she has never once let anyone win, not even the little kids.",
+      "start": 131.3,
+      "end": 136.3
+    },
+    {
+      "seat": 2,
+      "text": "That is the right way to raise champions, I would have loved that growing up.",
+      "start": 138.9,
+      "end": 143.9
+    },
+    {
+      "seat": 1,
+      "text": "We also cooked a lot together, she taught me how to make dumplings from scratch.",
+      "start": 144.9,
+      "end": 149.9
+    },
+    {
+      "seat": 2,
+      "text": "From scratch is serious, I can only make ramen and that is a stretch honestly.",
+      "start": 150.5,
+      "end": 155.5
+    },
+    {
+      "seat": 1,
+      "text": "Ramen counts if you add an egg and some green onions, that is real cooking.",
+      "start": 156.6,
+      "end": 161.6
+    },
+    {
+      "seat": 2,
+      "text": "Then I am basically a chef, I will put that on my resume next semester.",
+      "start": 162.4,
+      "end": 167.4
+    },
+    {
+      "seat": 1,
+      "text": "What are you studying anyway, I feel like we skipped the boring intro part?",
+      "start": 168.8,
+      "end": 173.5
+    },
+    {
+      "seat": 2,
+      "text": "Computer science with a minor in design, mostly because I like making things.",
+      "start": 174.2,
+      "end": 178.5
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        0.0,
+        179.5
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        0.0,
+        179.5
+      ],
+      "action": "hold",
+      "count": 0
+    }
+  ]
+}

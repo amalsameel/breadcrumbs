@@ -1,0 +1,117 @@
+{
+  "name": "cooldown",
+  "mode": "social",
+  "description": "Two 5.5 s pauses 15 s apart with one short exchange between: only one automatic crumb.",
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 49.2,
+      "end": 53.9
+    },
+    {
+      "seat": 1,
+      "text": "Ha, okay, mine would be the time I accidentally joined a marathon.",
+      "start": 59.4,
+      "end": 63.4
+    },
+    {
+      "seat": 2,
+      "text": "You accidentally joined a marathon? I need the whole story right now, all of it.",
+      "start": 64.0,
+      "end": 68.9
+    },
+    {
+      "seat": 1,
+      "text": "So it started with a free tshirt and a very confusing sign up table.",
+      "start": 74.4,
+      "end": 79.1
+    },
+    {
+      "seat": 2,
+      "text": "A free tshirt is how every bad decision in college starts honestly.",
+      "start": 79.8,
+      "end": 83.8
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        53.9,
+        59.4
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 58.9
+    },
+    {
+      "between": [
+        59.0,
+        84.8
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        0.0,
+        84.8
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}
