@@ -34,12 +34,17 @@ from models import Crumb, CrumbFormat, CrumbKind, CrumbSource, Mode, OverlapSet,
 
 log = logging.getLogger("breadcrumbs.ai.crumbs")
 
-MISS_BUDGET_S = 6.0  # text generation on a cache miss (live path)
+# PRD 8.10 / F8: a cache miss must reach the Table in 3 s or less, so text + TTS fit in 3 s and the
+# fallbacks (overlap or canned crumb; speechSynthesis instead of audio) fire inside that window.
+MISS_BUDGET_S = 2.0  # text generation on a cache miss (live path), fact lookup included
+MISS_FACT_BUDGET_S = 1.0  # grounded search on a miss; past this the crumb asks a question instead
 PREFETCH_BUDGET_S = 25.0
-MISS_TTS_BUDGET_S = 4.0  # past this the Table speaks with speechSynthesis
+MISS_TTS_BUDGET_S = 1.0  # past this the Table speaks with speechSynthesis
 PREFETCH_TTS_BUDGET_S = 12.0
 OPENER_TTS_BUDGET_S = 5.0
 FACT_BUDGET_S = 8.0
+# The round warning (F21) always says the time out loud, whatever crumb carries it.
+ROUND_WARNING_LEAD = "One minute left."
 TOPIC_MAX_CHARS = 80
 WHY_MAX_CHARS = 200
 
@@ -146,6 +151,8 @@ class _Plan:
     seat: int | None = None
     topic_hint: str | None = None
     fact: Fact | None = None
+    fact_budget_s: float = FACT_BUDGET_S
+    max_words: int = config.CRUMB_MAX_WORDS
 
 
 @dataclass
@@ -155,6 +162,7 @@ class _CacheEntry:
     created_at: float
     topic: str | None
     gen_ms: float
+    line_key: int | None = None  # hash of the latest participant line the entry was built after
 
 
 # --- Service ----------------------------------------------------------------------------------------
@@ -197,7 +205,9 @@ class CrumbService:
         started = time.perf_counter()
         crumb = self._overlap_crumb_validated("opener", convo)
         if crumb is None:
-            crumb = await self._build_within(self._plan("switch", convo, as_kind="opener"), convo, MISS_BUDGET_S)
+            plan = self._plan("switch", convo, as_kind="opener")
+            plan.fact_budget_s = MISS_FACT_BUDGET_S
+            crumb = await self._build_within(plan, convo, MISS_BUDGET_S)
         self.mark_delivered(crumb)
         audio = await self._synth(crumb.text, OPENER_TTS_BUDGET_S)
         return Delivery(crumb=crumb, audio_wav=audio, cache_hit=False, gen_ms=_ms_since(started))
@@ -208,12 +218,30 @@ class CrumbService:
         if kind == "opener":
             return await self.opener(convo)
         key = _cache_key(kind)
-        entry = self._cache.pop(key, None) if key else None
-        if entry is not None and convo.instruction is None and self._entry_valid(entry, now, convo.current_topic):
+        entry = self._cache.get(key) if key else None
+        if entry is not None and not self._entry_valid(entry, now, convo.current_topic, convo):
+            self._cache.pop(key, None)  # stale: drop it
+            entry = None
+        if entry is not None:
             crumb = entry.crumb.model_copy(update={"kind": kind})
-            log.info("crumb cache hit (%s)", key)
-            return Delivery(crumb=crumb, audio_wav=entry.audio, cache_hit=True, gen_ms=_ms_since(started))
-        crumb = await self._build_within(self._plan(kind, convo), convo, MISS_BUDGET_S)
+            audio = entry.audio
+            if convo.instruction:
+                lead = self._with_instruction(crumb, convo)
+                if lead is not None and lead.text != crumb.text:
+                    audio = await self._synth(lead.text, MISS_TTS_BUDGET_S)  # cached audio lacks the lead-in
+                crumb = lead
+            if crumb is not None:
+                self._cache.pop(key, None)
+                log.info("crumb cache hit (%s)", key)
+                return Delivery(crumb=crumb, audio_wav=audio, cache_hit=True, gen_ms=_ms_since(started))
+            # The cached crumb is too long to carry the instruction: keep it for later, generate one now.
+        plan = self._plan(kind, convo)
+        plan.fact_budget_s = MISS_FACT_BUDGET_S
+        if convo.instruction:
+            plan.max_words = max(10, config.CRUMB_MAX_WORDS - _lead_words(convo.instruction))
+        crumb = await self._build_within(plan, convo, MISS_BUDGET_S)
+        if convo.instruction:
+            crumb = self._with_instruction(crumb, convo) or self._with_instruction(self._canned(kind, convo), convo) or crumb
         audio = await self._synth(crumb.text, MISS_TTS_BUDGET_S)
         return Delivery(crumb=crumb, audio_wav=audio, cache_hit=False, gen_ms=_ms_since(started))
 
@@ -223,7 +251,7 @@ class CrumbService:
             return
         async with self._prefetch_lock:
             epoch = self._epoch
-            missing = [k for k in ("steer", "switch") if not self._key_valid(k, now, convo.current_topic)]
+            missing = [k for k in ("steer", "switch") if not self._key_valid(k, now, convo)]
             for key in missing:
                 self._cache.pop(key, None)
             results = await asyncio.gather(*(self._prefetch_one(k, convo) for k in missing), return_exceptions=True)
@@ -234,7 +262,7 @@ class CrumbService:
                 if self._epoch != epoch:
                     continue  # invalidated while generating
                 crumb, audio, gen_ms = result
-                self._cache[key] = _CacheEntry(crumb, audio, now, convo.current_topic, gen_ms)
+                self._cache[key] = _CacheEntry(crumb, audio, now, convo.current_topic, gen_ms, self._line_key(convo))
 
     def invalidate(self, reason: str) -> None:
         self._cache.clear()
@@ -386,8 +414,9 @@ class CrumbService:
             "requested_source": plan.source,
             "current_depth_max": convo.depth_max,
             "names": {"1": self.names.get(1, ""), "2": self.names.get(2, "")},
-            "profiles": {"1": self._profile_text(1), "2": self._profile_text(2)},
-            "overlaps_unused": [self._overlap_text(i) for i in self._unused_overlaps()],
+            # Only what the model may use right now: items and overlaps above the depth cap are left out.
+            "profiles": {"1": self._profile_text(1, convo.depth_max), "2": self._profile_text(2, convo.depth_max)},
+            "overlaps_unused": [self._overlap_text(i) for i in self._unused_overlaps(convo.depth_max)],
             "recent_transcript": convo.recent_transcript,
             "current_topic": convo.current_topic,
             "used_topics": list(self.used_topics),
@@ -396,16 +425,29 @@ class CrumbService:
             "off_limits": {str(s): list(self.profiles[s].off_limits) if s in self.profiles else [] for s in (1, 2)},
             "allowed_formats": list(config.ALLOWED_FORMATS[self.mode]),
         }
+        requested = self._requested_ids(plan)
+        if requested:
+            payload["requested_item_ids"] = requested
         if plan.fact is not None:
             payload["verified_fact"] = {"text": plan.fact.text, "url": plan.fact.url}
         if convo.instruction:
             payload["instruction"] = convo.instruction
         return payload
 
-    def _profile_text(self, seat: int) -> str:
+    def _profile_text(self, seat: int, depth_max: int) -> str:
         return "\n".join(
-            f"[{i.id}] ({i.kind}, depth {i.depth}) {i.text}. Hook: {i.hook}" for i in self._allowed(seat)
+            f"[{i.id}] ({i.kind}, depth {i.depth}) {i.text}. Hook: {i.hook}"
+            for i in self._allowed(seat) if i.depth <= depth_max
         )
+
+    def _requested_ids(self, plan: _Plan) -> list[str]:
+        """The item ids the plan was built on (profile item, or the overlap's items)."""
+        if plan.source == "overlap" and plan.overlap_index is not None:
+            ov = self.overlaps.overlaps[plan.overlap_index]
+            return ov.item_ids_seat1 + ov.item_ids_seat2
+        if plan.source in ("profile_seat1", "profile_seat2"):
+            return [i.id for i in plan.items]
+        return []
 
     def _overlap_text(self, index: int) -> str:
         ov = self.overlaps.overlaps[index]
@@ -430,7 +472,7 @@ class CrumbService:
     async def _build(self, plan: _Plan, convo: ConvoCtx) -> Crumb:
         """Generate, validate, regenerate once, then overlap opener, then canned (Appendix B)."""
         if plan.source == "outside" and "fun_fact" in plan.formats:
-            plan.fact = await self._fact(plan.topic_hint)
+            plan.fact = await self._fact(plan.topic_hint, plan.fact_budget_s)
             if plan.fact is None:
                 plan.formats = [f for f in plan.formats if f != "fun_fact"] or ["question"]
                 if plan.kind == "steer":
@@ -448,9 +490,9 @@ class CrumbService:
             log.info("crumb rejected on attempt %d: %s", attempt + 1, "; ".join(e.split(":")[0] for e in errors))
         return self._fallback(plan.kind, convo)
 
-    async def _fact(self, topic: str | None) -> Fact | None:
+    async def _fact(self, topic: str | None, budget_s: float = FACT_BUDGET_S) -> Fact | None:
         try:
-            return await asyncio.wait_for(get_fact(topic, self.location, gemini=self.gemini), FACT_BUDGET_S)
+            return await asyncio.wait_for(get_fact(topic, self.location, gemini=self.gemini), budget_s)
         except Exception as exc:  # noqa: BLE001 - no fact simply means "ask a question instead"
             log.warning("fact lookup failed (%s)", type(exc).__name__)
             return None
@@ -469,9 +511,8 @@ class CrumbService:
 
     def _from_draft(self, draft: CrumbDraft, plan: _Plan, convo: ConvoCtx) -> Crumb:
         ids = list(draft.source_item_ids)
-        if plan.source == "overlap" and plan.overlap_index is not None and not ids:
-            ov = self.overlaps.overlaps[plan.overlap_index]
-            ids = ov.item_ids_seat1 + ov.item_ids_seat2
+        if not ids and plan.source in ("overlap", "profile_seat1", "profile_seat2"):
+            ids = self._requested_ids(plan)  # the model forgot to cite them; the plan's items are implied
         fmt = draft.format if draft.format in config.ALLOWED_FORMATS[self.mode] else "question"
         return self._crumb(
             plan, fmt, draft.text, draft.addressed_to, ids, draft.topic or plan.topic_hint or "open question",
@@ -493,7 +534,7 @@ class CrumbService:
             source=plan.source,
             source_item_ids=ids,
             topic=topic,
-            depth=max(1, min(int(depth or 1), max(1, convo.depth_max), 4)),
+            depth=max(1, min(int(depth or 1), 4)),  # the real depth; _check rejects anything over the cap
             why=why,
             citation_url=fact.url if fact else None,
             citation_title=fact.title if fact else None,
@@ -501,10 +542,19 @@ class CrumbService:
 
     def _check(self, crumb: Crumb, plan: _Plan, convo: ConvoCtx) -> tuple[bool, Crumb, list[str]]:
         ok, cleaned, errors = validate_crumb(crumb, names=self.names, profiles=self.profiles,
-                                             max_words=config.CRUMB_MAX_WORDS)
+                                             max_words=plan.max_words)
         allowed = self._allowed_ids()
         if any(i not in allowed for i in cleaned.source_item_ids):
             errors.append("item not allowed")
+        # PRD 8.9 depth ladder: a crumb may be at or below the current max, by its items and its own label.
+        depth_of = {i.id: i.depth for p in self.profiles.values() for i in p.items}
+        item_depth = max((depth_of.get(i, 1) for i in cleaned.source_item_ids), default=1)
+        if item_depth > convo.depth_max or cleaned.depth > max(1, convo.depth_max):
+            errors.append("over the depth cap")
+        # The source is server-owned (featured_count, rotation), so the items must belong to it.
+        owned = self._source_ids(plan)
+        if owned is not None and not set(cleaned.source_item_ids) <= owned:
+            errors.append("items do not match the requested source")
         if plan.kind != "steer":
             if set(cleaned.source_item_ids) & self.used_item_ids:
                 errors.append("reuses a used item")
@@ -517,6 +567,25 @@ class CrumbService:
         if cleaned.format not in config.ALLOWED_FORMATS[self.mode]:
             errors.append("format not allowed in this mode")
         return not errors, cleaned, errors
+
+    def _source_ids(self, plan: _Plan) -> set[str] | None:
+        """Ids a draft for `plan` may cite: the seat's items, or the overlap's items. None = no rule."""
+        if plan.source == "overlap" and plan.overlap_index is not None:
+            return set(self._requested_ids(plan))
+        if plan.source in ("profile_seat1", "profile_seat2"):
+            return {i.id for i in self._allowed(int(plan.source[-1]))}
+        return None
+
+    def _with_instruction(self, crumb: Crumb, convo: ConvoCtx) -> Crumb | None:
+        """Prefix the instruction's spoken lead-in (the round warning). None when it no longer fits."""
+        lead = _lead_in(convo.instruction)
+        if lead is None or "minute" in crumb.text.lower():
+            return crumb
+        ok, text, _ = validate_crumb_text(f"{lead} {crumb.text}", names=self.names, profiles=self.profiles,
+                                          max_words=config.CRUMB_MAX_WORDS)
+        if not ok:
+            return None
+        return crumb.model_copy(update={"text": text})
 
     def _fallback(self, kind: CrumbKind, convo: ConvoCtx) -> Crumb:
         crumb = self._overlap_crumb_validated(kind, convo, fallback=True)
@@ -583,7 +652,7 @@ class CrumbService:
         else:
             text = f"{other}, what would you ask {speaker} about what they just said? Go for it."
             fmt, why = "question", f"Steer: handing {other} the follow-up on {speaker}'s last point."
-        return self._crumb(plan, fmt, text, _seat_label(3 - seat), [], topic, 2, why, convo)
+        return self._crumb(plan, fmt, text, _seat_label(3 - seat), [], topic, min(2, max(1, convo.depth_max)), why, convo)
 
     def _mock_overlap(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
         ov = self.overlaps.overlaps[plan.overlap_index or 0]
@@ -591,7 +660,7 @@ class CrumbService:
         ids = ov.item_ids_seat1 + ov.item_ids_seat2
         fmt: str = plan.formats[0]
         if fmt == "collab" and attempt == 0:
-            text = f"{n1} and {n2}, {_lower_first(_short_topic(ov.summary))}. What could you two build or trade around that? {n2} first."
+            text = f"{n1} and {n2}, {_collab_lead(_short_topic(ov.summary))}. What could you two build or trade around that? {n2} first."
         else:
             fmt, text = "question", ov.opener
         why = f"Switch: an unused {ov.kind} overlap, so both people get featured."
@@ -655,7 +724,12 @@ class CrumbService:
                 return seat
         return None
 
-    def _entry_valid(self, entry: _CacheEntry, now: float, topic: str | None) -> bool:
+    def _line_key(self, convo: ConvoCtx) -> int | None:
+        """Identity of the latest participant line (a hash, so no transcript text is kept)."""
+        latest = self._latest_line(convo)
+        return hash(latest) if latest is not None else None
+
+    def _entry_valid(self, entry: _CacheEntry, now: float, topic: str | None, convo: ConvoCtx | None = None) -> bool:
         if now - entry.created_at > config.CACHE_MAX_AGE_S:
             return False
         if (entry.topic or None) != (topic or None):
@@ -664,11 +738,14 @@ class CrumbService:
             return False
         if entry.crumb.kind != "steer" and entry.crumb.topic.strip().lower() in self.used_topics:
             return False
+        # PRD 8.10 / F14: the steer builds on what was just said, so a new turn makes it stale.
+        if convo is not None and entry.crumb.kind == "steer" and entry.line_key != self._line_key(convo):
+            return False
         return True
 
-    def _key_valid(self, key: str, now: float, topic: str | None) -> bool:
+    def _key_valid(self, key: str, now: float, convo: ConvoCtx) -> bool:
         entry = self._cache.get(key)
-        return entry is not None and self._entry_valid(entry, now, topic)
+        return entry is not None and self._entry_valid(entry, now, convo.current_topic, convo)
 
     async def _synth(self, text: str, budget_s: float) -> bytes | None:
         try:
@@ -685,6 +762,18 @@ def _cache_key(kind: CrumbKind) -> str | None:
     return "steer" if kind == "steer" else "switch"
 
 
+def _lead_in(instruction: str | None) -> str | None:
+    """The fixed spoken lead-in for an instruction, if it has one."""
+    if instruction and "minute left" in instruction.lower():
+        return ROUND_WARNING_LEAD
+    return None
+
+
+def _lead_words(instruction: str | None) -> int:
+    lead = _lead_in(instruction)
+    return len(lead.split()) if lead else 0
+
+
 def _profile_source(seat: int) -> CrumbSource:
     return "profile_seat1" if seat == 1 else "profile_seat2"
 
@@ -695,6 +784,14 @@ def _seat_label(seat: int) -> Literal["seat1", "seat2"]:
 
 def _short_topic(summary: str) -> str:
     return h.short(clean_text(summary), 8) or "shared ground"
+
+
+def _collab_lead(summary: str) -> str:
+    """'Both mentioned design' -> 'you both mentioned design'; anything else is kept as a clause."""
+    lowered = _lower_first(summary)
+    if lowered.startswith("both "):
+        return f"you {lowered}"
+    return lowered
 
 
 def _lower_first(text: str) -> str:

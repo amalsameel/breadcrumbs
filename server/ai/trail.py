@@ -15,7 +15,8 @@ from ai import heuristics as h
 from ai.gemini import Gemini, GeminiError, get_gemini
 from ai.profiles import allowed_items
 from ai.prompts import trail_system
-from ai.safety import clean_text, find_keyword, is_unsafe, off_limits_keywords, truncate_words
+from ai.safety import clean_text, find_keyword, is_sensitive, is_unsafe, off_limits_keywords, truncate_words
+from engine.hold import is_distress  # the same PRD 15.3 lexicon that pauses crumbs (pure, no engine state)
 from models import Mode, Profile, ProfileItem, Trail, TrailItem
 
 log = logging.getLogger("breadcrumbs.ai.trail")
@@ -43,8 +44,13 @@ async def generate_trail(
     transcript: str,
     profiles: dict[int, Profile],
     gemini: Gemini | None = None,
+    *,
+    safety_paused: bool = False,
 ) -> Trail:
+    """`safety_paused`: the session hit the distress lexicon (PRD 15.3). Then nothing from the
+    transcript becomes a thread; only the allowed profile items are used."""
     g = gemini or get_gemini()
+    transcript = "" if safety_paused else safe_transcript(transcript)
     drafts: list[TrailItemDraft] = []
     if not g.mock:
         try:
@@ -76,8 +82,19 @@ def _payload(mode: Mode, names: dict[int, str], transcript: str, profiles: dict[
     }
 
 
+def safe_transcript(transcript: str) -> str:
+    """Drop every line with distress or sensitive content before anything reads it for threads.
+
+    A statement that paused the crumbs (or a health, immigration, money... detail) must never come
+    back as a cheerful "Ask Dev how ... went." on the other person's phone.
+    """
+    kept = [raw for raw in (transcript or "").splitlines()
+            if not (is_distress(raw) or is_sensitive(raw) or is_unsafe(raw))]
+    return "\n".join(kept)
+
+
 def finalize_trail(drafts: list[TrailItemDraft], profiles: dict[int, Profile]) -> list[TrailItem]:
-    """Seat check, cleanup, safety filters and the 3-per-seat cap."""
+    """Seat check, cleanup, safety filters (unsafe, distress, sensitive, off-limits) and the 3-per-seat cap."""
     keywords = off_limits_keywords(profiles)
     per_seat: dict[int, int] = {1: 0, 2: 0}
     seen: set[str] = set()
@@ -86,7 +103,9 @@ def finalize_trail(drafts: list[TrailItemDraft], profiles: dict[int, Profile]) -
         if draft.for_seat not in (1, 2) or per_seat[draft.for_seat] >= MAX_PER_SEAT:
             continue
         text = truncate_words(clean_text(draft.text), TRAIL_MAX_WORDS, TRAIL_MAX_CHARS)
-        if not text or text.lower() in seen or is_unsafe(text) or find_keyword(text, keywords):
+        if not text or text.lower() in seen or find_keyword(text, keywords):
+            continue
+        if is_unsafe(text) or is_distress(text) or is_sensitive(text):
             continue
         if text[-1] not in ".?!":
             text += "."

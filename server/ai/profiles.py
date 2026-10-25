@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Literal
 
 from pydantic import BaseModel
@@ -133,13 +134,17 @@ def mock_profile_items(mode: Mode, answers: list[str]) -> list[ItemDraft]:
     for index, answer in enumerate(answers):
         default_kind = defaults[min(index, len(defaults) - 1)]
         for clause in h.split_clauses(answer):
+            if not h.about_speaker(clause):
+                continue
             rewrite = h.rewrite_clause(clause)
             kind = rewrite.kind or h.guess_kind(clause, default_kind)
             if mode != "networking" and kind in ("offer", "seeking"):
                 kind = "goal" if kind == "seeking" else "interest"
             drafts.append(ItemDraft(
                 kind=kind,  # type: ignore[arg-type]
-                text=rewrite.text,
+                # Cut on a phrase boundary here; finalize_items' word cap would end mid-phrase
+                # ("did not speak any Japanese, and a grandmother at a ramen shop").
+                text=h.short(rewrite.text, ITEM_MAX_WORDS),
                 hook=h.make_hook(kind, rewrite.core, rewrite.hook_style, HOOK_MAX_WORDS),
                 depth=h.KIND_DEPTH.get(kind, 1),
             ))
@@ -260,7 +265,7 @@ def _pair_overlap(
     tx, ty = f"{x.text}", f"{y.text}"
     shared = sorted(h.stems(tx) & h.stems(ty) - _GENERIC_STEMS - {h.stem(n) for n in names.values()})
     if shared:
-        word = _surface_word(tx, shared[0])
+        word = _surface_word(f"{tx} {ty}", shared[0])
         summary = f"Both mentioned {word}"
         return _build(x, y, "direct", summary, names, profiles, word)
     common = sorted(h.families_of(tx) & h.families_of(ty))
@@ -278,10 +283,20 @@ def _pair_overlap(
 
 
 def _surface_word(text: str, stem_value: str) -> str:
-    for word in h.content_words(text):
-        if h.stem(word) == stem_value:
-            return word
-    return stem_value
+    """The shared word as said: "Tokyo" (not "tokyo"), and "users" when one side said "user research"
+    and the other "what users want" (a bare "You both brought up user" does not read)."""
+    forms = [w.strip("'") for w in re.findall(r"[A-Za-z][A-Za-z'\-]+", text)
+             if len(w) >= 3 and w.lower() not in h.STOPWORDS and h.stem(w) == stem_value]
+    if not forms:
+        return stem_value
+    lowered = [f.lower() for f in forms]
+    # An activity reads best ("building", not "builds"); otherwise the plain form ("design", not
+    # "designer"), in the plural when one side used it.
+    word = next((w for w in lowered if w.endswith("ing")), None) or min(lowered, key=len)
+    if word + "s" in lowered:
+        word += "s"
+    # Lower case unless the word is only ever written with a capital (a proper noun like "Tokyo").
+    return word if word in forms else forms[lowered.index(word)]
 
 
 def _build(
@@ -302,8 +317,14 @@ def _template_opener(
     """A validated opener addressed by name, shrinking the item phrases until it fits 28 words."""
     n1, n2 = names[1], names[2]
     attempts: list[str] = []
-    for max_words in (8, 6):
-        t1, t2 = h.short(h.topic_of(x.text), max_words), h.short(h.topic_of(y.text), max_words)
+    # Shrink each side on its own (longest first), and for a direct overlap try first the phrasings
+    # in which both sides still say the shared word, so "You both brought up spring" has a referent.
+    lengths = sorted(((a, b) for a in (8, 6, 4) for b in (8, 6, 4)), key=lambda ab: -(ab[0] + ab[1]))
+    pairs = list(dict.fromkeys((h.short(h.topic_of(x.text), a), h.short(h.topic_of(y.text), b)) for a, b in lengths))
+    if kind == "direct" and label:
+        said = h.stem(label)
+        pairs.sort(key=lambda t: not (said in h.stems(t[0]) and said in h.stems(t[1])))
+    for t1, t2 in pairs:
         if kind == "direct" and label:
             attempts.append(f"{n1} mentioned {t1} and {n2} mentioned {t2}. You both brought up {label}. "
                             f"{n2}, what's your version?")

@@ -18,7 +18,8 @@ STOPWORDS = frozenset(
     always never every something someone anything everything maybe actually definitely probably
     right now got get gets want wants love loves like likes enjoy enjoys one two three much many
     being doing going been make made way time times day days week weeks year years people person
-    favorite talk tell said say says think know mean guess honestly basically""".split()
+    favorite talk tell said say says think know mean guess honestly basically still figure figured
+    ideally""".split()
 )
 
 _JUNK_CLAUSES = re.compile(
@@ -28,7 +29,7 @@ _JUNK_CLAUSES = re.compile(
 )
 _FILLER_PREFIX = re.compile(
     r"^(?:(?:um+|uh+|so|well|like|okay|ok|yeah|yes|oh|honestly|basically|i mean|i guess|i think|"
-    r"you know|actually|oh my god|omg|and|but|also|then|right|hmm+)\b[\s,]*)+",
+    r"you know|actually|oh my god|omg|and|but|also|then|right|hmm+|after that|and then|plus)\b[\s,]*)+",
     re.IGNORECASE,
 )
 _INNER_FILLER = re.compile(r"\b(?:um+|uh+|you know|i mean)\b,?\s*", re.IGNORECASE)
@@ -65,12 +66,32 @@ def stems(text: str) -> set[str]:
 
 
 _DANGLING = {"in", "a", "an", "the", "to", "of", "and", "or", "with", "for", "at", "on", "my", "their",
-             "your", "how", "that", "who", "from", "by", "but", "so"}
+             "your", "how", "that", "who", "from", "by", "but", "so", "then", "than", "like", "about",
+             "into", "as", "while", "when", "because", "if", "without", "through", "over", "after",
+             "before", "what", "which", "where", "until", "is", "are", "was", "were", "be", "it", "they",
+             "you", "his", "her", "its", "our", "this", "these", "those", "some", "any", "every", "each",
+             "small", "big", "new", "real", "very", "much", "more", "most", "few", "can", "could", "just",
+             "first"}
+# A cut that lands inside one of these clauses is moved back to before it ("until they hurt").
+_CLAUSE_STARTS = {"until", "because", "while", "when", "which", "that", "who", "and", "but", "so", "then",
+                  "than", "where", "what", "since", "though"}
 
 
 def short(text: str, max_words: int) -> str:
-    """First `max_words` words, without a dangling preposition or article at the end."""
-    words = text.split()[:max_words]
+    """First `max_words` words, ending on a whole phrase: when the text had to be cut, the cut moves
+    back to the last comma or clause word, and no preposition, article or helper word dangles."""
+    all_words = text.split()
+    words = all_words[:max_words]
+    if len(all_words) > len(words):
+        # The first comma ends the first phrase: "getting halfway up, froze" and "APIs, databases" are
+        # list or clause fragments, "getting halfway up" and "APIs" are whole.
+        comma = min((i for i, w in enumerate(words[:-1]) if w.endswith(",")), default=-1)
+        clause = max((i for i, w in enumerate(words) if i >= 2 and w.lower().strip(",;:.") in _CLAUSE_STARTS),
+                     default=-1)
+        if comma >= 0:
+            words = words[: comma + 1]
+        elif clause >= 2:
+            words = words[:clause]
     while len(words) > 1 and words[-1].lower().strip(",;:.") in _DANGLING:
         words.pop()
     return " ".join(words).rstrip(" ,;:.")
@@ -279,7 +300,8 @@ def split_clauses(answer: str) -> list[str]:
 def _lower_common_initial(clause: str) -> str:
     """'Rock climbing' -> 'rock climbing', but keep 'Tokyo' and 'I'."""
     first = clause.split(" ", 1)[0]
-    if first != "I" and first[:1].isupper() and (len(first) == 1 or first[1:].islower()) and first.lower() in _COMMON_WORDS:
+    common = first.lower() in _COMMON_WORDS or first.lower().endswith(("ing", "ly"))
+    if first != "I" and first[:1].isupper() and (len(first) == 1 or first[1:].islower()) and common:
         return first.lower() + clause[len(first):]
     return clause
 
@@ -322,7 +344,7 @@ def rewrite_clause(clause: str) -> Rewrite:
     if m:
         return Rewrite(f"could talk for hours about {to_third(m.group(1))}", to_second(m.group(1)), "interest")
 
-    m = re.match(r"^(?:i(?:'m|\s+am)\s+)?(?:really\s+|super\s+|kind of\s+|pretty\s+|very\s+)?"
+    m = re.match(r"^(?:i(?:'m|\s+am)\s+)?(?:really\s+|super\s+|kind of\s+|pretty\s+|very\s+|[a-z]+ly\s+)?"
                  r"(?:into|obsessed with|passionate about|a (?:big|huge) fan of|crazy about)\s+(.+)", c, re.I)
     if m:
         return Rewrite(f"into {to_third(m.group(1))}", to_second(m.group(1)))
@@ -332,6 +354,9 @@ def rewrite_clause(clause: str) -> Rewrite:
         verb, rest = m.group(1).lower(), m.group(2)
         if rest.lower().startswith("when "):
             return Rewrite(f"{verb}s it {to_third(rest)}", f"those moments {to_second(rest)}", "preference")
+        if rest.lower().startswith("that "):
+            # "I love that every route is a puzzle" is a whole clause, not a topic to love "about".
+            return Rewrite(f"{verb}s {to_third(rest)}", to_second(rest[5:]), None, "love_that")
         return Rewrite(f"{verb}s {to_third(rest)}", to_second(rest))
 
     m = re.match(r"^i(?:'m|\s+am)\s+(?:really\s+|so\s+)?looking forward to\s+(.+)", c, re.I)
@@ -366,17 +391,36 @@ def rewrite_clause(clause: str) -> Rewrite:
 
     m = re.match(r"^i(?:'m|\s+am)\s+(.+)", c, re.I)
     if m:
-        return Rewrite(to_third(m.group(1)), f"being {to_second(m.group(1))}")
+        # "is a product designer", so the opener says "Maya mentioned being a product designer",
+        # not "Maya mentioned a product designer" (as if she had mentioned a person).
+        return Rewrite(f"is {to_third(m.group(1))}", f"being {to_second(m.group(1))}")
 
-    m = re.match(r"^i\s+(?:can|used to)\s+([a-z]+)(.*)", c, re.I)
+    m = re.match(r"^(?:ideally,?\s+|usually,?\s+)?there(?:'s|\s+is|\s+would be|\s+has to be)\s+(.+)", c, re.I)
     if m:
-        lead = "used to" if "used to" in c.lower()[:12] else "can"
-        return Rewrite(f"{lead} {m.group(1)}{to_third(m.group(2))}", f"{to_gerund(m.group(1))}{to_second(m.group(2))}", "fun_fact")
+        return Rewrite(to_third(m.group(1)), to_second(m.group(1)))
 
-    m = re.match(r"^i\s+(?:also\s+|really\s+|just\s+|actually\s+)?([a-z]+)\b(.*)", c, re.I)
-    if m and m.group(1).lower() not in _MODALS:
-        verb, rest = m.group(1), m.group(2)
-        return Rewrite(f"{conjugate_third(verb)}{to_third(rest)}", f"{to_gerund(verb)}{to_second(rest)}")
+    m = re.match(r"^i\s+(can|used to)\s+(?:(still|also|really|always|even|actually|usually)\s+)?([a-z]+)(.*)", c, re.I)
+    if m:
+        lead = m.group(1).lower()
+        adverb = f"{m.group(2).lower()} " if m.group(2) else ""
+        verb, rest = m.group(3), m.group(4)
+        return Rewrite(f"{lead} {adverb}{verb}{to_third(rest)}", f"{adverb}{to_gerund(verb)}{to_second(rest)}", "fun_fact")
+
+    m = re.match(r"^i\s+(did not|didn't|do not|don't|never)\s+(?:really\s+|actually\s+)?([a-z]+)\b(.*)", c, re.I)
+    if m:
+        neg, verb, rest = m.group(1).lower().replace("n't", " not"), m.group(2), m.group(3)
+        if neg == "never":
+            text, core = f"never {conjugate_third(verb)}", f"never {to_gerund(verb)}"
+        else:
+            text, core = f"{'did' if neg.startswith('did') else 'does'} not {verb}", f"not {to_gerund(verb)}"
+        return Rewrite(f"{text}{to_third(rest)}", f"{core}{to_second(rest)}")
+
+    m = re.match(r"^i\s+(?:(still|always|usually|often|sometimes|never|even)\s+)?"
+                 r"(?:also\s+|really\s+|just\s+|actually\s+)?([a-z]+)\b(.*)", c, re.I)
+    if m and m.group(2).lower() not in _MODALS:
+        adverb = f"{m.group(1).lower()} " if m.group(1) else ""
+        verb, rest = m.group(2), m.group(3)
+        return Rewrite(f"{adverb}{conjugate_third(verb)}{to_third(rest)}", f"{adverb}{to_gerund(verb)}{to_second(rest)}")
 
     m = re.match(r"^my\s+(.+)", c, re.I)
     if m:
@@ -436,11 +480,61 @@ def make_hook(kind: str, core: str, hook_style: str | None = None, max_words: in
         template = "What's the best part of {core}?"
     elif hook_style == "happy":
         template = "What is it about {core} that makes you happy?"
+    elif kind == "preference" and core.lower().startswith("when "):
+        template = "What makes it so good {core}?"
+    elif hook_style == "love_that":
+        template = "Why do you love that {core}?"
     else:
         template = HOOK_TEMPLATES.get(kind, HOOK_TEMPLATES["interest"])
-    overhead = len(template.replace("{core}", "").split())
-    trimmed = short(core, max(2, max_words - overhead))
+    core = re.split(r",\s*(?:which|and|but|so|then|though)\b", core, maxsplit=1)[0].strip()
+    # One phrase per hook: "getting halfway up, froze" -> "getting halfway up",
+    # "a board game at the end that gets way too competitive" -> "a board game at the end".
+    head = core.split(",", 1)[0].strip()
+    if "," in core:
+        core = head if len(head.split()) >= 2 else core
+    else:
+        # Two activities: ask about the first ("reading about user interviews and trying to run").
+        pair = re.match(r"^(\S+\s+\S+.*?)\s+and\s+[a-z]+ing\b", core, re.I)
+        core = pair.group(1) if pair else core
+    relative = re.match(r"^((?:\S+\s+){3,}?)(?:that|which|who)\s", core, re.I)
+    if relative and hook_style != "love_that" and not core.lower().startswith(("when ", "the time")):
+        core = relative.group(1).strip()
+    # "your goal is just to finish" or "your battery died in Shinjuku" is a whole clause: say it, then ask
+    # (not "How is your goal is ... going?").
+    if _is_clause(core) and not core.lower().startswith("the time"):
+        ask = "How is that going?" if kind == "goal" else "What's the story there?"
+        text = short(core, max(3, max_words - _words(ask)))
+        if text.lower().endswith(" there") and ask.endswith(" there?"):
+            ask = "What's the story?"
+        return f"{text[:1].upper()}{text[1:]}. {ask}"
+    trimmed = short(core, max(2, max_words - _words(template.replace("{core}", ""))))
     return template.format(core=trimmed)
+
+
+def _words(text: str) -> int:
+    """Spoken words, not punctuation: the "?" of a template is not a word of the budget."""
+    return len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'\-]*", text))
+
+
+_PRONOUNS = {"i", "you", "we", "they", "he", "she", "it", "who", "that"}
+
+
+def _is_clause(core: str) -> bool:
+    """'your goal is ...', 'your battery died ...', 'your Japanese mostly stops there': a subject and a verb."""
+    words = [w.strip(",").lower() for w in core.split()]
+    if len(words) < 3 or words[0] not in ("your", "the", "a", "an"):
+        return False
+    for k in range(1, min(4, len(words) - 1)):
+        w = words[k]
+        if w in _PRONOUNS:
+            return False
+        if w in ("is", "are", "was", "were"):
+            return True
+        if k >= 2 and is_past(w) and not w.endswith(("eed", "dred")):
+            return True
+        if k >= 2 and words[k - 1].endswith("ly") and w.endswith("s"):
+            return True
+    return False
 
 
 _TOPIC_PREFIX = re.compile(
@@ -459,6 +553,9 @@ def topic_of(item_text: str) -> str:
         return f"the time they {rest}" if first and is_past(first) else rest
     stripped = _TOPIC_PREFIX.sub("", text)
     if stripped != text:
+        for lead, verb in _TOPIC_VERBS:
+            if text.lower().startswith(lead + " "):
+                return f"{verb} {stripped}"
         first = stripped.split(" ", 1)[0]
         if text.lower().startswith(("wants to", "trying to")) and first:
             return to_gerund(first) + stripped[len(first):]
@@ -467,6 +564,17 @@ def topic_of(item_text: str) -> str:
     first, rest = words[0].lower(), text[len(words[0]):]
     if first.endswith("ing") or first in {"a", "an", "the", "their"}:
         return text
+    second = words[1].lower() if len(words) > 1 else ""
+    # Helper verbs are not the action: "used to run" -> "running", "did not speak" -> "not speaking",
+    # "can build" -> "being able to build", "still has" -> "still having".
+    if first == "used" and second == "to" and len(words) > 2:
+        return to_gerund(words[2]) + text.split(words[2], 1)[1]
+    if first in _AUX and second in ("not", "never") and len(words) > 2:
+        return f"{second} {to_gerund(words[2])}" + text.split(words[2], 1)[1]
+    if first in ("can", "could") and len(words) > 1:
+        return "being able to" + rest
+    if first in _LEAD_ADVERBS and len(words) > 1:
+        return f"{first} {topic_of(text[len(words[0]):].strip())}"
     if first in _THIRD_IRREGULAR:
         return _THIRD_IRREGULAR[first] + rest
     if is_past(first):
@@ -483,7 +591,23 @@ def topic_of(item_text: str) -> str:
     return text
 
 
+# Prefixes whose object alone would sound like the person mentioned a person or a thing:
+# "hoping to meet an engineer" -> "meeting an engineer", not "an engineer".
+_TOPIC_VERBS = (("hoping to meet", "meeting"), ("looking for", "finding"), ("can help with", "helping with"),
+                ("good at", "being good at"))
 _THIRD_IRREGULAR = {"has": "having", "does": "doing", "goes": "going", "is": "being"}
+_AUX = {"did", "does", "do", "was", "were", "is", "are", "had", "has", "have", "would", "will", "should", "might"}
+_LEAD_ADVERBS = {"still", "always", "usually", "often", "sometimes", "never", "even", "also"}
+
+
+def about_speaker(clause: str) -> bool:
+    """False for clauses whose subject is someone or something else ("it is the Austin half",
+    "he was a better coach"): out of context they make garbled items and crumbs."""
+    first = clause.strip().split(" ", 1)[0].lower().strip(",")
+    if first in ("now", "then", "so", "and") and " " in clause.strip():
+        first = clause.strip().split()[1].lower().strip(",")
+    return first not in {"it", "it's", "that", "that's", "this", "he", "she", "he's", "she's", "there",
+                         "there's", "they", "they're", "which", "who"}
 
 
 # --- Transcript helpers ----------------------------------------------------------------------

@@ -6,19 +6,24 @@ Everything here is pure and synchronous. The crumb validator (`validate_crumb_te
 from __future__ import annotations
 
 import re
-from functools import lru_cache
 
 from models import Profile
 
 EM_DASH = "\u2014"
 
 # PRD 6.4 quick toggles, each expanded to a keyword list. Free text off-limits terms that match a
-# toggle name expand the same way; anything else is matched as a literal phrase.
+# toggle name expand the same way; anything else is matched as a literal phrase, and a single word
+# of 4+ letters also as a prefix ("japan" blocks "Japanese", "climb" blocks "climber").
 OFF_LIMITS_TOGGLES: dict[str, list[str]] = {
     "work": [
         "work", "job", "jobs", "career", "careers", "boss", "office", "coworker", "coworkers",
-        "employer", "company", "manager", "workplace", "internship", "profession", "colleague",
-        "colleagues", "promotion", "fired", "laid off", "layoff",
+        "employer", "employee", "company", "manager", "workplace", "internship", "intern", "profession",
+        "colleague", "colleagues", "promotion", "fired", "laid off", "layoff", "hiring", "resume",
+        # occupations and employers: "a product designer at a startup" is work talk without the word "work"
+        "startup", "start-up", "founder", "cofounder", "co-founder", "entrepreneur", "engineer",
+        "engineering", "developer", "programmer", "designer", "consultant", "analyst", "freelance",
+        "freelancer", "client", "clients", "customer", "customers", "team", "role", "industry",
+        "day job", "nine to five", "9 to 5", "side hustle", "business", "salary", "paycheck",
     ],
     "family": [
         "family", "families", "mom", "mother", "dad", "father", "parent", "parents", "sibling",
@@ -44,7 +49,7 @@ OFF_LIMITS_TOGGLES: dict[str, list[str]] = {
     "health": [
         "health", "healthy", "sick", "illness", "disease", "diagnosis", "diagnosed", "doctor",
         "hospital", "therapy", "therapist", "medication", "medical", "surgery", "injury",
-        "injured", "cancer", "anxiety", "depression", "mental health", "diabetes", "disability",
+        "injured", "hurt", "concussion", "sprain", "sprained", "fracture", "fractured", "acl", "cancer", "anxiety", "depression", "mental health", "diabetes", "disability",
         "pregnant", "pregnancy", "rehab", "adhd", "chronic",
     ],
 }
@@ -56,6 +61,8 @@ SENSITIVE_KEYWORDS: list[str] = [
     "illness", "disease", "diagnosis", "diagnosed", "therapy", "therapist", "medication",
     "surgery", "cancer", "anxiety", "depression", "mental health", "diabetes", "disability",
     "pregnant", "pregnancy", "rehab", "adhd", "autism", "chronic",
+    # injuries ("hurt my knee" is health information too); see also _INJURY_RE
+    "injury", "injured", "concussion", "sprained", "fractured", "torn ligament", "acl", "physical therapy",
     # religion
     *OFF_LIMITS_TOGGLES["religion"],
     # politics
@@ -88,6 +95,18 @@ UNSAFE_KEYWORDS: list[str] = [
     "sleep with", "sleeping with", "one night stand", "bedroom", "fetish", "horny",
     "body count", "physique",
 ]
+
+# "hurt my knee", "broke their wrist", "tore my ACL": an injury verb plus a body part. Kept as a
+# pattern so "broke my phone" or "hurt my feelings" are not health information.
+_INJURY_RE = re.compile(
+    r"\b(?:hurt|hurts|hurting|injur(?:e|ed|es|ing)|broke|broken|break(?:s|ing)?|tore|torn|tear(?:s|ing)?|"
+    r"sprain(?:ed|s|ing)?|twist(?:ed|s|ing)?|fractur(?:e|ed|es|ing)|pull(?:ed|s|ing)?|blew out|blown out|"
+    r"messed up|wrecked)\s+(?:my|their|his|her|your|a|an|the|both)?\s*(?:left\s+|right\s+|lower\s+)?"
+    r"(?:knee|knees|ankle|ankles|back|shoulder|shoulders|wrist|wrists|arm|arms|leg|legs|hip|hips|neck|"
+    r"foot|feet|hand|hands|elbow|elbows|acl|mcl|meniscus|hamstring|hamstrings|rib|ribs|collarbone|"
+    r"finger|fingers|toe|toes|spine|achilles|calf|groin|head|jaw|nose|muscle|ligament)\b",
+    re.IGNORECASE,
+)
 
 _EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF‍️]"
@@ -125,23 +144,61 @@ def first_sentence(text: str, max_chars: int = 200) -> str:
     return truncate_words(sentence, 40, max_chars)
 
 
-@lru_cache(maxsize=512)
-def _keyword_re(keyword: str) -> re.Pattern[str]:
-    kw = keyword.lower()
-    # Allow simple inflections: "job" -> "jobs", "vote" -> "voted", "injury" -> "injuries", "sexy" -> "sexiest".
+PREFIX_MARK = "*"  # a trailing "*" on a keyword matches any word that starts with it
+
+
+_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+# Endings a keyword may take: "job" -> "jobs", "vote" -> "voted", "injury" -> "injuries", "sexy" -> "sexiest".
+_INFLECTIONS = ("", "s", "es", "ed", "ing", "d")
+_Y_INFLECTIONS = ("y", "ies", "ied", "ier", "iest", "ying")
+
+
+def _normalize(text: str) -> str:
+    """Lowercase with whitespace runs collapsed, so a multi-word keyword matches across line breaks."""
+    return " ".join((text or "").lower().split())
+
+
+def _contains(lowered: str, phrase: str, endings: tuple[str, ...] = ("",), prefix: bool = False) -> bool:
+    """True when `phrase` (plus one of `endings`, or any word tail when `prefix`) appears in `lowered`
+    as a whole word: no letter or digit directly before it or after the match.
+
+    Plain string scanning on purpose: keywords include people's free-text off-limits terms and their
+    names, and a regex built from them would outlive the session in a process-wide cache (`lru_cache`
+    or the `re` module's own pattern cache) after the session is wiped (PRD F20, 15.1).
+    """
+    if not phrase:
+        return False
+    start = 0
+    while (i := lowered.find(phrase, start)) != -1:
+        start = i + 1
+        if i > 0 and lowered[i - 1] in _ALNUM:
+            continue
+        end = i + len(phrase)
+        if prefix:
+            return True  # the word tail runs to the end of the word, so the right edge always holds
+        for ending in endings:
+            if lowered.startswith(ending, end) and (end + len(ending) >= len(lowered)
+                                                    or lowered[end + len(ending)] not in _ALNUM):
+                return True
+    return False
+
+
+def _keyword_in(lowered: str, keyword: str) -> bool:
+    kw = _normalize(keyword)
+    if kw.endswith(PREFIX_MARK):
+        return _contains(lowered, kw[: -len(PREFIX_MARK)], prefix=True)
     if kw.endswith("y") and len(kw) > 3 and " " not in kw:
-        body = rf"{re.escape(kw[:-1])}(?:y|ies|ied|ier|iest|ying)"
-    else:
-        body = re.escape(kw).replace(r"\ ", r"\s+") + "(?:s|es|ed|ing|d)?"
-    return re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", re.IGNORECASE)
+        return _contains(lowered, kw[:-1], _Y_INFLECTIONS)
+    return _contains(lowered, kw, _INFLECTIONS)
 
 
 def find_keyword(text: str, keywords: list[str] | tuple[str, ...]) -> str | None:
     """Return the first keyword found in `text` (word-boundary, case-insensitive), else None."""
     if not text:
         return None
+    lowered = _normalize(text)
     for keyword in keywords:
-        if keyword and _keyword_re(keyword).search(text):
+        if keyword and _keyword_in(lowered, keyword):
             return keyword
     return None
 
@@ -158,6 +215,8 @@ def expand_off_limits(terms: list[str]) -> list[str]:
             toggle = OFF_LIMITS_TOGGLES.get(term) or OFF_LIMITS_TOGGLES.get(term.replace("_", " "))
             if toggle:
                 keywords.extend(toggle)
+            elif re.fullmatch(r"[a-z][a-z'\-]{3,}", term):
+                keywords.append(term + PREFIX_MARK)
     return list(dict.fromkeys(keywords))
 
 
@@ -169,7 +228,7 @@ def off_limits_keywords(profiles: dict[int, Profile]) -> list[str]:
 
 
 def is_sensitive(text: str) -> bool:
-    return find_keyword(text, SENSITIVE_KEYWORDS) is not None
+    return find_keyword(text, SENSITIVE_KEYWORDS) is not None or bool(_INJURY_RE.search(text or ""))
 
 
 def is_unsafe(text: str) -> bool:
@@ -178,15 +237,13 @@ def is_unsafe(text: str) -> bool:
 
 def name_present(text: str, names: dict[int, str]) -> bool:
     """True when any participant's name (full or first token) appears in `text`."""
-    lowered = text.lower()
+    lowered = _normalize(text)
     for name in names.values():
-        name = (name or "").strip()
+        name = _normalize(name)
         if not name:
             continue
-        candidates = {name.lower(), name.split()[0].lower()}
-        for cand in candidates:
-            if re.search(rf"(?<![a-z0-9]){re.escape(cand)}(?![a-z0-9])", lowered):
-                return True
+        if _contains(lowered, name) or _contains(lowered, name.split()[0]):
+            return True
     return False
 
 

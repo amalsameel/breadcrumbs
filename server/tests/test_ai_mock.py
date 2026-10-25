@@ -333,8 +333,9 @@ async def test_payload_matches_prd_9_4_and_hides_removed_items(g: Gemini):
     assert set(payload) == {
         "mode", "kind", "requested_source", "current_depth_max", "names", "profiles", "overlaps_unused",
         "recent_transcript", "current_topic", "used_topics", "used_item_ids", "featured_count", "off_limits",
-        "allowed_formats",
+        "allowed_formats", "requested_item_ids",
     }
+    assert payload["requested_item_ids"] == ["s1_i1", "s2_i1"]  # the planned overlap's items
     assert payload["names"] == {"1": "Maya", "2": "Dev"}
     assert payload["requested_source"] == "overlap" and payload["kind"] == "switch"
     assert "s1_i2" not in payload["profiles"]["1"] and "sourdough" not in payload["profiles"]["1"]
@@ -401,11 +402,12 @@ async def test_invalidate_and_refill(g: Gemini):
     assert svc.cached_summary(1.0)["steer"] is not None
 
 
-async def test_instruction_bypasses_cache(g: Gemini):
+async def test_instruction_uses_cache_with_spoken_lead_in(g: Gemini):
     svc = _service(g)
     await svc.prefetch(_ctx(TRANSCRIPT, "running"), now=0.0)
+    cached = svc._cache["switch"].crumb.text
     d = await svc.get("switch", _ctx(TRANSCRIPT, "running", instruction="one minute left"), now=1.0)
-    assert not d.cache_hit
+    assert d.cache_hit and d.crumb.text == f"One minute left. {cached}"
 
 
 # --- Fallback chain ----------------------------------------------------------------------------------------

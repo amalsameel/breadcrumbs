@@ -61,7 +61,9 @@ DEPTH_LADDER = """Depth ladder:
 - Level 4: reflective (what matters to you, what you'd change)
 Formats: question (default), fun_fact (always ends with a question back to them), would_you_rather,
 callback (a thread from earlier in this conversation), collab (what could you two build or trade?).
-Use only a format listed in allowed_formats."""
+Use only a format listed in allowed_formats.
+When requested_item_ids is given, build the crumb on those items. Always list the item ids you
+used in source_item_ids, and only use items at or below current_depth_max."""
 
 # --- 9.5 Outside facts (grounded) -------------------------------------------------
 FACT_PROMPT = (
@@ -114,8 +116,14 @@ def overlap_system(mode: Mode) -> str:
     return f"{OVERLAP_SYSTEM}\n{OVERLAP_SUFFIX}\n\nMode: {MODE_LABEL[mode]}. Tone: {TONE[mode]}."
 
 
+# PRD 9.2 / 15.3 applied to the trail: appended so TRAIL_SYSTEM stays verbatim.
+TRAIL_SAFETY = """Never turn distress, self-harm or a safety concern into a thread. Never mention sensitive
+categories (health or injuries, religion, politics, sexuality, immigration status, finances, criminal
+history, trauma), even if they came up."""
+
+
 def trail_system(mode: Mode) -> str:
-    return f"{TRAIL_SYSTEM}\n\nMode: {MODE_LABEL[mode]}. Tone: {TONE[mode]}."
+    return f"{TRAIL_SYSTEM}\n{TRAIL_SAFETY}\n\nMode: {MODE_LABEL[mode]}. Tone: {TONE[mode]}."
 
 
 # --- Appendix B: canned fallback crumbs ------------------------------------------------
@@ -149,7 +157,7 @@ def canned_crumbs(mode: Mode) -> list[tuple[str, str]]:
 
 ALL_PROMPTS: tuple[str, ...] = (
     PROFILE_SYSTEM, OVERLAP_SYSTEM, OVERLAP_SUFFIX, CRUMB_SYSTEM, DEPTH_LADDER, FACT_PROMPT,
-    HOLD_SYSTEM, ENERGY_SYSTEM, TRAIL_SYSTEM,
+    HOLD_SYSTEM, ENERGY_SYSTEM, TRAIL_SYSTEM, TRAIL_SAFETY,
 )
 
 __all__ = [
