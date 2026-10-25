@@ -43,6 +43,8 @@ class Engine:
 
     # read-only views for the runner / crumb context
     def snapshot(self, now: float) -> dict        # EngineSnapshot (types.ts) minus `cached` (runner fills it)
+                                                  # round 2: `vad_active` stays the raw local VAD; `noise_suspected`
+                                                  # = raw VAD active but not counted as speech (unconfirmed by Muse)
     def recent_transcript(self, now: float, seconds: float = 120) -> str   # "Maya: ...\nDev: ..." (human turns only, mapped seats)
     @property current_topic -> str | None         # from the latest EnergyTag
     def depth_max(self, now: float) -> int        # min(MAX_DEPTH[mode], 1 + floor(minutes_live / RAMP_MINUTES[mode]))
@@ -107,8 +109,14 @@ async def tag_energy(context: str) -> EnergyTag                     # gemini-3.5
 @dataclass class Fact: text: str; url: str; title: str
 async def get_fact(topic: str | None, location: str) -> Fact | None  # None if no citation (never an ungrounded fact); mock returns None
 
-# ai/tts.py
-async def synthesize(text: str) -> bytes | None                      # WAV bytes or None
+# ai/tts.py  (round 2: ElevenLabs, then Gemini TTS, then None so the Table uses the browser voice)
+async def synthesize(text: str, gemini: Gemini | None = None, *, fast: bool = True,
+                     elevenlabs: ElevenLabs | None = None, budget_s: float | None = None) -> bytes | None   # WAV bytes or None
+# fast=True: live lines (misses, opener, calibration) on eleven_flash_v2_5; fast=False: prefetch (eleven_v4, then
+# multilingual_v2, then flash). budget_s is the caller's whole time budget; the chain splits it across routes.
+# ai/elevenlabs.py
+def get_elevenlabs() -> ElevenLabs   # process-wide; keyless (unavailable) under pytest unless BREADCRUMBS_ELEVENLABS_LIVE_TESTS=1
+class ElevenLabs: available: bool; async synthesize(text, *, fast, budget_s=None) -> bytes | None; async warm() -> bool
 
 # ai/trail.py
 async def generate_trail(mode: Mode, names: dict[int, str], transcript: str, profiles: dict[int, Profile]) -> Trail   # <= 3 items per seat
@@ -174,9 +182,10 @@ Browser side (TypeScript, consumed by workstream D):
 export interface CaptureHandle { stop(): void; setPaused(paused: boolean): void; readonly ctx: AudioContext }
 export async function startCapture(opts: {
   onFrame: (pcm: ArrayBuffer) => void;            // 3,840 bytes per 80 ms
-  onVad: (active: boolean, rms: number) => void;  // 10 Hz
+  onVad: (active: boolean, rms: number, reading?: VadReading) => void;  // 10 Hz
 }): Promise<CaptureHandle>
-export class Vad { update(rms: number, nowMs: number): boolean; get active(): boolean; get noiseFloor(): number }   // PRD 14.1 local VAD
+// round 2: speech-aware VAD (1.5 s room calibration, adaptive floor, SNR hysteresis 10/5 dB, voice checks, 200 ms attack / 500 ms release)
+export interface VadReading { active: boolean; rms: number; levelDb: number; floorDb: number; snrDb: number; voiced: boolean; calibrating: boolean }
 // web/src/audio/player.ts
 export class CrumbPlayer {
   constructor(ctx?: AudioContext)
@@ -185,7 +194,11 @@ export class CrumbPlayer {
   fadeOut(ms?: number): void          // 250 ms default (barge-in)
   get playing(): boolean
   get playingSinceMs(): number | null // for the 300 ms VAD grace
+  get outputKind(): "audio" | "speech" | "silent" | null   // round 2, for echo-aware barge-in
+  outputLevel(): number | null        // RMS 0..1 of WebAudio output; null for browser speech
 }
+// web/src/components/table/playback.ts (round 2: echo-aware barge-in, replaces forward/shouldFade)
+export class PlaybackGate { observe(sample: { active: boolean; levelDb: number; voiced?: boolean }, now: number): { send: boolean; fade: boolean }; get currentId(): string | null }
 // web/src/audio/recorder.ts
 export interface RecorderHandle { stop(): Promise<Blob>; cancel(): void; readonly analyser: AnalyserNode; readonly mimeType: string }
 export async function startRecording(): Promise<RecorderHandle>
@@ -224,6 +237,12 @@ Routes: `/` Home (create session, choose mode, quick-profile toggle) → `/table
 - C: `tests/test_validator.py`, `tests/test_ai_mock.py` (profiles/overlaps/crumbs/trail in mock mode, cache invalidation, source rotation)
 - A: `tests/test_muse_realtime.py` (local fake Muse WS server: handshake shape, pacing, endStream, reconnect on 1011), `tests/test_transcribe.py` (httpx MockTransport), `tests/test_convert.py` (skips without ffmpeg)
 - Integration: `tests/test_api.py` (full flow in mock mode with FastAPI TestClient, consent gating, wipe, TTL)
+- Round 2: `tests/test_elevenlabs.py`, `tests/test_noise_echo.py`; sim adds 5 scripts beyond the 13 PRD ones:
+  `self_echo_transcript`, `real_barge_in_still_works`, `background_noise`, `bursty_noise`, `echo_then_reply_same_turn`.
+  Sim script keys added: `noise[{start, end}]` (local VAD with no Muse turn), `crumb_text`, per-turn `vad_from` (echo turns only).
+- Web (run from `web/`): table `node --import ./src/components/table/__tests__/register.mjs --test 'src/components/table/__tests__/*.test.mjs'`;
+  player `node --import ./src/components/table/__tests__/register.mjs --test 'src/audio/__tests__/*.test.mjs'`;
+  phone `node --test src/components/phone/flow.test.mjs`.
 
 ## 8. File ownership (do not edit other workstreams' files)
 

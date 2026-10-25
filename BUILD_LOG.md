@@ -291,3 +291,300 @@ Newest entries are at the bottom. Every entry has a timestamp, an author (`lead`
 - Results on `main`: `pytest -q` → **467 passed** (identical with keys in `.env` and with keys blanked); `sim.replay` → **13/13**; web table tests **53/53**, phone flow **19/19**; `npm run build` OK; mock smoke on :8130 → **25/25**; **real-key calibration test** (Muse diarization + Claude) on the merged live server → calibration `{A:1, B:2}` + Claude opener: PASS.
 - Commits: `da7c54d` engine review fixes · `9044e97` AI review fixes · `c318d41` server + Table review fixes · `76454ab` Claude provider + Spark fix + Muse TLS.
 - Live server now runs from `main` (port 8000, same tunnel); the temporary worktree was removed.
+
+### 2026-10-24 · lead · User test round 2: voice cutoff, captions, UI revamp, background noise
+User feedback: (1) crumbs speak one word then cut off, and the voice is not natural enough; (2) captions reveal too slowly and vanish too fast; (3) revamp the UI with the UI/UX skills, ElevenLabs-style (reference screenshot), with a white-tipped orb; (4) background noise keeps the Table "listening" forever.
+- 🔍 **Root cause of (1):** self barge-in. `PlaybackGate.shouldFade` fades the line on any local VAD activity after the first 300 ms of voice, and the laptop mic hears the laptop speaker (browser `speechSynthesis` output is not removed by echo cancellation). The Table hears its own first word and stops itself.
+- 🔍 **Voice options checked:** Meta Model API has no TTS (`muse-voice-transcribe-1.0` is speech-to-text only; models: muse-wonder-1.0, muse-spark-*, muse-image-1.0, sam-3.1). Claude has no TTS. Gemini TTS is integrated but billing-blocked. **User chose ElevenLabs.**
+- 🔍 **(4):** local VAD is RMS-only (`rms > max(0.01, 3 × floor)`), so steady room noise reads as speech, and VAD activity freezes the pause timer, so crumbs never fire.
+- ⚠️ **Design change:** the dark PRD 14.3 palette is replaced by an ElevenLabs-style light system (tokens in `web/src/index.css`: off-white `#F7F5F2` canvas, near-black ink, pill buttons, 28 px cards, Inter Tight display). Orb state colors keep the PRD meaning (amber/orange listening, blue holding, gray paused) and are always paired with a text label.
+- ✅ Pre-added shared config so the parallel builders don't collide: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL`, `TTS_PROVIDER`; engine `Params.VAD_UNCONFIRMED_S = 2.5` and `Params.ECHO_TEXT_OVERLAP = 0.5`. `.env` has an empty `ELEVENLABS_API_KEY=` slot.
+- Next: workflow with 4 builders (voice, audio intelligence, Table UI + orb, Home + phone UI) → per-area skeptical review → fixes → final verification.
+
+### 2026-10-24 · lead · Round 2 workflow launched
+- 🟡 Workflow `breadcrumbs-round2` (run `wf_19917748-1b6`): 4 builders in parallel with disjoint file ownership. **voice**: ElevenLabs client + TTS chain + robust player. **audio**: echo-aware barge-in, speech-aware VAD, engine noise + echo-text rules, sim scripts. **table-ui**: WebGL grainy white-tip orb, caption timing, Table revamp. **home-phone-ui**: Home orb carousel + phone flow revamp. Each area is pipelined through a skeptical reviewer (defects must be reproduced) and a fixer, then one final verifier (keys blanked, port 8130, never 8000).
+- The ElevenLabs reference screenshot is described in detail in the prompts (agents can't see images); the orb component contract is pinned there so the two UI builders can work in parallel.
+
+### 2026-10-24 · round2:home-phone · Light orb-led redesign of Home and the phone flow
+- ✅ Home (`web/src/pages/Home.tsx`), rebuilt to the reference layout with our own name and copy: top nav (orb-dot wordmark, How it works / Privacy section links, black pill "Set the table"); hero "Never lose / the thread." in regular-weight Inter Tight (48 / 60 / 72 px, -0.04em) with a right-column paragraph and black + white pill CTAs; a large rounded showcase (radius 28, hairline, `bg-bg-sunken/55`) with a 3-way mode radiogroup (Social = ember, Networking = cocoa, Speed dating = lilac dots), an orb carousel (center 320 px with a white play button that creates the table for that mode, neighbors at 0.78x, faded outer orbs clipped by the container, captions with title + tagline, prev/next chevrons between the captions, Arrow keys, swipe, an aria-live announcement, and wrap-around via an unbounded position so no orb jumps across the stage), and a bottom row with a Full / Quick profile pill toggle and a black pill CTA. Below that: a 3-step How it works (Scan, Talk, Keep the trail), the privacy promise with a still sage orb, and status pills (Muse live/mock, AI provider from `ai_provider`, ffmpeg, dev tools). The create-session error is a dismissible `role="alert"` toast. Skip link included.
+- ✅ Phone flow restyled, behavior unchanged (`flow.ts` and every API call untouched): `phone/PhoneScreen.tsx` (light shell, orb wordmark, ink step marks, regular-weight `StepHeading` with a `size="md"` option for interview questions, new shared `ErrorNote`), `BuildingStep.tsx` / `QuietSteps.tsx` / `EndSteps.tsx` (CrumbOrb figures: warming while building, idle/warming while waiting, listening when phones go face down, still sage when the table is cleared; white contact card; white pill links), `InterviewStep.tsx` (orb record control wired to the recorder's analyser, waveform below it, white cards), `ReviewStep.tsx` (vibe pill, white field, ErrorNote), `pages/Join.tsx` (spinner color only).
+- ✅ Components: `RecordButton.tsx` is now an orb control: a 224 px button holding CrumbOrb (listening idle, warming + live `level` while recording, paused when the mic is unavailable), a white center disc (mic / stop + seconds / spinner) and a thin ink 20 s countdown ring. Same props plus an optional `analyser`, and a throttled (about 20 Hz) smoothed RMS `useAudioLevel`. `Waveform.tsx`: ink bars, line-strong idle dots, 48 px. `ProfileChips.tsx`: white pills with the kind label and a 44 px x, white Undo pill. `TrailCard.tsx`: numbered white cards with orb dots. `ConsentForm.tsx`: white promise card with mode-palette orb dots, ink checkbox accent, focus ring on the agree row.
+- ✅ Primitives (`components/ui/*`): `Button` (primary = black pill, secondary = white pill with hairline shadow, ghost, danger; 44 / 54 px), `Card` (white / sunken / lifted), `Pill` (white status pill with a tone dot, ink text for contrast), `TogglePill` (pressed = black pill with a check), `Switch` (ink track), `TextField` (white field, ink focus ring, exported `FIELD_CLASS`), new `Segmented.tsx` (radiogroup with roving focus, Arrow/Home/End), `Crumbs.tsx` (`OrbDot` CSS sphere with a white glint using the orb's own `PALETTES` from `table/orbLook.ts`, `Wordmark`, `OrbFigure`, monochrome `CrumbSteps`; `BreathingCrumb` and `CrumbMark` removed, nothing else used them), `modes.ts` (+ `tagline`, `palette` per mode). Every dark-theme leftover in these files (amber glows, `text-bg` on amber, `text-crumb`, rgba gold shadows) is gone.
+- ✅ Visual check through a scratch harness outside the repo (headless Chrome, 375 px iframe since headless clamps windows to 500 px): Home and all phone steps (consent, interview, review, waiting, live, opt-in, trail, gone) have `scrollWidth == clientWidth == 375`, so no horizontal scroll. The desktop 1440 px Home matches the reference composition.
+- ⚠️ Deviations: the carousel's outer faded orbs repeat the neighbor modes (only 3 modes exist), so they are aria-hidden and decorative. The active caption's up-right arrow is decorative; the play button is the action. Hero, nav and showcase "Set the table" all create a session with the selected mode.
+- Tests: `npx tsc -b --noEmit` → OK; `npm run build` → built (only the existing >500 kB chunk warning); `node --test src/components/phone/flow.test.mjs` → 19 passed, 0 failed (includes the no-em-dash check over every file in this area); table suite → 53 tests, 52 passed, 1 failed (`tableState.test.mjs` "shows the crumb while it is spoken and lingers after", the Table area's caption-timing work in progress, not touched here).
+- Requests: lead: `web/index.html` still has `<meta name="theme-color" content="#17120E">` (dark), so set it to `#F7F5F2`. The favicon could become the ember orb dot.
+
+### 2026-10-24 · round2:voice · ElevenLabs voice, TTS provider chain, player that never truncates
+- ✅ **ElevenLabs API checked against the official docs before any code** (text-to-speech/convert, text-to-dialogue/convert, models, voices search, prompting controls). The request shapes used: `POST /v1/text-to-speech/{voice_id}?output_format=pcm_24000` with header `xi-api-key` and body `{text, model_id, language_code?, voice_settings{stability, similarity_boost, style, use_speaker_boost, speed}, seed}`; and `POST /v1/text-to-dialogue?output_format=pcm_24000` with body `{inputs[{text, voice_id}], model_id, settings{stability, similarity}, seed}`. **Eleven v4 (released 2026-09-28) is served only on Text to Dialogue**, so one input there gives a single-voice line. Turbo v2.5 is deprecated in favour of Flash v2.5. `pcm_24000` is raw PCM16 mono at 24 kHz, so it is wrapped with `ai.gemini.pcm_to_wav` and needs no decoding or resampling.
+- ✅ New `server/ai/elevenlabs.py`. It uses an async httpx client with the certifi CA bundle, a keep-alive pool bound to the running loop, a 3 s connect timeout and a read timeout of 4 s (fast) or 12 s (natural). It retries once on 408/429/5xx, timeouts and dropped connections.
+  - Model choice:
+    - Prefetch path (`fast=False`): `eleven_v4`, then `eleven_multilingual_v2`, then `eleven_flash_v2_5`. Latency is hidden on this path, so the most natural model goes first.
+    - Live path (`fast=True`): `eleven_flash_v2_5` only (about 75 ms model latency). It covers misses, Drop a crumb, the opener and calibration lines.
+  - Voice: Sarah (`EXAVITQu4vr4xnSDxMaL`), a warm, reassuring, soft-spoken American voice. ElevenLabs says default voices stay available through 2026-12-31. `ELEVENLABS_VOICE_ID` overrides the voice, and a malformed value falls back to the default. `ELEVENLABS_MODEL` overrides the first prefetch model.
+  - Settings: stability 0.5, similarity 0.75, style 0, speed 1.0, a fixed seed for consistency, speaker boost on for the natural path only, and `language_code: "en"` on Flash only.
+  - Failures:
+    - 401 or 402 pause the provider for 10 min.
+    - 403 sets that model aside, or pauses the provider if the refused model is Flash.
+    - Two 4xx answers in a row set a model aside for 10 min. One bad line does not.
+  - Leading and trailing silence is trimmed, keeping 30 ms before the first word and 120 ms after the last, so the Table's start time matches the first word.
+  - `warm()` sends `GET /v1/models` (no characters billed) to open the TLS connection before the first live line.
+  - Logs show only endpoint, model, status, error code, latency, size and request id. They never contain the text or the key.
+- ✅ `server/ai/tts.py`: the provider chain is ElevenLabs (when a key is set and the provider is not paused), then Gemini TTS, then None (the Table uses the browser voice). `synthesize(text, gemini=None, *, fast=True, elevenlabs=None)` keeps the old call shape (runner `_say` defaults to the fast path). ElevenLabs now works even when the text AI is mock. New `speech_text()` removes `[audio tags]` (v4 would perform them), `<markup>`, `*_#` style markup and URLs, turns `&` into "and", runs `clean_text`, and caps the line at 1000 characters.
+- ✅ `server/ai/crumbs.py`: only `_synth` changed. It sets `fast = budget_s < PREFETCH_TTS_BUDGET_S`, so misses (1 s) and the opener (5 s) take the fast path and prefetch (12 s) takes the natural one.
+- ✅ `web/src/audio/player.ts`. The public API is unchanged (`playing`, `playingSinceMs`, `currentId`, `attach`, `resume`, `playChime`, `play`, `fadeOut`).
+  - WAV playback:
+    - PCM16 WAV is copied straight into an AudioBuffer, and only other formats go through `decodeAudioData` (both the promise and the callback forms).
+    - `resume()` is bounded at 800 ms. A context that is still not running falls back to the browser voice.
+    - A 6 ms fade-in removes the start click. Every node in flight is held in a module-level set.
+    - A watchdog fires at duration + 1.5 s, and a `statechange` listener ends the line when a mic restart closes the context.
+    - `fadeOut` also ends on the wall clock in case `ended` never fires.
+  - speechSynthesis:
+    - It waits up to 1.5 s for `voiceschanged`, and the voice list is warmed in the constructor.
+    - Voices are scored: Natural/Neural, then Premium, then Enhanced, then Google US English, then Ava/Samantha/Zoe/Allison/Jenny/Aria, with en-US preferred. macOS novelty voices are never picked.
+    - Each utterance stays referenced until it ends.
+    - If the engine is busy, the player calls `cancel()`, waits 60 ms, then calls `resume()` before `speak()`.
+    - Lines over 180 characters are spoken sentence by sentence, all of them. A non-local voice gets a pause/resume keepalive.
+    - An outside `interrupted`/`canceled` error repeats that part once instead of dropping the rest of the line.
+    - If there is no `start` after 2.5 s, the caption timer takes over. A watchdog at 2.5x the estimated length plus 4 s keeps a lost `end` from hanging the line.
+  - The player ends a line only on natural end, `fadeOut()`, or a superseding `play()`.
+  - New read-only `outputKind` ("audio" | "speech" | "silent") and `outputLevel()` (RMS of the WebAudio output), for echo-aware barge-in.
+- ✅ `.env.example`: comments only (provider chain, default models, default voice, overrides).
+- ⚠️ `ELEVENLABS_API_KEY` is empty in `.env`, so **no real ElevenLabs call was made**, and latency and naturalness per model are not measured. The scratch script `round2/eleven_smoke.py` (scratchpad) makes at most 3 real calls (fast, natural, natural fallback). It prints only latency and audio length and writes the WAVs next to itself. Today it prints "ELEVENLABS_API_KEY is not set; no calls made". Whether v4 works on Text to Dialogue for this account is untested; if it does not, the chain falls back to Multilingual v2 and then Flash.
+- ⚠️ Deviation: `tests/test_ai_regressions.py::test_slow_generation_and_tts_still_deliver_within_three_seconds` patches `synthesize` with `slow_tts(text, gemini=None)`, which does not accept `fast=`. The call now raises TypeError and `_synth` catches it, so the test still passes, but it no longer exercises the slow-TTS path. The fake needs `*, fast=True` (I do not own that file).
+- Tests: new `server/tests/test_elevenlabs.py`, **43 passed**. It runs on httpx.MockTransport and covers the exact URL, query, headers and body for both endpoints, the override and bad voice id, WAV wrapping, silence trim, a WAV answer, too-short audio, retry on 429/5xx/timeout/connect, fallback through the models, the set-aside and pause rules, no key means no request, nothing logged but request ids, certifi TLS, the chain order and fallbacks, `speech_text`, the `_synth` fast/natural split, the pooled client per loop, and `warm()`.
+- Results: `cd server && .venv/bin/pytest -q` gives **537 passed**. `python -m sim.replay` gives **16/16 PASS**. `npm run build` is OK (only the existing >500 kB chunk warning). Phone flow gives **19/19**. Table tests give **52/53**: the one failure is `tableState.test.mjs` "shows the crumb while it is spoken and lingers after", in caption timing, which the table-ui builder is changing; I did not touch it. The scratch player tests (Node, with fake AudioContext and speechSynthesis, `round2/player.test.mjs`) give **11/11**.
+- Requests:
+  - (lead) In `server/conftest.py`, pin `config.ELEVENLABS_API_KEY = ""` and reset `ai.elevenlabs._singleton`, so tests stay hermetic once a real key is in `.env`.
+  - (engine/runner) Call `await get_elevenlabs().warm()` when a session starts.
+  - (audio-intelligence) `CrumbPlayer.outputKind` and `outputLevel()` are available for echo-aware barge-in.
+  - (ai tests owner) Update the `slow_tts` fake as described above.
+
+### 2026-10-24 · round2:audio · Echo-aware barge-in (the one-word cutoff) + speech-aware VAD (background noise)
+- ✅ **Table echo gate (cutoff root cause).** `web/src/components/table/playback.ts`: `PlaybackGate.forward/shouldFade` are replaced by `observe({active, levelDb, voiced}, now) -> {send, fade}`. A new `EchoModel` learns the speech-band level of our own sound while the bot plays (chime and voice, 90th percentile of the last 80 bot-sound frames, kept across lines). Activity counts as a person only when it is voiced and louder than the echo by 6 dB (12 dB until 2 s of echo has been heard, and for the first second of each line it also has to beat that line's own loudest echo by 12 dB), sustained for 200 ms after the grace. Echo-level onsets are held back from the server during the line, during a 400 ms tail, and for up to 800 ms after the line (a stretch still going after that is a person speaking at echo level and is passed on, without a fade). Loud runs are only learned as echo if they turn out not to be a person. The chime and the first 300 ms of the voice are still a grace (always learned, never a barge-in). `speakLine` passes the end time to `gate.end`. `web/src/lib/useTable.ts` `onVad` feeds the gate the VAD reading.
+- ✅ **Speech-aware VAD (issue 4).** `web/public/pcm-worklet.js` now sends `{type:"vad", rms, speech, zcr, impulse}` every 100 ms: full-band RMS, 300 to 3,400 Hz band RMS (4th-order high-pass + 2nd-order low-pass biquads), zero-crossing rate, and the peak-to-median ratio of the 10 ms sub-block energies (clicks). `web/src/audio/capture.ts` `Vad` adds a 1.5 s ambient calibration and an adaptive speech-band floor (20th percentile: rises toward the 8 s value at up to 3 dB/s, falls at once to the 2 s value, and jumps to a new level that stays flat, std < 1.5 dB, for 1.5 s). It has an SNR with hysteresis (on at 10 dB, off at 5 dB), voice checks (band share >= 16%, ZCR <= 0.3, impulse <= 12 dB, level >= -52 dBFS), syllable modulation (level std over 1 s >= 3 dB to start, >= 1.5 dB to hold), and 200 ms attack / 500 ms release. `onVad(active, rms, reading?)` keeps its contract; `reading` carries `levelDb, floorDb, snrDb, voiced, calibrating`.
+- ✅ **Engine echo-by-text (`server/engine/core.py`, `state.py`).** The engine keeps the text of the latest 8 bot lines (`crumb_dispatched` crumb text, `say` effect text). A Muse turn that starts during a bot line, or within `ECHO_WINDOW_S = 1.0` after it, now waits for at least 2 words (`ECHO_MIN_WORDS`) before it can barge in. `echo_overlap` is the share of the turn's words that sit in a word pair (bigram) that also occurs in the line, with plural and possessive folding. It is high for echo even with ASR slips, and low for replies that only share words with the line ("Hi, I'm from Austin." after "...say hi and tell Dev where you're from."). If the overlap is >= `params.ECHO_TEXT_OVERLAP`, the turn is echo: no barge-in, no partial caption, no human activity (so `crumbs_this_silence` is never reset), and at speechEnd it is `dropped_as_bot` (decision trigger `echo_text`). The whole turn is re-checked at speechEnd, so a reply that opens with the question's words is still human. Otherwise it barges in as before (words that are not the line plus local VAD) or counts as a human turn. Echo turns do not count as `turn_active` and do not stop the pause timer.
+- ✅ **Engine noise rule.** Local VAD counts as speech (pause timer, `vad_active` input to the policy, manual-crumb gating, the barge-in check, `_human_talking`) only while a human Muse turn is open, or for `params.VAD_UNCONFIRMED_S` after the later of its onset and the last Muse speechStart, partial or speechEnd of a person. After a stretch outlives that window the room is marked noisy: new onsets then need Muse too, until Muse hears someone or the VAD has been quiet for `NOISE_LATCH_CLEAR_S = 4 s`. Unconfirmed noise never resets the timer, never cancels a crumb being generated, and never barges in. The snapshot gains `noise_suspected` (VAD active but not counted). It is also added to `EngineSnapshot` in `web/src/lib/types.ts`. `vad_active` in the snapshot stays the raw local VAD.
+- ✅ **Simulator.** `server/sim/replay.py` adds the script keys `noise[{start,end}]` (VAD-only spans) and `crumb_text`. New scripts: `self_echo_transcript` (Muse transcribes the crumb late, so the time overlap is only 37.5%: no barge-in, the turn is dropped as echo, and the follow-up switch still fires at 68.4), `real_barge_in_still_works` (a person talks over the crumb: crumb_interrupted at the onset, 59.9; the turn is human), and `background_noise` (VAD on from 50 to 75 s, no Muse after 53.9: steer at **61.3 s** = last Muse 53.9 + 2.5 + 5.0; no barge-in from the noise). Against the pre-change engine (`git show HEAD:`), `self_echo_transcript` and `background_noise` fail and `real_barge_in_still_works` passes (it is the guard).
+- ⚠️ Deviations: (1) Two existing tests asserted that speechStart + VAD during a crumb barges in at once. They now send a first non-echo partial before expecting the barge-in, as the spec requires (`tests/test_policy.py::test_barge_in_by_speech_start_and_never_for_system_lines`, `tests/test_engine_regressions.py::test_speech_start_barges_in_only_with_local_vad`). (2) `tests/test_sim_scripts.py::test_all_prd_scripts_present` now checks that the 13 PRD scripts are a subset of the scripts present. (3) A loud voice that starts inside the 300 ms grace is learned as echo and does not fade the line when the grace ends. This trades a rare case for never cutting the bot off.
+- ⚠️ Known limit: someone who talks at or below the level of the speaker's echo cannot interrupt locally. The server still needs local VAD for a Muse barge-in, as before, so Skip remains the way out. A stronger fix needs the player's output level as a reference (the voice area's `audio/player.ts`).
+- Tests: new `server/tests/test_noise_echo.py` (21 cases), new `web/src/components/table/__tests__/vad.test.mjs` (15 cases: real worklet + Vad on synthetic 24 kHz signals. Silence, white, pink, loud 60/120 Hz hum, hum switched on, keyboard clicks with and without room noise, slow HVAC/AGC pumping, and a fan switched on all stay inactive (the fan is absorbed within 1.5 s). The old RMS VAD was active 9.7 s on the clicks and 8.9 s on the fan. A harmonic 4.5 Hz-modulated voice at ~12 dB SNR over pink noise is active within 500 ms and releases after it), and a rewritten gate section in `playback.test.mjs` (steady echo at -55/-45/-35/-25/-15 dBFS through chime, voice and tail is never sent and never fades; a voice 12 dB over the echo fades within 200 ms; louder second line, cold start, clicks, single loud frame, person after the line).
+- Results: `cd server && .venv/bin/pytest -q` → **537 passed**; `.venv/bin/python -m sim.replay` → **16/16 PASS** (13 PRD + 3 new); table tests → **102 passed, 0 failed**; phone flow → **19 passed, 0 failed**; `npm run build` → ✓ built (tsc clean; only the existing >500 kB chunk warning).
+- Requests: docs/CONTRACTS.md: add `noise_suspected` to EngineSnapshot, the optional third `onVad` argument (`VadReading`), and the `PlaybackGate.observe` API. Table UI: show `engine.noise_suspected` (for example "Background noise" instead of "Listening"). Voice area: keep `LinePlayer` (playChime/play/fadeOut/playing) unchanged; optionally expose the output level for a reference-based echo estimate.
+
+### 2026-10-24 · round2:table-ui · Grainy WebGL orb with a white tip, captions that land at once and stay readable, Table revamp in the light reference style
+- ✅ **The orb** (`web/src/components/CrumbOrb.tsx`, `web/src/components/table/orbGl.ts`, `web/src/components/table/orbLook.ts`). It follows the CrumbOrb contract: the default export takes `mode`, `pulseKey`, `palette`, `level`, `className`, `still` and `label`, and it exports `OrbPalette`.
+  - It is a raw WebGL 1 fragment shader with no new dependencies: domain-warped value-noise color clouds (quintic interpolation, so no creases), soft spherical shading, a limb tinted by the rim color, film grain, and a **pure white specular tip near the upper left on every palette**, orange included.
+  - Palettes: ember (orange, sienna, peach, cream), lilac, cocoa (deep brown with a periwinkle rim), sage and citrus. Mode looks: listening breathes at 0.2 Hz; warming is richer and livelier; crumb is the brightest, with the strongest tip; holding is lilac, paused is sage and safety is cocoa. A `pulseKey` change sends a bright wave across the sphere, boosts the glint and adds a soft outer ring. `level` nudges the scale and the drift speed.
+  - An animated orb gets its own GL context and draws straight into its canvas, with no per-frame readback. Still orbs (thumbnails, reduced motion) share one hidden context and copy a single frame into a 2D canvas, so any number of them stays within the browser's context cap. The shared context is released 2 s after its last user. A dedicated context is released only once its canvas has really left the page, which keeps StrictMode re-mounts safe.
+  - The canvas is DPR aware: DPR is capped at 2, the backing store at 560 px, and both are quantized to 8 px. A resize never rebuilds the context. Rendering pauses when the orb is offscreen (IntersectionObserver) or the tab is hidden. Slow states run at about 30 fps. Context loss is handled.
+  - Without WebGL, under 40 px, or before the first frame, the CSS orb shows instead: layered radial gradients, SVG feTurbulence grain and the same white tip. Under `prefers-reduced-motion` or `still`, one static frame is drawn. `OrbDot` is a tiny CSS-only orb for dots and tab icons. `OrbStatus` is now a quiet white pill with a palette dot and the state text, so state is never shown by color alone.
+  - Verified in headless Chrome on a scratch harness (port 8141, since stopped): all 7 modes and 5 palettes, the reduced-motion still frame and the no-WebGL fallback render with a white tip. `canvas.getContext` checks confirm that animated orbs hold a `webgl` context and still orbs a `2d` one.
+- ✅ **Caption timing (issue 2)** (`format.ts`, `tableState.ts`, `CrumbCaption.tsx`, `LiveStage.tsx`, `Calibration.tsx`).
+  - The whole line appears **as soon as the crumb arrives**: one 0.3 s blur-to-sharp, opacity and translate motion, with a stagger of at most 20 ms per word, capped so that any line lands within 0.42 s. It no longer waits for the chime or paces itself to the audio.
+  - `captionHideAt` / `captionStage` keep the line on screen while it is pending or playing, then for `max(4 s, 0.35 s/word + 2 s)` after the voice ends, and never for less than 6 s in total. An interrupted line gets the same reading time from the moment it was cut, in slightly softer ink, so a barge-in no longer pulls the text away.
+  - After that the line eases out and shrinks into a small "Last crumb" line under the orb for 30 s (`recapCrumb`). The source line and citation link appear 0.18 s after the text and stay with it. Calibration and re-sync prompts use the same entrance.
+- ✅ **Table revamp** in the light reference language, adapted with our own name and copy. The canvas is off-white, ink is near-black, and color appears only in the orbs.
+  - `TopBar`: wordmark with an orb dot; quiet white status pills for mode, mock, mic, speech service (`muse`, new optional prop) and connection; the round timer pill reads "almost up" in the last minute.
+  - `Lobby`: a regular-weight Inter Tight headline at 68 px with a paragraph in the right column. Below it, one rounded well container (`bg-well`) holds:
+    - a read-only segmented mode display, each mode with its own orb dot;
+    - the two seat QR cards, as white cards around the table's orb;
+    - a step pill track (`lobbyStep`) and the black "Start listening" pill on the right.
+  - `SeatQr`: a white card with a hairline QR frame and an ink-on-white QR.
+  - `LiveStage`: the orb is the hero, at up to 400 px, or 230 px while a caption shows. The caption is in large regular Inter Tight, the state sits in a pill, and the trail dots are tiny orbs.
+  - `Controls`: a segmented pill track of toggles (Hold / Pause listening / X-ray, pressed state shown as a raised white pill), white End and Skip pills, and the black "Drop a crumb" pill. Key caps are shown inside the pills on wide screens. End keeps its two-step confirm, now with a status announcement and focus moved to "Keep talking". On phones the Drop pill goes full width and the labels shorten.
+  - `XRay`: a right-side white drawer card (inset, rounded 24 px) with hairline dividers and mono readouts. Sparklines are drawn in ink and amber. **Background noise readouts** come from `engine.noise_suspected`, read through an optional cast (`noiseSuspected()`): a "Background noise ignored" status chip, a `background noise` row, and the detail line under the orb's "Listening" pill.
+  - `EndScreens`, `StartListening` (new `align` prop), `Calibration` (steps in a pill track), `TuningPanel` (ink switch and slider), `DevTurnBox` (pill radios and a black Send button), `CrumbTrail` (white popover card), `primitives` (pill `TableButton` tones primary/quiet/danger/ghost/segment, a `SegmentTrack`, light chips and badges, and a flat `Backdrop`).
+  - Every dark-theme leftover was fixed: `white/…`, `bg-black`, dark shadows, `text-crumb` on light backgrounds, and `ink-faint` used for text (2.7:1). Small text now uses `ink-muted` or the new `amber-ink`. Checked at 1440 px and 390 px (through an iframe, since headless Chrome has a minimum width): no horizontal scroll.
+- `web/src/index.css`: additions only, and every existing token is untouched. New tokens: `--color-well` #F3F1EE, `--color-amber-ink` #A4470F, `--shadow-raised`, `--shadow-drawer`. New keyframes: `orb-drift`, `orb-breathe`, `orb-float`.
+- `web/src/pages/Table.tsx`: a 1460 px content column, `muse` passed to TopBar, the X-ray toggle as a pill during calibration, the toast as a white pill, and drawer padding of 464 px.
+- Deviations:
+  - `useTable` exposes no audio level, so the Table does not pass `level` yet (the prop works).
+  - The two-line `PLAYING_GRACE` idea was dropped. A playing line is never hidden, because `useTable` always reports its end.
+  - Only Table-local copies of the mode palettes exist (`MODE_PALETTE` in `format.ts`). They match `components/ui/modes.ts`.
+- Tests:
+  - `node --import ./src/components/table/__tests__/register.mjs --test 'src/components/table/__tests__/*.test.mjs'` gives **102 pass, 0 fail**. New cases cover caption timing, stages, the noise label, `lobbyStep` and orb looks and helpers. The tableState caption tests were rewritten for the new reading-time rules.
+  - `node --test src/components/phone/flow.test.mjs` gives **19 pass, 0 fail**.
+  - `npm run build` passed earlier in this round (only the existing >500 kB chunk warning). The final `tsc` run fails on one line in another area's in-progress file, `src/audio/player.ts(410,18)` (TS2345: `SpeechSynthesis | undefined` is not assignable to `SpeechSynthesis | null`). My files type-check clean, and `vite build` to a scratch outDir gives **✓ built**.
+
+### 2026-10-24 · round2:fix:voice · Hermetic ElevenLabs under pytest, budget-aware TTS chain, cancel-settle race
+- ✅ **Real billed ElevenLabs calls from pytest (high).** Fixed in my own module, so it holds even before the conftest pin lands: `server/ai/elevenlabs.py` `get_elevenlabs()` returns a cached keyless client while pytest runs (`PYTEST_VERSION` / `PYTEST_CURRENT_TEST` set), whatever `.env` holds, and never caches it in `_singleton`. A client a test installs as `_singleton` on purpose is still used. `BREADCRUMBS_ELEVENLABS_LIVE_TESTS=1` opts a deliberate live test back in. Re-ran the reviewer's leak probe: `ELEVENLABS_API_KEY=sk_fake_review_probe pytest -q -p leakplug` gave `549 passed`, `REVIEW_PROBE real-network elevenlabs requests: 0` (was 661), 35 s (was 95 s).
+- ✅ **A slow model used up the whole budget (medium).** The budget now flows down: `crumbs._synth` calls `synthesize(text, gemini, fast=fast, budget_s=budget_s)` (still inside the same `wait_for`). `server/ai/tts.py` works to a deadline 50 ms inside the budget. When Gemini can speak and the budget is at least 2.5 s, it keeps 30% back for Gemini; otherwise ElevenLabs gets the whole budget. Gemini runs under `wait_for` with the time left. Defaults when no budget is passed: 5 s fast (the runner's `SAY_TIMEOUT_S`), 12 s natural. `ElevenLabs.synthesize(..., budget_s=)` gives each model a share of the time left: v4 gets 50%, Multilingual v2 gets 60% of the rest, and the last model gets everything left. A model is skipped if its share is under 0.3 s. Each attempt is bounded end to end with `asyncio.wait_for`, because httpx's read timeout is per chunk. Connect and read timeouts are capped to the attempt's window. A timeout on a natural model (v4, Multilingual v2) is no longer retried; the chain moves on to the next model. Any retry runs only if the time left covers its backoff plus 0.3 s. The reviewer's `hang_probe.py` (dialogue never answers, 12 s budget) now prints `result bytes: 48044`, with requests `[(0.06, '/v1/text-to-dialogue'), (6.03, '/v1/text-to-speech/...')]` (was `TIMEOUT at 12.0s`).
+- ✅ **Browser voice dropped after the player's own cancel (medium).** In `web/src/audio/player.ts`, every `speechSynthesis.cancel()` now goes through `cancelEngine()`, which records `lastCancelAt`. `startSpeech` always waits out what is left of `CANCEL_SETTLE_MS` since the last cancel, whether or not the engine reports `speaking`/`pending`, and then re-checks `pb.ended`. The wait is ceil plus 1 ms because timers can fire early. The reviewer's `race.test.mjs` now prints `dropped speak() calls: 0`, voices both lines, and passes.
+- ✅ **Slow-TTS regression no longer tested (low).** `tests/test_ai_regressions.py` is not my file, so I left it alone. Its fake still raises TypeError, now on `budget_s=` as well as `fast=`. I added my own regression, which patches `crumbs.synthesize` with a `**kwargs` fake that sleeps 100 s and asserts `_synth` returns None within the 1 s miss budget.
+- Tests: `server/tests/test_elevenlabs.py`, 43 to 55 cases. New cases: stuck v4 through the real `CrumbService._synth` returns a WAV inside the (scaled) prefetch budget with exactly one dialogue request; the budget is split across all 3 natural models; a stalled Flash returns inside 0.5 s with no retry; a retry is skipped when the budget cannot cover it; old behavior is kept without a budget; time is kept for Gemini when ElevenLabs stalls; ElevenLabs gets the whole short budget when Gemini is mock; a slow Gemini is bounded; the `_synth` slow-TTS bound; a keyless singleton under pytest with a key; the live opt-in; and zero real-network requests through the chain with a key set. The existing fakes now take `budget_s`, and the `_synth` path test also asserts that the budgets are passed. New `web/src/audio/__tests__/player.test.mjs` has 14 cases: the voice builder's 11 scratch tests plus 3 cancel-settle tests.
+- Results: `cd server && .venv/bin/pytest -q` gave **549 passed**. `.venv/bin/python -m sim.replay` gave **16/16 PASS**, exit 0. `npm run build` built OK (only the existing >500 kB chunk warning), and `tsc -b --noEmit` was clean. Player tests gave **14 passed, 0 failed** (4 runs in a row). Table tests gave **102 passed, 0 failed**. Phone flow gave **27 passed, 0 failed**.
+- ⚠️ Deviations: (1) Defect 1 was fixed in `ai/elevenlabs.py`, not in `server/conftest.py` (lead-owned). The conftest pin is still worth adding as a second guard. (2) The new test file `web/src/audio/__tests__/player.test.mjs` sits next to the module I own. Run it with `node --import ./src/components/table/__tests__/register.mjs --test 'src/audio/__tests__/*.test.mjs'`. (3) `.env.example` got one comment line about the pytest opt-in.
+- Requests: (lead) In `server/conftest.py` `_hermetic_ai`, also add `monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "")` and `monkeypatch.setattr(ai.elevenlabs, "_singleton", ai.elevenlabs.ElevenLabs(api_key=""))`. (ai tests owner) In `tests/test_ai_regressions.py`, change the fake to `async def slow_tts(text, gemini=None, **kwargs)`. (lead) Add the player test glob to the documented web test commands.
+
+### 2026-10-24 · round2:fix:home-phone-ui · Review fixes: carousel focus, drag vs click, outer orb exit, 320 px tabs and pill, danger contrast, record button name
+- ✅ **Carousel keeps keyboard focus** (`web/src/pages/Home.tsx`). The play button no longer lives inside the keyed slots, so it no longer unmounts when the carousel steps. `OrbCarousel` now renders one persistent play button (`data-carousel-play`) as an overlay at the stage center (72 px wide, 64 px narrow). Its label is `Set the table for <current mode>` and it calls `onStart(current)`. `CarouselSlot` no longer takes `creating`/`onStart`. Checked in headless Chrome at 1440 px: focus the play button, then ArrowRight x3 and ArrowLeft give Networking, Speed dating, Social, Speed dating, and focus stays on the play button after every step (before, focus went to BODY after the first step).
+- ✅ **A drag no longer also clicks a neighbor orb** (`Home.tsx`, new pure `web/src/components/ui/carousel.ts`). `classifyGesture(dx, dy)` returns tap, swipe (with a delta) or drag. A swipe is |dx| > 48 px and |dx| > 1.3|dy|. A tap is a move under 8 px. Anything else is an aborted drag. For any gesture other than a tap, the stage swallows the next click in the capture phase (`onClickCapture`), so it never reaches a neighbor orb or the play button. A keyboard click (`detail === 0`) is never swallowed. Checked in Chrome: the reported rightward drag (1040,730) to (1130,730) on the Networking neighbor now goes to Speed dating, a leftward drag goes back to Social, and a plain tap on a neighbor still selects it. `nearestPos` and `wrapIndex` moved into the same module, replacing Home's local `mod` and `select` math.
+- ✅ **A faded outer orb slides out instead of vanishing.** Slots keep their orb mounted for every rendered distance, `keepsOrb(dist)` = dist <= `SLOT_REACH` (3), so an offset-2 orb that becomes offset 3 fades and slides out with its wrapper. Orbs at distance 2 and above stay `still`, so this adds two static canvases, 7 in all (confirmed by counting canvases in Chrome).
+- ✅ **Tabs and pill fit at 320 px** (`ui/Segmented.tsx`, `ui/Pill.tsx`, `phone/PhoneScreen.tsx`, `Home.tsx`).
+  - Segmented: options are `min-w-0 shrink`, the label span is `min-w-0 truncate`, and the group is `min-w-0`. Large options step down with the viewport: 13 px text and `px-2` under 360 px, 14 px and `px-2.5` from 360 px, 15 px and `px-3` from 400 px, and 16 px and `px-5` from 640 px. The tab row's side padding is `px-2` under 360 px.
+  - Measured in Chrome at 320, 340, 360, 375, 390, 414, 480, 640, 700, 768 and 1024 px: every mode and profile-length label shows in full (none truncated), the group stays inside the showcase, and there is no horizontal scroll.
+  - Home: the Profile length group is `shrink-0`, so it does not truncate at 640 px now that options can shrink. The showcase "Set the table" button is `shrink-0`, so it no longer wraps onto two lines at 640 px (that wrap was already there before this fix).
+  - Pill: the children are wrapped in `<span className="min-w-0 truncate py-px">`, the pill is `max-w-full min-w-0`, and the vertical padding is `py-[3px]`, so the height is unchanged.
+  - PhoneScreen header: the wordmark and step marks are `shrink-0`, and the mode pill is `max-w-[40vw]`. At 320 px the review header now shows "Spee..." with an ellipsis and its right edge (clientWidth 45, scrollWidth 82). At 360 and 375 px it shows the full "Speed dating".
+- ✅ **Danger contrast.** Small error text is now ink with a red dot, as in `ErrorNote`: the `TextField` error and the `ConsentForm` agree error. The danger `Pill` uses ink text (the dot carries the tone). The danger `Button` text is `color-mix(in srgb, var(--color-danger) 80%, black)` = #AB3731, which is 6.32:1 on white and 5.81:1 on the canvas. The area now has no `text-danger` at all, so `index.css` did not need a new token.
+- ✅ **Record control name** (`RecordButton.tsx`, `phone/flow.ts`, `phone/InterviewStep.tsx`). `aria-pressed` is dropped. The label is `recordLabel(recording)`, "Start recording" or "Stop recording", with no countdown. The InterviewStep live region now says `recordingNotice(elapsed, LIMIT_MS)`: "Recording", then "10 seconds left", then "5 seconds left", so over a 20 s take it changes only three times. The visible "Ns" countdown inside the button stays as before.
+- Regression tests (`web/src/components/phone/flow.test.mjs`, 8 new): gesture classification (including the reported drag), capture-phase click suppression that never swallows keyboard clicks, nearestPos wrap, a single play button outside `CarouselSlot`, the orb kept mounted at every rendered distance, Segmented and Pill shrink/truncate and the header pill cap, no `text-danger` in the area, and the record label and coarse live-region marks. The no-em-dash check now also covers `ui/carousel.ts`.
+- ⚠️ Deviations: (1) The CSS-level fixes (play button placement, shrink classes, no `text-danger`) are guarded by source checks in the Node test, because the area has no DOM test runner. Their behavior was checked in headless Chrome instead (scratch scripts `round2/fix1.mjs` to `fix6.mjs`, served from a scratch build on port 8153 with `round2/servefix.py`). (2) At 320 px the phone header keeps the step marks and truncates the mode pill rather than hiding the marks, because the marks are the only progress indicator on those screens.
+- Results: `node --test src/components/phone/flow.test.mjs`: **27 passed, 0 failed**. Table suite: **102 passed, 0 failed**. `npx tsc -b --noEmit`: clean. `npm run build`: built in 270 ms (only the existing >500 kB chunk warning).
+
+## round2:fix:table-ui (caption entrance never waits, Skip clears the caption)
+
+Author: round2:fix:table-ui
+
+Fixed both confirmed table-ui defects at the root.
+
+1. New crumb waited 0.4 to 0.5 s for the previous caption/recap/hint to exit (AnimatePresence mode="wait").
+   - web/src/components/table/LiveStage.tsx: caption slot no longer uses mode="wait". The slot is a one-cell grid
+     (CAPTION_SLOT) and every child (caption, resync prompt, quiet/safety hint, "Last crumb" recap) sits in that cell
+     (CAPTION_SLOT_ITEM), so the leaving line and the arriving crumb overlap and crossfade. A new crumb starts its
+     0.3 s entrance at 0 ms. Recap and Hint exits now use CAPTION_EXIT_S.
+   - web/src/components/table/Calibration.tsx: same change for the spoken-prompt slot.
+   - web/src/components/table/CrumbCaption.tsx: exit shortened from 0.45 s to CAPTION_EXIT_S (0.2 s), reduced motion
+     keeps an opacity-only exit; new optional `className` prop for slot placement.
+   - web/src/components/table/format.ts: new CAPTION_EXIT_S = 0.2, CAPTION_SLOT, CAPTION_SLOT_ITEM.
+2. Skip left the skipped crumb on screen >= 4 s, then a 30 s recap.
+   - web/src/components/table/tableState.ts: SpokenLine gains `skippedAt: number | null` (null on crumb and system_say
+     records). New action `{ type: "line_skipped", id, at }`: a pending/playing line becomes "interrupted" with
+     endedAt (kept if already set) and skippedAt = at; a finished line keeps status "done" and only gets skippedAt;
+     a second skip or unknown id is a no-op. Works for crumbs and the calibration/resync systemLine.
+   - web/src/components/table/format.ts: CaptionTiming gains optional skippedAt. captionHideAt returns skippedAt
+     (no linger, no 6 s minimum, even while "playing"); captionStage goes straight to "gone" (no recap). Barge-ins
+     and server crumb_interrupted are unchanged and keep the full reading time.
+   - Needs useTable (other area) to dispatch it from actions.skip; until then Skip behaves as before.
+
+Tests (new regression cases):
+- web/src/components/table/__tests__/captionSlot.test.mjs (new): LiveStage/Calibration have no AnimatePresence
+  mode="wait" and use the one-cell slot; CrumbCaption exit uses CAPTION_EXIT_S.
+- format.test.mjs: skipped line hides at skippedAt with no recap; barge-in still full; CAPTION_EXIT_S <= 0.25 s.
+- tableState.test.mjs: Skip while playing, during the chime, after finish, idempotence, crumb_interrupted is not a
+  skip, systemLine skip.
+
+Results:
+- Table tests: `ℹ tests 112` `ℹ pass 112` `ℹ fail 0`
+- Phone tests: `ℹ tests 27` `ℹ pass 27` `ℹ fail 0`
+- `npx tsc --noEmit -p .`: clean. `npm run build`: `✓ built in 287ms` (existing >500 kB chunk warning only).
+
+Deviations: used a one-cell grid overlay instead of mode="popLayout" (popLayout needs ref-forwarding children and
+absolute positioning; the grid keeps layout stable with no ref plumbing). Skip is tracked as `skippedAt` rather than a
+boolean so a finished crumb is never rewritten to "interrupted" and the hide time is exact.
+
+Cross-area request (useTable owner): in `actions.skip`, dispatch
+`{ type: "line_skipped", id, at: performance.now() }` for the visible line (gate.currentId, else the last crumb's id
+while its caption is still "full"), alongside the existing interruptedRef/fade/control("skip").
+
+---
+
+## round2:fix:audio (review fixes for the audio area)
+
+Fixed the three confirmed review defects at the root, each with regression tests that fail on the pre-fix code.
+
+1. A reply that Muse merges into an echo-marked turn was treated as silence (high, regression).
+   - server/engine/state.py: new `echo_tail_words(text, lines)` counts the words at the end of a transcript that
+     share no adjacent word pair with any recent bot line (it shares `_line_pairs` / `_echo_covered` with
+     `echo_overlap`, which is unchanged). New `ECHO_REPLY_WORDS = 3`. TurnRecord gains `reply_after_echo`.
+   - server/engine/core.py: `_on_transcript` now re-checks every partial of an open echo-marked turn
+     (`_echo_reply_check`). When 3 or more trailing words are not the line, the turn flips to a person:
+     `echo = False`, `provisional = False`, `reply_after_echo = True`, `_muse_heard(now)`, then `_human_activity`
+     (or `_barge_in` if the crumb is still playing past the grace and local VAD is active, like `_echo_verdict`).
+     The partial is emitted as a caption from then on. `_close` no longer drops a `reply_after_echo` turn on time
+     overlap (a short answer after a long echo would otherwise be > 50% bot time). A single ASR slip inside an echo
+     uncovers 1 word, so it stays echo. The speechEnd re-check is kept.
+   - Reviewer probe (rev/merged.py) on the fixed engine: max silence_s 0.7 (VAD) / 1.4 (no VAD), 0 crumb
+     decisions, 20 captions, turn_active True, noise_suspected False (before: silence 11.0, a switch at 32.5 s).
+2. Noise in bursts shorter than VAD_UNCONFIRMED_S still blocked crumbs forever (high).
+   - server/engine/core.py `on_vad`: `_vad_since` is no longer cleared on every release. At an onset it restarts
+     only when it is None, after a quiet spell of NOISE_LATCH_CLEAR_S, or when Muse heard someone after it was set
+     (`_muse_heard_at > _vad_since`; strict, so the same-instant confirmation that opened the window does not reopen
+     it). Bursts of one noise now share one confirmation window.
+   - Reviewer probe (rev/flicker.py): steady at_s 44.4; bursts 2.0/0.6 -> 43.9, 1.5/0.6 -> 44.4, 2.4/0.6 -> 44.4,
+     all noise_suspected True (before: 0 deliveries for every burst pattern).
+3. The Table's echo gate counted PERSON_SUSTAIN_MS only after the Vad's own 200 ms attack, and learned the
+   attack frames as echo (medium).
+   - web/src/components/table/playback.ts: new `attackRun` (and `ATTACK_RUN_MS = PERSON_SUSTAIN_MS`). While a line
+     sounds and the VAD is still inactive, loud voiced frames are held, not learned as echo. When the stretch opens
+     on a loud frame they seed `personMs` and `pending`; otherwise they are learned as echo. Only the newest
+     ATTACK_RUN_MS is held: older loud frames the VAD never took up are learned as echo, so a swell is never
+     withheld from the model.
+   - End-to-end probe (rev/gate.mjs, real TTS speech through the real worklet + Vad): a person 12 dB over a
+     -49 dBFS echo now fades at +177 ms (was +477 ms); 0 self-fades at all six echo levels; the echo-gain swing
+     probe (rev/gate2.mjs) gives the same self-fade counts as before (0, 0, 2, 0, 6, 5 of 20).
+
+Sim: server/sim/replay.py gains an optional per-turn `vad_from` for `echo` turns (local VAD from that time to the
+turn end: a person answering inside the echo turn). New scripts:
+   - server/sim/scripts/bursty_noise.json: 2.0 s on / 0.6 s off noise from 50 s; steer at 62.1 s, no barge-in.
+   - server/sim/scripts/echo_then_reply_same_turn.json: the steer's echo runs into seat 2's 18 s answer in one
+     Muse turn; no crumb 59.4-78 s, no barge-in, not dropped as bot.
+   Against a copy of the engine with these fixes reverted both scripts FAIL (no steer for bursts; a switch at
+   76.9 s over the answer).
+
+Tests added:
+   - server/tests/test_noise_echo.py: echo_tail_words cases; reply merged into an echo turn (with and without VAD)
+     never lets a crumb fire; short merged reply not dropped by time overlap; ASR slip at the end of an echo stays
+     echo; reply words during the line with VAD barge in; bursty noise (4 patterns) fires about when steady noise
+     does; speech after bursts counts once Muse hears it. 10 of them failed before the fix.
+   - web/src/components/table/__tests__/playback.test.mjs: attack frames count towards a person (1 and 2 attack
+     frames: fade exactly when the VAD turns on), attack frames are not learned as echo, an echo swell in the
+     attack does not fade, a loud run the VAD never takes up is learned. 3 fail on the pre-fix gate (the other 2
+     are safety guards).
+
+Results:
+   - cd server && .venv/bin/pytest -q -> 564 passed in 34.25s
+     (one earlier full run had 1 failure in tests/test_muse_realtime.py::test_reconnect_burst_is_capped_by_drop_oldest_queue,
+     outside this area; it passes in isolation 21/21 twice and in the next full run: timing-sensitive)
+   - .venv/bin/python -m sim.replay -> 18/18 PASS, exit 0
+   - web table tests -> tests 117, pass 117, fail 0
+   - phone flow -> tests 27, pass 27, fail 0
+   - npm run build -> clean, built in 320ms (existing >500 kB chunk warning only)
+
+Deviations: the flip also skips the BOT_OVERLAP_DROP time-overlap drop for that turn (not in the review fix, needed
+for short replies). The burst-window reopen uses a strict `>` (the reviewer's prototype used `>=`, which reopened a
+window on the same instant and delayed the crumb by about 2 s). After Muse last heard someone, one more burst
+still gets a window (it could be the same person), so bursty noise fires up to one window later than steady noise
+in the sim script (62.1 s vs 61.3 s).
+
+Open: the caption of a flipped turn shows Muse's whole text, line words included (Muse's partials are cumulative;
+stripping the echo prefix reliably would need an offset that survives ASR rewrites of the final). The first second
+of each line keeps the cold 12 dB margin, so an interrupt in that second is still slower (probe: +877 ms at 0.5 s
+into the line); unchanged by design.
+
+### 2026-10-24 · round2:final · Final verification of round 2 (voice, audio, table-ui, home-phone-ui)
+
+Cross-area requests applied:
+- server/conftest.py `_hermetic_ai`: pins `config.ELEVENLABS_API_KEY = ""` and `ai.elevenlabs._singleton` to a keyless
+  `ElevenLabs(api_key="")` (second guard next to the in-module pytest guard; not None, so a lazy rebuild cannot read config).
+- server/tests/test_ai_regressions.py: `slow_tts(text, gemini=None, **kwargs)`, so the slow-TTS test exercises the
+  timeout again (it now takes 3.01 s instead of failing fast on a TypeError).
+- server/engine/runner.py: `start()` spawns `_warm_voice()` (ElevenLabs `warm()`, best effort, no-op without a key) so
+  the first live line skips the TLS handshake; `_say` passes `budget_s=SAY_TIMEOUT_S` to `synthesize`.
+- web/src/lib/useTable.ts `actions.skip`: dispatches `{type: "line_skipped", id, at}` for `gate.currentId`, else the
+  last crumb while its caption is still "full" (reads state through a ref, so the actions object is not rebuilt per event).
+  Skip now takes the caption down at once with no recap.
+- web/index.html: theme-color #17120E -> #F7F5F2.
+- docs/CONTRACTS.md: tts.synthesize signature and ai/elevenlabs, EngineSnapshot.noise_suspected, onVad VadReading,
+  CrumbPlayer.outputKind/outputLevel, PlaybackGate.observe, sim keys noise[]/crumb_text/vad_from, the 5 new sim
+  scripts, and the web test commands (table, player, phone).
+Not applied (optional, left for the lead): useTable `micLevel` for the orb's `level` prop; playback.ts using
+player.outputLevel() for a reference-based echo estimate; MISS_TTS_BUDGET_S 1.0 -> 1.5 (waits for real-key latency).
+
+Seams checked: CrumbOrb props at every call site (Home, Crumbs, RecordButton, Lobby, LiveStage, Calibration,
+EndScreens) match the contract (tsc clean); noise_suspected on server (engine/core.py snapshot) and web (types.ts
+EngineSnapshot); synthesize call sites (runner._say, crumbs._synth) match the new signature. Dark-theme grep: no
+text-white, bg-black, white/N or black/N left in src; text-ink-faint remains only on a sparkline stroke, a disabled
+mic icon, input placeholders and the inactive Home carousel captions (deliberate gray as in the reference, aria-hidden
+neighbours; about 2.6:1 on the well, flagged for a visual call).
+
+Results (all with MODEL_API_KEY= GEMINI_API_KEY= ANTHROPIC_API_KEY= ELEVENLABS_API_KEY=):
+- cd server && .venv/bin/pytest -q -> 564 passed in 35.38s
+- .venv/bin/python -m sim.replay -> 18/18 PASS, exit 0
+- cd web && npm run build -> tsc -b clean, "✓ built in 348ms" (existing >500 kB chunk warning only)
+- table tests -> tests 117, pass 117, fail 0
+- player tests (src/audio/__tests__) -> tests 14, pass 14, fail 0
+- phone flow -> tests 27, pass 27, fail 0
+- mock uvicorn on 8130 + python -m sim.smoke_e2e --base http://127.0.0.1:8130 -> "SMOKE PASS: 25/25 checks in 53.9 s";
+  server stopped, no errors in its log. Port 8000 untouched.
