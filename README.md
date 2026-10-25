@@ -461,7 +461,7 @@ The frontend tests use Node's built-in `node:test` (no test framework). They cov
 | `56a20a5`, `86c0118` | Round 2 docs, contracts and build log: round 2 verified (564 tests); ElevenLabs key still blocked at quota 0 |
 | `c0422ab` | ElevenLabs live (credit limit fixed, calibration PASS with real keys) and usage cuts: voice only the next crumb, regenerate only stale text, `sim.usage` harness |
 | `7b52971` | README refresh (status, providers, setup, history) and `server/requirements.txt` |
-| (this commit) | Live-test round: background-noise immunity (noise defers instead of resetting the pause, noise floor, foreground/bystander classifier, endpoint backdating), the 3 s crumb (1.5 / 3.0 / 4.5 s, Opus fast mode for crumb drafts and holds), the "Just talk" setup (no phones, Table consent, live memory, icebreaker, Table trail) beside "With profiles", and a one-orb Home with no mode categories (23 new sim scripts, 762 tests) |
+| `92a4746` | Live-test round: background-noise immunity (noise defers instead of resetting the pause, noise floor, foreground/bystander classifier, endpoint backdating), the 3 s crumb (1.5 / 3.0 / 4.5 s, Opus fast mode for crumb drafts and holds), the "Just talk" setup (no phones, Table consent, live memory, icebreaker, Table trail) beside "With profiles", and a one-orb Home with no mode categories (23 new sim scripts, 762 tests) |
 
 Commits that only update the build log (`c58d7c6`, `cd4e0f6`) are left out. `BUILD_LOG.md` has the details of every step.
 
