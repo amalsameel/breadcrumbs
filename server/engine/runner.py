@@ -39,6 +39,7 @@ TICK_S = 1.0 / config.TICK_HZ
 BROADCAST_S = 1.0 / config.ENGINE_BROADCAST_HZ
 DELIVER_TIMEOUT_S = 12.0  # CrumbService has its own 6 s text + 4 s TTS budgets; this is the hard stop
 SAY_TIMEOUT_S = 5.0
+MAX_BOT_SPEECH_S = 30.0  # longer than any crumb or system line; an interval still open after this was lost
 CLASSIFY_TIMEOUT_S = 6.0
 ENERGY_TIMEOUT_S = 6.0
 PREFETCH_TIMEOUT_S = 40.0
@@ -112,6 +113,11 @@ class SessionRunner:
         self._muse: MuseClient | None = None
         self._muse_task: asyncio.Task | None = None
         self._audio_owner: object | None = None
+        self._audio_lock = asyncio.Lock()  # attach/detach never interleave (one Muse client at a time)
+
+        # Bot speech the Table reported as playing and has not yet reported as finished (id -> start).
+        self._bot_open: dict[str, float] = {}
+        self._bot_force_closed: set[str] = set()
 
         self._prefetch_due: float | None = None
         self._last_prefetch_at: float | None = None
@@ -168,6 +174,7 @@ class SessionRunner:
         while True:
             try:
                 now = self.clock()
+                self._expire_bot_speech(now)
                 self._apply(self.engine.tick(now))
                 self._maybe_prefetch(now)
             except Exception:  # noqa: BLE001 - a bad tick must not kill the session
@@ -197,7 +204,35 @@ class SessionRunner:
         self._apply(self.engine.on_vad(bool(active), float(rms), self.clock()))
 
     def on_tts_state(self, crumb_id: str, playing: bool) -> None:
-        self._apply(self.engine.on_tts_state(str(crumb_id), bool(playing), self.clock()))
+        crumb_id = str(crumb_id)
+        now = self.clock()
+        if playing:
+            self._bot_open.setdefault(crumb_id, now)
+            self._bot_force_closed.discard(crumb_id)
+        elif crumb_id in self._bot_force_closed and crumb_id not in self._bot_open:
+            return  # a late `playing:false` for speech we already closed: nothing left to do
+        else:
+            self._bot_open.pop(crumb_id, None)
+        self._apply(self.engine.on_tts_state(crumb_id, bool(playing), now))
+
+    def on_table_gone(self) -> None:
+        """The last Table connection closed: whatever it was playing stopped with it (PRD 8.3, 8.7).
+
+        A reload mid-crumb never sends `tts_state playing:false`, and an open bot interval keeps
+        `tts_playing` true forever, which blocks every automatic crumb and queues every Drop a crumb.
+        """
+        self._close_bot_speech(list(self._bot_open), self.clock(), "table gone")
+
+    def _expire_bot_speech(self, now: float) -> None:
+        stale = [i for i, started in self._bot_open.items() if now - started >= MAX_BOT_SPEECH_S]
+        self._close_bot_speech(stale, now, "no tts end reported")
+
+    def _close_bot_speech(self, ids: list[str], now: float, reason: str) -> None:
+        for speech_id in ids:
+            self._bot_open.pop(speech_id, None)
+            self._bot_force_closed.add(speech_id)
+            log.info("closed bot speech %s (%s)", speech_id, reason)
+            self._apply(self.engine.on_tts_state(speech_id, False, now))
 
     def on_control(self, action: str) -> None:
         if action == "xray":
@@ -220,11 +255,26 @@ class SessionRunner:
 
     # ------------------------------------------------------------------ Muse lifecycle (/ws/audio)
 
-    async def attach_audio(self, owner: object) -> None:
-        """A Table audio socket started streaming: open a fresh Muse session for it."""
-        if self._stopped or self._audio_owner is owner:
-            return
-        await self._close_muse()
+    @property
+    def audio_owner(self) -> object | None:
+        return self._audio_owner
+
+    async def attach_audio(self, owner: object, *, only_if_free: bool = False) -> None:
+        """A Table audio socket started streaming: open a fresh Muse session for it.
+
+        `only_if_free` reclaims Muse for a socket that was displaced by another one which has since
+        closed, without stealing it back from a socket that is still streaming.
+        """
+        async with self._audio_lock:
+            if self._stopped or self._audio_owner is owner:
+                return
+            if only_if_free and self._audio_owner is not None:
+                return
+            await self._close_muse()
+            if not self._stopped:  # stop() may have run while the old client was closing
+                self._open_muse(owner)
+
+    def _open_muse(self, owner: object) -> None:
         self._audio_owner = owner
         self._dev_labels.clear()
         client = make_realtime_client(self._on_muse_event, profile_keywords(self.names, self.session), self._on_muse_status)
@@ -242,8 +292,9 @@ class SessionRunner:
             self._muse.push_audio(frame)
 
     async def detach_audio(self, owner: object) -> None:
-        if self._audio_owner is owner:
-            await self._close_muse()
+        async with self._audio_lock:
+            if self._audio_owner is owner:
+                await self._close_muse()
 
     async def _run_muse(self, client: MuseClient) -> None:
         try:
@@ -416,6 +467,12 @@ class SessionRunner:
         if self._stopped or self.engine.phase == "ended":
             self.engine.crumb_failed(now)
             return
+        if self.engine.pending_cancelled:
+            # PRD 8.1: someone spoke (or tapped Skip) while it was generated. Never send it to the Table and
+            # never mark it delivered; a still-wanted request is already re-queued by the engine.
+            log.info("crumb dropped (kind=%s, cancelled while generating)", kind)
+            self._apply(self.engine.crumb_cancelled(now))
+            return
         self._dispatch(delivery, (now - started) * 1000.0, now)
 
     def _dispatch(self, delivery: Delivery, latency_ms: float, now: float) -> None:
@@ -430,6 +487,9 @@ class SessionRunner:
         }, roles=("table",))
         self.engine.crumb_dispatched(crumb, now, latency_ms, delivery.cache_hit)
         self.crumbs.mark_delivered(crumb)
+        # F14: a ready steer and switch are always cached during LIVE. A hit just emptied a slot (and a
+        # miss means it was empty), so refill it now rather than at the next turn or the 30 s refresh.
+        self._prefetch_due = now if self._prefetch_due is None else min(self._prefetch_due, now)
         log.info("crumb dispatched (kind=%s, source=%s, cache_hit=%s, %.0f ms)", crumb.kind, crumb.source, delivery.cache_hit, latency_ms)
 
     async def _say(self, speech_id: str, text: str) -> None:

@@ -119,6 +119,9 @@ class SeatState:
     opted_in: bool | None = None
     contact: str | None = None
     trail_fetched: bool = False
+    # Secret set when this seat first consents and handed to that phone as an HttpOnly cookie
+    # (main.py `require_owner`). Never part of the summary.
+    key: str | None = None
 
     @property
     def consented(self) -> bool:
@@ -147,6 +150,7 @@ class SeatState:
         self.profile = None
         self.contact = None
         self.opted_in = None
+        self.key = None
 
 
 @dataclass
@@ -204,7 +208,7 @@ class Session:
             "created_at": self.created_at,
             "expires_in_s": round(self.expires_in()),
             "dev_tools": config.DEV_TOOLS,
-            "mock": {"muse": config.MUSE_MOCK, "gemini": config.GEMINI_MOCK},
+            "mock": {"muse": config.MUSE_MOCK, "gemini": config.AI_MOCK},
         }
 
     # -- connections ----------------------------------------------------------------------------

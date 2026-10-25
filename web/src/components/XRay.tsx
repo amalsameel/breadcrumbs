@@ -5,7 +5,7 @@ import type { EngineSnapshot, Seat } from "../lib/types";
 import type { TableActions, TableView } from "../lib/useTable";
 import Sparkline from "./Sparkline";
 import { Icon } from "./table/Icon";
-import { fmt, sourceCaption } from "./table/format";
+import { fmt, sourceCaption, staleThreshold } from "./table/format";
 import { TuningPanel } from "./table/TuningPanel";
 import { DevTurnBox } from "./table/DevTurnBox";
 
@@ -50,7 +50,11 @@ export default function XRay({ view, actions, names, onClose }: XRayProps) {
         {engine ? (
           <>
             <PauseSection engine={engine} history={view.history.map((p) => p.silence)} />
-            <StalenessSection engine={engine} history={view.history.map((p) => p.staleness)} />
+            <StalenessSection
+              engine={engine}
+              history={view.history.map((p) => p.staleness)}
+              staleSwitch={staleThreshold(view.params)}
+            />
             <StateSection engine={engine} />
             <LastCrumbSection view={view} names={names} />
           </>
@@ -178,7 +182,15 @@ const PART_LABEL: Record<keyof EngineSnapshot["parts"], string> = {
   E: "low energy",
 };
 
-function StalenessSection({ engine, history }: { engine: EngineSnapshot; history: number[] }) {
+function StalenessSection({
+  engine,
+  history,
+  staleSwitch,
+}: {
+  engine: EngineSnapshot;
+  history: number[];
+  staleSwitch: number;
+}) {
   const parts = Object.entries(engine.parts) as [keyof EngineSnapshot["parts"], number][];
   return (
     <Section
@@ -208,7 +220,7 @@ function StalenessSection({ engine, history }: { engine: EngineSnapshot; history
         values={history}
         min={0}
         max={1}
-        thresholds={[{ value: 0.6, label: "stale", color: "var(--color-crumb)" }]}
+        thresholds={[{ value: staleSwitch, label: "stale", color: "var(--color-crumb)" }]}
         color="var(--color-crumb)"
         label="Staleness over the last 60 seconds"
       />

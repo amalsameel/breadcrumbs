@@ -9,13 +9,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 import config
+from ai.gemini import Gemini
 from ai.profiles import extract_profile, find_overlaps
 from ai.trail import generate_trail
 from audio.convert import ConversionError, ffmpeg_available, to_wav_24k
@@ -49,6 +51,13 @@ OFF_LIMITS_MAX_CHARS = 60
 CONTACT_MAX_CHARS = 200
 CONTROL_ACTIONS = frozenset({"spark", "skip", "hold", "resume", "pause_listening", "resume_listening", "xray"})
 OPEN_PHASES = ("lobby", "profiles")  # profile setup is still allowed
+SEAT_KEY_BYTES = 24
+NOT_YOUR_SEAT = "This seat is already in use on another phone. Scan the code for your own seat."
+
+# The AI helpers fall back to their deterministic heuristics when the model fails, but a caller's
+# outer timeout can cancel them before they get there (slow model + retries). On a timeout we run the
+# same helper again with this always-mock client, which goes straight to the heuristic (PRD 9.7, 11.3).
+_HEURISTIC = Gemini(mock=True)
 
 # PRD 6.3: three questions per mode; Quick profile asks only Q1.
 INTERVIEW: dict[str, list[str]] = {
@@ -78,11 +87,20 @@ def interview_questions(mode: Mode, quick: bool) -> list[InterviewQuestion]:
 def app_config() -> dict:
     """AppConfig (web/src/lib/types.ts)."""
     return {
-        "mock": {"muse": config.MUSE_MOCK, "gemini": config.GEMINI_MOCK},
+        "mock": {"muse": config.MUSE_MOCK, "gemini": config.AI_MOCK},
+        "ai_provider": config.AI_PROVIDER,
         "dev_tools": config.DEV_TOOLS,
         "public_base_url": config.PUBLIC_BASE_URL,
         "ffmpeg": ffmpeg_available(),
     }
+
+
+def seat_cookie(seat: int) -> str:
+    return f"bc_seat{seat}"
+
+
+def seat_cookie_path(sid: str, seat: int) -> str:
+    return f"/api/sessions/{sid}/seats/{seat}"
 
 
 def _clean_terms(terms: list[str]) -> list[str]:
@@ -100,7 +118,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         sweeper = asyncio.create_task(store.run_sweeper(), name="ttl-sweeper")
-        log.info("breadcrumbs up (muse_mock=%s, gemini_mock=%s, ffmpeg=%s)", config.MUSE_MOCK, config.GEMINI_MOCK, ffmpeg_available())
+        log.info("breadcrumbs up (muse_mock=%s, ai_provider=%s, ffmpeg=%s)", config.MUSE_MOCK, config.AI_PROVIDER, ffmpeg_available())
         try:
             yield
         finally:
@@ -129,6 +147,20 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         if not st.consented:
             raise HTTPException(403, "Consent is required first.")
 
+    def require_owner(request: Request, st: SeatState) -> None:
+        """A seat belongs to the phone that consented for it (PRD 5.6, F2, F4, F17).
+
+        The first consent mints a secret that goes back as an HttpOnly cookie scoped to that seat's
+        path, so the browser sends it on every later call for its own seat and never for the other
+        one. Without it, the other phone (or anyone with the sid) could consent or opt in for the
+        partner, read their off-limits list, or undo their removed items.
+        """
+        if st.key is None:
+            return
+        presented = request.cookies.get(seat_cookie(st.seat)) or ""
+        if not secrets.compare_digest(presented.encode(), st.key.encode()):
+            raise HTTPException(403, NOT_YOUR_SEAT)
+
     def require_open(session: Session) -> None:
         if session.phase not in OPEN_PHASES:
             raise HTTPException(409, "Profiles are locked once the conversation has started.")
@@ -154,9 +186,13 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
                 return
             try:
                 overlaps = await asyncio.wait_for(find_overlaps(p1, p2, session.mode), timeout=OVERLAP_TIMEOUT_S)
-            except Exception as exc:  # noqa: BLE001 - the opener falls back to a generated switch
-                log.warning("overlap finder failed (%s)", type(exc).__name__)
-                overlaps = OverlapSet(overlaps=[])
+            except Exception as exc:  # noqa: BLE001 - heuristic overlaps keep the opener overlap-based (F11)
+                log.warning("overlap finder failed (%s); using heuristic overlaps", type(exc).__name__)
+                try:
+                    overlaps = await find_overlaps(p1, p2, session.mode, gemini=_HEURISTIC)
+                except Exception as exc2:  # noqa: BLE001 - the opener falls back to a generated switch
+                    log.warning("heuristic overlaps failed (%s)", type(exc2).__name__)
+                    overlaps = OverlapSet(overlaps=[])
             if session.wiped or session.phase not in OPEN_PHASES:
                 return
             session.overlaps = overlaps
@@ -184,13 +220,15 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         both_share = all(session.seat(s).opted_in is True for s in (1, 2))
         trail = Trail(items=[])
         if both_share:
+            args = (session.mode, session.names, session.transcript, session.profiles)
             try:
-                trail = await asyncio.wait_for(
-                    generate_trail(session.mode, session.names, session.transcript, session.profiles),
-                    timeout=TRAIL_TIMEOUT_S,
-                )
-            except Exception as exc:  # noqa: BLE001 - contacts are still swapped without threads
-                log.warning("trail generation failed (%s)", type(exc).__name__)
+                trail = await asyncio.wait_for(generate_trail(*args), timeout=TRAIL_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001 - fall back to the heuristic trail (PRD 9.7)
+                log.warning("trail generation failed (%s); using heuristic trail", type(exc).__name__)
+                try:
+                    trail = await generate_trail(*args, gemini=_HEURISTIC)
+                except Exception as exc2:  # noqa: BLE001 - contacts are still swapped without threads
+                    log.warning("heuristic trail failed (%s)", type(exc2).__name__)
         if session.wiped:
             return
         session.trail = trail
@@ -268,9 +306,10 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     # ------------------------------------------------------------------ seats: consent, interview, profile
 
     @app.post("/api/sessions/{sid}/seats/{seat}/consent")
-    async def consent(sid: str, seat: int, body: ConsentBody) -> dict:
+    async def consent(sid: str, seat: int, body: ConsentBody, request: Request, response: Response) -> dict:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)
         require_open(session)
         name = " ".join(body.typed_name.split())
         if not body.agreed:
@@ -279,15 +318,24 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
             raise HTTPException(422, "Please type your name.")
         st.consent = Consent(typed_name=name, agreed=True, at=time.time())
         st.joined = True
+        if st.key is None:
+            st.key = secrets.token_urlsafe(SEAT_KEY_BYTES)
+        response.set_cookie(
+            seat_cookie(seat), st.key, path=seat_cookie_path(sid, seat),
+            max_age=max(60, round(session.expires_in())), httponly=True, samesite="lax",
+        )
         if session.phase == "lobby":
             session.phase = "profiles"
         session.send_session()
         return {"ok": True}
 
     @app.post("/api/sessions/{sid}/seats/{seat}/answers")
-    async def upload_answer(sid: str, seat: int, question_id: str = Form(...), audio: UploadFile = File(...)) -> dict:
+    async def upload_answer(
+        sid: str, seat: int, request: Request, question_id: str = Form(...), audio: UploadFile = File(...)
+    ) -> dict:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)
         require_consent(st)
         require_open(session)
         qids = [q.id for q in interview_questions(session.mode, session.quick)]
@@ -315,21 +363,22 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         return {"transcript": transcript}
 
     @app.post("/api/sessions/{sid}/seats/{seat}/profile")
-    async def build_profile(sid: str, seat: int) -> Profile:
+    async def build_profile(sid: str, seat: int, request: Request) -> Profile:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)
         require_consent(st)
         require_open(session)
         if not st.answers:
             raise HTTPException(409, "Record at least one answer first.")
         order = [q.id for q in interview_questions(session.mode, session.quick)]
         answers = [st.answers[q] for q in order if q in st.answers]
+        args = (seat, session.mode, st.name or f"Seat {seat}", answers)
         try:
-            profile = await asyncio.wait_for(
-                extract_profile(seat, session.mode, st.name or f"Seat {seat}", answers), timeout=PROFILE_TIMEOUT_S
-            )
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(504, "Building your profile took too long. Please try again.") from exc
+            profile = await asyncio.wait_for(extract_profile(*args), timeout=PROFILE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("profile extraction timed out; using heuristic extraction")
+            profile = await extract_profile(*args, gemini=_HEURISTIC)  # F4: the heuristic profile, not a 504
         if session.wiped:
             raise HTTPException(404, "This session was deleted.")
         st.profile = profile
@@ -337,16 +386,18 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         return profile
 
     @app.get("/api/sessions/{sid}/seats/{seat}/profile")
-    async def get_profile(sid: str, seat: int) -> Profile:
+    async def get_profile(sid: str, seat: int, request: Request) -> Profile:
         st = require_seat(await require_session(sid), seat)
+        require_owner(request, st)  # off-limits and removed items are private to their seat
         if st.profile is None:
             raise HTTPException(404, "No profile yet.")
         return st.profile
 
     @app.patch("/api/sessions/{sid}/seats/{seat}/profile")
-    async def patch_profile(sid: str, seat: int, body: ProfilePatchBody) -> Profile:
+    async def patch_profile(sid: str, seat: int, body: ProfilePatchBody, request: Request) -> Profile:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)
         require_consent(st)
         require_open(session)
         if st.profile is None:
@@ -357,9 +408,10 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         return st.profile
 
     @app.post("/api/sessions/{sid}/seats/{seat}/ready")
-    async def ready(sid: str, seat: int) -> dict:
+    async def ready(sid: str, seat: int, request: Request) -> dict:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)
         require_consent(st)
         if st.ready:
             return {"ok": True}
@@ -374,9 +426,10 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     # ------------------------------------------------------------------ end of session: opt-in + trail
 
     @app.post("/api/sessions/{sid}/seats/{seat}/trail-optin")
-    async def trail_optin(sid: str, seat: int, body: TrailOptInBody) -> dict:
+    async def trail_optin(sid: str, seat: int, body: TrailOptInBody, request: Request) -> dict:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)  # only this seat's phone can answer (or change) its own yes/no
         if session.phase != "ended":
             raise HTTPException(409, "The conversation hasn't ended yet.")
         if session.trail_task is not None:
@@ -390,9 +443,10 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         return {"ok": True}
 
     @app.get("/api/sessions/{sid}/seats/{seat}/trail")
-    async def get_trail(sid: str, seat: int) -> TrailResponse:
+    async def get_trail(sid: str, seat: int, request: Request) -> TrailResponse:
         session = await require_session(sid)
         st = require_seat(session, seat)
+        require_owner(request, st)  # fetching marks trail_fetched, which wipes the session
         if not session.trail_ready or session.trail is None:
             raise HTTPException(409, "The trail isn't ready yet.")
         partner = session.seat(2 if seat == 1 else 1)
@@ -483,6 +537,10 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
             pass
         finally:
             session.unregister(conn)
+            runner = session.runner
+            if role == "table" and runner is not None and not session.has_role("table"):
+                # No Table is left to report `tts_state playing:false` for what it was playing (PRD 8.3).
+                runner.on_table_gone()
             await conn.stop()
 
     @app.websocket("/ws/audio/{sid}")
@@ -511,6 +569,9 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
                 if attached is not runner:
                     await runner.attach_audio(conn)
                     attached = runner
+                elif runner.audio_owner is None:
+                    # Another Table's socket took Muse over and has since gone away: take it back.
+                    await runner.attach_audio(conn, only_if_free=True)
                 runner.push_audio(conn, frame)
         except (WebSocketDisconnect, RuntimeError):
             pass

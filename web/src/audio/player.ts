@@ -51,6 +51,11 @@ export class CrumbPlayer {
     return this.playing ? (this.current?.id ?? null) : null;
   }
 
+  /** Use a fresh (gesture-unlocked) context, e.g. after the mic restarts; keeps a live one in place. */
+  attach(ctx: AudioContext): void {
+    if (!this.ctxRef || this.ctxRef.state === "closed") this.ctxRef = ctx;
+  }
+
   /** Resume a suspended AudioContext (autoplay policy). Call from a user gesture when possible. */
   async resume(): Promise<void> {
     const ctx = this.ctx();

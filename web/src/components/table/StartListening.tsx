@@ -7,14 +7,16 @@ interface StartListeningProps {
   mic: MicState;
   onStart(): void;
   hint?: string;
+  /** Shown once the mic is open; see micOnMessage (only claims transcription once it is happening). */
+  onMessage: string;
 }
 
-export default function StartListening({ mic, onStart, hint }: StartListeningProps) {
+export default function StartListening({ mic, onStart, hint, onMessage }: StartListeningProps) {
   if (mic.status === "on") {
     return (
       <p className="flex items-center justify-center gap-2 text-sm text-ink-muted" role="status">
         <span className="size-2 animate-pulse rounded-full bg-ok" aria-hidden="true" />
-        Mic is on. Audio is transcribed live and never stored.
+        {onMessage}
       </p>
     );
   }

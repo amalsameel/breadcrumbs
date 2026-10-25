@@ -140,7 +140,8 @@ def test_health_config_and_interview(client: TestClient) -> None:
     assert client.get("/api/health").json()["ok"] is True
     cfg = client.get("/api/config").json()
     assert cfg["mock"] == {"muse": True, "gemini": True}
-    assert set(cfg) == {"mock", "dev_tools", "public_base_url", "ffmpeg"}
+    assert cfg["ai_provider"] == "mock"
+    assert set(cfg) == {"mock", "ai_provider", "dev_tools", "public_base_url", "ffmpeg"}
     full = client.get("/api/interview", params={"mode": "networking", "quick": "false"}).json()["questions"]
     assert [q["id"] for q in full] == ["q1", "q2", "q3"]
     assert full[0]["text"] == "What are you working on that you're excited about?"
@@ -276,13 +277,18 @@ def test_speed_dating_round_timer(client: TestClient, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(core, "ROUND_TIMER_S", {**core.ROUND_TIMER_S, "speed_dating": 2.5})
     monkeypatch.setattr(core, "ROUND_WARNING_S", 1.5)
+    # The warning keeps a gap after the previous crumb; in a 2.5 s round that gap would swallow it.
+    monkeypatch.setattr(core, "ROUND_WARNING_GAP_S", 0.0, raising=False)
     sid = create(client, mode="speed_dating", quick=True)
     with client.websocket_connect(f"/ws/events/{sid}?role=table") as table:
         setup_ready(client, sid, quick=True)
         for seat in (1, 2):
             client.post(f"/api/sessions/{sid}/seats/{seat}/ready")
         with client.websocket_connect(f"/ws/audio/{sid}") as audio:
-            assert go_live(client, sid, table, audio)["crumb"]["kind"] == "opener"
+            opener = go_live(client, sid, table, audio)["crumb"]
+            assert opener["kind"] == "opener"
+            for playing in (True, False):  # the Table plays the opener, as a real one would
+                table.send_json({"type": "tts_state", "crumb_id": opener["id"], "playing": playing})
             snap = wait_for(table, of_type("engine"))["engine"]
             assert snap["round_remaining_s"] is not None and snap["round_remaining_s"] <= 2.5
             warning = wait_for(table, of_type("crumb"), timeout=5)  # the 1-minute-left crumb (F21)

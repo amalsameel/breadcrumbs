@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import type { Seat, SessionSummary } from "../../lib/types";
 import type { MicState } from "../../lib/useTable";
 import SeatQr from "../SeatQr";
-import { isInsecureUrl, isLocalUrl } from "./format";
+import { isInsecureUrl, isLocalUrl, micOnMessage } from "./format";
 import StartListening from "./StartListening";
 
 interface LobbyProps {
@@ -17,6 +17,7 @@ export default function Lobby({ session, joinUrls, mic, onStartListening }: Lobb
   const local = isLocalUrl(joinUrls[1]);
   const insecure = !local && isInsecureUrl(joinUrls[1]);
   const anyoneJoined = session.seats["1"].joined || session.seats["2"].joined;
+  const bothConsented = session.seats["1"].consented && session.seats["2"].consented;
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center justify-center gap-7 px-6 py-6">
@@ -57,7 +58,8 @@ export default function Lobby({ session, joinUrls, mic, onStartListening }: Lobb
         <StartListening
           mic={mic}
           onStart={onStartListening}
-          hint="Start the mic now so it is ready the moment you both are."
+          hint="Start the mic now so it is ready the moment you both are. Nothing is sent until you have both consented."
+          onMessage={micOnMessage(session.phase, bothConsented)}
         />
       )}
     </div>

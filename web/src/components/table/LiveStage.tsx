@@ -4,23 +4,30 @@ import type { Seat } from "../../lib/types";
 import type { TableView } from "../../lib/useTable";
 import CrumbOrb, { OrbStatus } from "../CrumbOrb";
 import CrumbCaption from "./CrumbCaption";
-import { deriveOrb } from "./format";
+import { deriveOrb, isResyncStep, micOnMessage } from "./format";
 import { useNow } from "./hooks";
 import { isSpeaking, visibleCrumb } from "./tableState";
 import { Icon } from "./Icon";
+import StartListening from "./StartListening";
 
 interface LiveStageProps {
   view: TableView;
   names: Record<Seat, string>;
+  onStartListening(): void;
 }
 
-export default function LiveStage({ view, names }: LiveStageProps) {
+export default function LiveStage({ view, names, onStartListening }: LiveStageProps) {
   const now = useNow(500);
-  const crumb = visibleCrumb(view.crumbs, now);
+  // A reconnect re-maps the voices while the phase stays live: the spoken prompt is captioned here.
+  const resyncing = isResyncStep(view.calibrationStep);
+  const resyncLine = resyncing ? view.systemLine : null;
+  const crumb = resyncLine ? null : visibleCrumb(view.crumbs, now);
   const speaking = crumb ? isSpeaking(crumb, now) : false;
-  const orb = deriveOrb(view.engine, speaking);
-  const showQuietHint = Boolean(view.engine?.quiet_hint) && !crumb && orb.mode !== "paused";
-  const compact = crumb !== null;
+  const orb = deriveOrb(view.engine, speaking, resyncing);
+  const showQuietHint = Boolean(view.engine?.quiet_hint) && !crumb && !resyncing && orb.mode !== "paused";
+  const compact = crumb !== null || resyncLine !== null;
+  // After a Table reload or a lost mic there is no capture: offer the same gesture again (PRD 14.1).
+  const micOff = view.mic.status !== "on";
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6">
@@ -38,7 +45,15 @@ export default function LiveStage({ view, names }: LiveStageProps) {
 
       <div className="mt-6 flex min-h-[11rem] w-full items-start justify-center">
         <AnimatePresence mode="wait">
-          {crumb ? (
+          {resyncLine ? (
+            <CrumbCaption
+              key={resyncLine.id}
+              id={resyncLine.id}
+              text={resyncLine.text}
+              durationS={resyncLine.durationS}
+              started={resyncLine.startedAt !== null || resyncLine.status !== "pending"}
+            />
+          ) : crumb ? (
             <CrumbCaption
               key={crumb.id}
               id={crumb.id}
@@ -75,9 +90,20 @@ export default function LiveStage({ view, names }: LiveStageProps) {
         </AnimatePresence>
       </div>
 
-      {/* Crumbs are always captioned for screen readers too (PRD 14.3). */}
+      {micOff && (
+        <div className="mt-2">
+          <StartListening
+            mic={view.mic}
+            onStart={onStartListening}
+            hint="The mic is off, so nothing is being heard. Turn it back on to keep the conversation going."
+            onMessage={micOnMessage("live", view.bothConsented)}
+          />
+        </div>
+      )}
+
+      {/* Crumbs and voice prompts are always captioned for screen readers too (PRD 14.3). */}
       <p className="sr-only" aria-live="polite" aria-atomic="true">
-        {crumb ? crumb.text : ""}
+        {resyncLine ? resyncLine.text : crumb ? crumb.text : ""}
       </p>
     </div>
   );

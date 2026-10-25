@@ -56,7 +56,7 @@ export default function Table() {
       case "calibrating":
         return <Calibration view={view} names={names} onStartListening={actions.startListening} />;
       case "live":
-        return <LiveStage view={view} names={names} />;
+        return <LiveStage view={view} names={names} onStartListening={actions.startListening} />;
       case "ended":
         return <EndedScreen crumbCount={view.crumbs.length} onWipe={actions.wipe} />;
     }

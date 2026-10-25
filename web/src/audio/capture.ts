@@ -12,6 +12,46 @@ export interface CaptureHandle {
 export interface CaptureOptions {
   onFrame: (pcm: ArrayBuffer) => void; // 3,840 bytes per 80 ms
   onVad: (active: boolean, rms: number) => void; // 10 Hz
+  /** The mic went away on its own (unplugged, permission revoked, the audio context closed). */
+  onLost?: () => void;
+}
+
+interface TrackLike {
+  addEventListener(type: "ended", cb: () => void): void;
+  removeEventListener(type: "ended", cb: () => void): void;
+}
+
+interface ContextLike {
+  readonly state: string;
+  addEventListener(type: "statechange", cb: () => void): void;
+  removeEventListener(type: "statechange", cb: () => void): void;
+}
+
+/**
+ * Calls `onLost` once when any mic track ends or the capture context closes (or is interrupted) without
+ * us stopping it. Returns the unsubscribe used by a deliberate stop.
+ */
+export function watchCaptureLoss(tracks: TrackLike[], ctx: ContextLike, onLost: () => void): () => void {
+  let done = false;
+  const lost = () => {
+    if (done) return;
+    done = true;
+    off();
+    onLost();
+  };
+  const onState = () => {
+    if (ctx.state === "closed" || ctx.state === "interrupted") lost();
+  };
+  const off = () => {
+    for (const t of tracks) t.removeEventListener("ended", lost);
+    ctx.removeEventListener("statechange", onState);
+  };
+  for (const t of tracks) t.addEventListener("ended", lost);
+  ctx.addEventListener("statechange", onState);
+  return () => {
+    done = true;
+    off();
+  };
 }
 
 type WorkletMessage = { type: "frame"; pcm: ArrayBuffer } | { type: "rms"; rms: number };
@@ -114,6 +154,9 @@ export async function startCapture(opts: CaptureOptions): Promise<CaptureHandle>
   const vad = new Vad();
   let paused = false;
   let stopped = false;
+  const unwatch = watchCaptureLoss(stream.getAudioTracks(), ctx, () => {
+    if (!stopped) opts.onLost?.();
+  });
 
   node.port.onmessage = (e: MessageEvent<WorkletMessage>) => {
     if (paused || stopped) return;
@@ -138,6 +181,7 @@ export async function startCapture(opts: CaptureOptions): Promise<CaptureHandle>
     stop() {
       if (stopped) return;
       stopped = true;
+      unwatch();
       node.port.onmessage = null;
       src.disconnect();
       node.disconnect();
