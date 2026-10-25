@@ -748,8 +748,14 @@ class CrumbService:
         return entry is not None and self._entry_valid(entry, now, convo.current_topic, convo)
 
     async def _synth(self, text: str, budget_s: float) -> bytes | None:
+        # Only prefetch has a budget long enough for the most natural voice model; misses, Drop a crumb
+        # and the opener are on the live path and use the fast one. The budget is passed down too, so a
+        # slow model leaves time for the next one (and for Gemini) instead of using it all up.
+        fast = budget_s < PREFETCH_TTS_BUDGET_S
         try:
-            return await asyncio.wait_for(synthesize(text, self.gemini), timeout=budget_s)
+            return await asyncio.wait_for(
+                synthesize(text, self.gemini, fast=fast, budget_s=budget_s), timeout=budget_s
+            )
         except Exception as exc:  # noqa: BLE001 - the Table falls back to speechSynthesis
             log.warning("tts skipped (%s)", type(exc).__name__)
             return None

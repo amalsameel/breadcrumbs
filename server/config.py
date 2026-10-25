@@ -18,6 +18,7 @@ load_dotenv(ROOT / ".env")
 MODEL_API_KEY = os.environ.get("MODEL_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 ASR_MODEL = os.environ.get("ASR_MODEL", "muse-voice-transcribe-1.0")
 EVENT_LOCATION = os.environ.get("EVENT_LOCATION", "Austin, Texas (HackTX at UT Austin)")
@@ -42,6 +43,11 @@ MUSE_SPARK_MODEL = "muse-spark-1.3"
 # Claude is the first text provider when ANTHROPIC_API_KEY is set (Gemini, then Muse Spark, are fallbacks).
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")  # live path: fast, short crumbs
+# Crumb voice: ElevenLabs first when ELEVENLABS_API_KEY is set, then Gemini TTS, else the Table's browser voice.
+ELEVENLABS_API_BASE = "https://api.elevenlabs.io"
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()  # empty = the built-in default voice
+ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "").strip()  # empty = the built-in default model
+TTS_PROVIDER = "elevenlabs" if ELEVENLABS_API_KEY else "gemini" if GEMINI_API_KEY else "browser"
 MUSE_REALTIME_URL = "wss://api.meta.ai/v1/asr/realtime?sessionId={sid}"
 MUSE_TRANSCRIBE_URL = "https://api.meta.ai/v1/asr/transcribe"
 META_API_BASE = "https://api.meta.ai/v1"
@@ -125,6 +131,12 @@ class Params:
     MAX_CRUMBS_PER_10_MIN: int = MAX_CRUMBS_PER_10_MIN
     TTS_TAIL_MS: int = TTS_TAIL_MS
     WILDCARD_ENABLED: bool = False  # F22, off by default
+    # Background noise: local VAD activity that Muse has not confirmed as a speech turn within this many
+    # seconds stops counting as speech (it no longer freezes the pause timer).
+    VAD_UNCONFIRMED_S: float = 2.5
+    # Self-hearing by text: a Muse turn during or just after bot speech whose words overlap the line being
+    # spoken by at least this fraction is the bot's own echo (no barge-in, never a human turn).
+    ECHO_TEXT_OVERLAP: float = 0.5
     HOLD_MAX_S: dict = field(default_factory=lambda: dict(HOLD_MAX_S))
     STALENESS_WEIGHTS: dict = field(default_factory=lambda: dict(STALENESS_WEIGHTS))
 

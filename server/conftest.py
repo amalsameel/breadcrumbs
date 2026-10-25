@@ -15,6 +15,7 @@ def _hermetic_ai(monkeypatch):
     GEMINI_API_KEY set it would make real, billed calls. Tests that exercise real request shapes build
     their own client with a fake transport; this only pins the shared singleton to mock mode.
     """
+    import ai.elevenlabs as elevenlabs_mod
     import ai.gemini as gemini_mod
     import config
 
@@ -23,3 +24,7 @@ def _hermetic_ai(monkeypatch):
     monkeypatch.setattr(config, "AI_PROVIDER", "mock")
     monkeypatch.setattr(config, "CLAUDE_ENABLED", False)
     monkeypatch.setattr(gemini_mod, "_singleton", gemini_mod.Gemini(mock=True))
+    # Same for the voice: with ELEVENLABS_API_KEY in .env, every test reaching ai.tts.synthesize would
+    # make a real, billed request. A keyless client (not None: a lazy rebuild would read config again).
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "")
+    monkeypatch.setattr(elevenlabs_mod, "_singleton", elevenlabs_mod.ElevenLabs(api_key=""))

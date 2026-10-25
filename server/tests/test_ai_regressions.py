@@ -363,7 +363,7 @@ async def test_slow_generation_and_tts_still_deliver_within_three_seconds(monkey
     async def slow_build(plan, convo):  # noqa: ANN001
         await asyncio.sleep(100)
 
-    async def slow_tts(text, gemini=None):  # noqa: ANN001
+    async def slow_tts(text, gemini=None, **kwargs):  # noqa: ANN001, ANN003
         await asyncio.sleep(100)
 
     monkeypatch.setattr(svc, "_build", slow_build)
