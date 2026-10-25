@@ -10,3 +10,4 @@ web/dist/
 *.m4a
 .pytest_cache/
 .DS_Store
+*.tsbuildinfo

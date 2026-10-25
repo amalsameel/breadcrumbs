@@ -1,0 +1,558 @@
+"""Breadcrumbs server: REST (PRD 13), WebSockets (PRD 12.1), static web app (docs/CONTRACTS.md section 4).
+
+Run from `server/`: `uvicorn main:app --port 8000`. Everything lives in memory (session_store.py); the
+live loop for each session is an engine/runner.py SessionRunner created when both seats are ready.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+from collections.abc import AsyncIterator
+
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+
+import config
+from ai.profiles import extract_profile, find_overlaps
+from ai.trail import generate_trail
+from audio.convert import ConversionError, ffmpeg_available, to_wav_24k
+from engine.runner import SessionRunner
+from models import (
+    Consent,
+    ConsentBody,
+    CreateSessionBody,
+    InterviewQuestion,
+    Mode,
+    OverlapSet,
+    Profile,
+    ProfilePatchBody,
+    Trail,
+    TrailOptInBody,
+    TrailResponse,
+)
+from muse.transcribe import TranscribeError, transcribe_wav
+from session_store import EVENT_ROLES, Connection, SeatState, Session, SessionStore
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("breadcrumbs.api")
+
+WEB_DIST = config.ROOT / "web" / "dist"
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024  # Muse REST body limit
+PROFILE_TIMEOUT_S = 30.0
+OVERLAP_TIMEOUT_S = 30.0
+TRAIL_TIMEOUT_S = 25.0
+MAX_OFF_LIMITS = 12
+OFF_LIMITS_MAX_CHARS = 60
+CONTACT_MAX_CHARS = 200
+CONTROL_ACTIONS = frozenset({"spark", "skip", "hold", "resume", "pause_listening", "resume_listening", "xray"})
+OPEN_PHASES = ("lobby", "profiles")  # profile setup is still allowed
+
+# PRD 6.3: three questions per mode; Quick profile asks only Q1.
+INTERVIEW: dict[str, list[str]] = {
+    "social": [
+        "What's something you could talk about for an hour?",
+        "What's a story your friends always make you tell?",
+        "What's something you're looking forward to right now?",
+    ],
+    "networking": [
+        "What are you working on that you're excited about?",
+        "What's something you're trying to learn or figure out right now?",
+        "What could you help someone with, and what kind of person are you hoping to meet?",
+    ],
+    "speed_dating": [
+        "What does a perfect Saturday look like for you?",
+        "What's a small thing that makes you unreasonably happy?",
+        "What's something people are usually surprised to learn about you?",
+    ],
+}
+
+
+def interview_questions(mode: Mode, quick: bool) -> list[InterviewQuestion]:
+    texts = INTERVIEW[mode][:1] if quick else INTERVIEW[mode]
+    return [InterviewQuestion(id=f"q{i}", text=t) for i, t in enumerate(texts, start=1)]
+
+
+def app_config() -> dict:
+    """AppConfig (web/src/lib/types.ts)."""
+    return {
+        "mock": {"muse": config.MUSE_MOCK, "gemini": config.GEMINI_MOCK},
+        "dev_tools": config.DEV_TOOLS,
+        "public_base_url": config.PUBLIC_BASE_URL,
+        "ffmpeg": ffmpeg_available(),
+    }
+
+
+def _clean_terms(terms: list[str]) -> list[str]:
+    out: list[str] = []
+    for term in terms:
+        t = " ".join(str(term).split())[:OFF_LIMITS_MAX_CHARS]
+        if t and t.lower() not in {o.lower() for o in out}:
+            out.append(t)
+    return out[:MAX_OFF_LIMITS]
+
+
+def create_app(store: SessionStore | None = None) -> FastAPI:
+    store = store if store is not None else SessionStore()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        sweeper = asyncio.create_task(store.run_sweeper(), name="ttl-sweeper")
+        log.info("breadcrumbs up (muse_mock=%s, gemini_mock=%s, ffmpeg=%s)", config.MUSE_MOCK, config.GEMINI_MOCK, ffmpeg_available())
+        try:
+            yield
+        finally:
+            sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper
+            await store.wipe_all("server shutdown")
+
+    app = FastAPI(title="Breadcrumbs", lifespan=lifespan)
+    app.state.store = store
+
+    # ------------------------------------------------------------------ helpers
+
+    async def require_session(sid: str) -> Session:
+        session = await store.get(sid)
+        if session is None:
+            raise HTTPException(404, "This session doesn't exist or was already deleted.")
+        return session
+
+    def require_seat(session: Session, seat: int) -> SeatState:
+        if seat not in session.seats:
+            raise HTTPException(404, "Unknown seat.")
+        return session.seat(seat)
+
+    def require_consent(st: SeatState) -> None:
+        if not st.consented:
+            raise HTTPException(403, "Consent is required first.")
+
+    def require_open(session: Session) -> None:
+        if session.phase not in OPEN_PHASES:
+            raise HTTPException(409, "Profiles are locked once the conversation has started.")
+
+    def send_table_state(session: Session, conn: Connection | None = None) -> None:
+        """The Table needs params and (once live) the latest engine snapshot right away."""
+        events: list[dict] = [{"type": "params", "params": session.params.to_dict()}]
+        if session.runner is not None:
+            events.append({"type": "engine", "engine": session.runner.snapshot()})
+        for event in events:
+            if conn is not None:
+                conn.send_text(json.dumps(event, separators=(",", ":")))
+            else:
+                session.broadcast(event, roles=("table",))
+
+    async def start_live(session: Session) -> None:
+        """Both seats ready: overlaps, Engine + CrumbService + runner, phase calibrating."""
+        async with session.lock:
+            if session.runner is not None or session.phase not in OPEN_PHASES or not session.both("ready"):
+                return
+            p1, p2 = session.seat(1).profile, session.seat(2).profile
+            if p1 is None or p2 is None:
+                return
+            try:
+                overlaps = await asyncio.wait_for(find_overlaps(p1, p2, session.mode), timeout=OVERLAP_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001 - the opener falls back to a generated switch
+                log.warning("overlap finder failed (%s)", type(exc).__name__)
+                overlaps = OverlapSet(overlaps=[])
+            if session.wiped or session.phase not in OPEN_PHASES:
+                return
+            session.overlaps = overlaps
+            runner = SessionRunner(session, overlaps=overlaps, on_round_end=lambda: end_session(session))
+            session.runner = runner
+            session.phase = "calibrating"
+            runner.start()
+            log.info("session calibrating (overlaps=%d)", len(overlaps.overlaps))
+        session.send_session()
+        send_table_state(session)
+
+    async def end_session(session: Session) -> None:
+        if session.phase == "ended" or session.wiped:
+            return
+        session.phase = "ended"
+        runner = session.runner
+        if runner is not None:
+            runner.end()
+            session.transcript = runner.full_transcript()
+            await runner.stop()
+        session.send_session()
+        log.info("session ended")
+
+    async def build_trail(session: Session) -> None:
+        both_share = all(session.seat(s).opted_in is True for s in (1, 2))
+        trail = Trail(items=[])
+        if both_share:
+            try:
+                trail = await asyncio.wait_for(
+                    generate_trail(session.mode, session.names, session.transcript, session.profiles),
+                    timeout=TRAIL_TIMEOUT_S,
+                )
+            except Exception as exc:  # noqa: BLE001 - contacts are still swapped without threads
+                log.warning("trail generation failed (%s)", type(exc).__name__)
+        if session.wiped:
+            return
+        session.trail = trail
+        session.trail_ready = True
+        session.transcript = ""  # no longer needed by anything
+        session.broadcast({"type": "trail_ready"}, roles=("seat1", "seat2"))
+        log.info("trail ready (matched=%s, items=%d)", both_share, len(trail.items))
+
+    # ------------------------------------------------------------------ meta
+
+    @app.get("/api/health")
+    async def health() -> dict:
+        return {"ok": True, "sessions": len(store), **app_config()}
+
+    @app.get("/api/config")
+    async def get_config() -> dict:
+        return app_config()
+
+    @app.get("/api/interview")
+    async def get_interview(mode: Mode = "social", quick: bool = False) -> dict:
+        return {"questions": [q.model_dump() for q in interview_questions(mode, quick)]}
+
+    # ------------------------------------------------------------------ sessions
+
+    @app.post("/api/sessions")
+    async def create_session(body: CreateSessionBody | None = None) -> dict:
+        body = body or CreateSessionBody()
+        session = store.create(body.mode, body.quick)
+        base = config.PUBLIC_BASE_URL
+        return {
+            "session_id": session.sid,
+            "join_urls": {"1": f"{base}/join/{session.sid}/1", "2": f"{base}/join/{session.sid}/2"},
+        }
+
+    @app.get("/api/sessions/{sid}")
+    async def get_session(sid: str) -> dict:
+        return (await require_session(sid)).summary()
+
+    @app.delete("/api/sessions/{sid}")
+    async def delete_session(sid: str) -> dict:
+        await require_session(sid)
+        await store.wipe(sid, "deleted")
+        return {"ok": True}
+
+    @app.post("/api/sessions/{sid}/end")
+    async def end(sid: str) -> dict:
+        await end_session(await require_session(sid))
+        return {"ok": True}
+
+    @app.patch("/api/sessions/{sid}/params")
+    async def patch_params(sid: str, changes: dict = Body(...)) -> dict:
+        session = await require_session(sid)
+        try:
+            if session.runner is not None:
+                params = session.runner.update_params(changes)
+            else:
+                session.params.update(changes)
+                params = session.params.to_dict()
+                session.broadcast({"type": "params", "params": params}, roles=("table",))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, f"Invalid parameter value: {exc}") from exc
+        return {"params": params}
+
+    @app.get("/api/sessions/{sid}/metrics")
+    async def get_metrics(sid: str) -> dict:
+        """Aggregate counts and latencies only, never text (PRD 15.1, 16.3)."""
+        session = await require_session(sid)
+        runner = session.runner
+        return {
+            "phase": session.phase,
+            "turns": len(runner.engine.turns) if runner else 0,
+            "metrics": runner.engine.metrics() if runner else None,
+        }
+
+    # ------------------------------------------------------------------ seats: consent, interview, profile
+
+    @app.post("/api/sessions/{sid}/seats/{seat}/consent")
+    async def consent(sid: str, seat: int, body: ConsentBody) -> dict:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        require_open(session)
+        name = " ".join(body.typed_name.split())
+        if not body.agreed:
+            raise HTTPException(400, "Please check the box to agree before continuing.")
+        if not name:
+            raise HTTPException(422, "Please type your name.")
+        st.consent = Consent(typed_name=name, agreed=True, at=time.time())
+        st.joined = True
+        if session.phase == "lobby":
+            session.phase = "profiles"
+        session.send_session()
+        return {"ok": True}
+
+    @app.post("/api/sessions/{sid}/seats/{seat}/answers")
+    async def upload_answer(sid: str, seat: int, question_id: str = Form(...), audio: UploadFile = File(...)) -> dict:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        require_consent(st)
+        require_open(session)
+        qids = [q.id for q in interview_questions(session.mode, session.quick)]
+        if question_id not in qids:
+            raise HTTPException(422, "Unknown question.")
+        try:
+            data = await audio.read(MAX_UPLOAD_BYTES + 1)
+        finally:
+            await audio.close()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "That recording is too large.")
+        if not data:
+            raise HTTPException(422, "The recording is empty. Please record again.")
+        wav = await _to_wav(data, audio.filename or "answer.webm")
+        mock_key = f"{session.mode}:{question_id}:seat{seat}"
+        try:
+            transcript = await transcribe_wav(wav, mock_key=mock_key)
+        except TranscribeError as exc:
+            raise HTTPException(502, f"Transcription failed ({exc}). Please try again.") from exc
+        if session.wiped:
+            raise HTTPException(404, "This session was deleted.")
+        st.answers[question_id] = transcript
+        session.send_session()
+        log.info("answer stored (seat=%d, %s, %d words)", seat, question_id, len(transcript.split()))
+        return {"transcript": transcript}
+
+    @app.post("/api/sessions/{sid}/seats/{seat}/profile")
+    async def build_profile(sid: str, seat: int) -> Profile:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        require_consent(st)
+        require_open(session)
+        if not st.answers:
+            raise HTTPException(409, "Record at least one answer first.")
+        order = [q.id for q in interview_questions(session.mode, session.quick)]
+        answers = [st.answers[q] for q in order if q in st.answers]
+        try:
+            profile = await asyncio.wait_for(
+                extract_profile(seat, session.mode, st.name or f"Seat {seat}", answers), timeout=PROFILE_TIMEOUT_S
+            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(504, "Building your profile took too long. Please try again.") from exc
+        if session.wiped:
+            raise HTTPException(404, "This session was deleted.")
+        st.profile = profile
+        session.send_session()
+        return profile
+
+    @app.get("/api/sessions/{sid}/seats/{seat}/profile")
+    async def get_profile(sid: str, seat: int) -> Profile:
+        st = require_seat(await require_session(sid), seat)
+        if st.profile is None:
+            raise HTTPException(404, "No profile yet.")
+        return st.profile
+
+    @app.patch("/api/sessions/{sid}/seats/{seat}/profile")
+    async def patch_profile(sid: str, seat: int, body: ProfilePatchBody) -> Profile:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        require_consent(st)
+        require_open(session)
+        if st.profile is None:
+            raise HTTPException(409, "Build your profile first.")
+        known = {i.id for i in st.profile.items}
+        removed = list(dict.fromkeys(i for i in body.removed_item_ids if i in known))
+        st.profile = st.profile.model_copy(update={"removed_item_ids": removed, "off_limits": _clean_terms(body.off_limits)})
+        return st.profile
+
+    @app.post("/api/sessions/{sid}/seats/{seat}/ready")
+    async def ready(sid: str, seat: int) -> dict:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        require_consent(st)
+        if st.ready:
+            return {"ok": True}
+        require_open(session)
+        if st.profile is None:
+            raise HTTPException(409, "Build and review your profile first.")
+        st.ready = True
+        session.send_session()
+        await start_live(session)
+        return {"ok": True}
+
+    # ------------------------------------------------------------------ end of session: opt-in + trail
+
+    @app.post("/api/sessions/{sid}/seats/{seat}/trail-optin")
+    async def trail_optin(sid: str, seat: int, body: TrailOptInBody) -> dict:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        if session.phase != "ended":
+            raise HTTPException(409, "The conversation hasn't ended yet.")
+        if session.trail_task is not None:
+            raise HTTPException(409, "Both answers are in already.")
+        contact = " ".join((body.contact or "").split())[:CONTACT_MAX_CHARS]
+        st.opted_in = body.share
+        st.contact = (contact or None) if body.share else None
+        session.send_session()
+        if all(session.seat(s).opted_in is not None for s in (1, 2)):
+            session.trail_task = asyncio.create_task(build_trail(session), name="trail")
+        return {"ok": True}
+
+    @app.get("/api/sessions/{sid}/seats/{seat}/trail")
+    async def get_trail(sid: str, seat: int) -> TrailResponse:
+        session = await require_session(sid)
+        st = require_seat(session, seat)
+        if not session.trail_ready or session.trail is None:
+            raise HTTPException(409, "The trail isn't ready yet.")
+        partner = session.seat(2 if seat == 1 else 1)
+        matched = st.opted_in is True and partner.opted_in is True
+        response = TrailResponse(
+            matched=matched,
+            partner_name=partner.name if matched else None,
+            partner_contact=partner.contact if matched else None,
+            trail=[i for i in session.trail.items if i.for_seat == seat] if matched else [],
+        )
+        st.trail_fetched = True
+        if session.both("trail_fetched"):
+            await store.wipe(sid, "trail delivered")
+        return response
+
+    # ------------------------------------------------------------------ WebSockets
+
+    async def handle_table_event(session: Session, conn: Connection, raw: str) -> None:
+        try:
+            evt = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(evt, dict):
+            return
+        kind = evt.get("type")
+        runner = session.runner
+        live = runner is not None and not runner.stopped
+        try:
+            if kind == "control":
+                action = evt.get("action")
+                if action == "end":
+                    await end_session(session)
+                elif action in CONTROL_ACTIONS and live:
+                    runner.on_control(action)
+            elif kind == "vad" and live:
+                runner.on_vad(bool(evt.get("active")), float(evt.get("rms") or 0.0))
+            elif kind == "tts_state" and live:
+                runner.on_tts_state(str(evt.get("crumb_id") or ""), bool(evt.get("playing")))
+            elif kind == "params" and isinstance(evt.get("changes"), dict):
+                if runner is not None:
+                    runner.update_params(evt["changes"])
+                else:
+                    session.params.update(evt["changes"])
+                    session.broadcast({"type": "params", "params": session.params.to_dict()}, roles=("table",))
+            elif kind == "dev_turn":
+                if not config.DEV_TOOLS:
+                    return
+                if not live:
+                    conn.send_text(json.dumps({"type": "error", "message": "Dev turns work once both seats are ready."}))
+                    return
+                duration = evt.get("duration_s")
+                runner.dev_turn(int(evt.get("seat") or 0), str(evt.get("text") or ""), float(duration) if duration else None)
+        except (TypeError, ValueError):
+            log.warning("ignored a malformed %s event", kind)
+
+    @app.websocket("/ws/events/{sid}")
+    async def ws_events(ws: WebSocket, sid: str, role: str = "table") -> None:
+        await ws.accept()
+        session = await store.get(sid)
+        if session is None:
+            await ws.close(4404)
+            return
+        if role not in EVENT_ROLES:
+            await ws.close(4403)
+            return
+        conn = Connection(ws, role)  # type: ignore[arg-type]
+        conn.start()
+        session.register(conn)
+        try:
+            if role == "table":
+                conn.send_text(json.dumps({"type": "session", "session": session.summary()}))
+                send_table_state(session, conn)
+            else:
+                st = session.seat(1 if role == "seat1" else 2)
+                if not st.joined:
+                    st.joined = True
+                    session.send_session()
+                else:
+                    conn.send_text(json.dumps({"type": "session", "session": session.summary()}))
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                text = message.get("text")
+                if text and role == "table":
+                    await handle_table_event(session, conn, text)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            session.unregister(conn)
+            await conn.stop()
+
+    @app.websocket("/ws/audio/{sid}")
+    async def ws_audio(ws: WebSocket, sid: str) -> None:
+        await ws.accept()
+        session = await store.get(sid)
+        if session is None:
+            await ws.close(4404)
+            return
+        if not session.both("consented") or session.phase == "ended":
+            await ws.close(4403)
+            return
+        conn = Connection(ws, "audio")
+        conn.start()
+        session.register(conn)
+        attached: SessionRunner | None = None
+        try:
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                frame = message.get("bytes")
+                runner = session.runner
+                if not frame or runner is None or runner.stopped:
+                    continue  # profiles phase or ended: nothing listens yet
+                if attached is not runner:
+                    await runner.attach_audio(conn)
+                    attached = runner
+                runner.push_audio(conn, frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            session.unregister(conn)
+            if attached is not None:
+                await attached.detach_audio(conn)
+            await conn.stop()
+
+    # ------------------------------------------------------------------ static web app (SPA fallback)
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa(full_path: str) -> FileResponse:
+        if full_path.split("/", 1)[0] in ("api", "ws"):
+            raise HTTPException(404, "Not found.")
+        dist = WEB_DIST.resolve()
+        index = dist / "index.html"
+        if not index.is_file():
+            raise HTTPException(404, "The web app is not built. Run `npm run build` in web/, or use the Vite dev server.")
+        if full_path:
+            candidate = (dist / full_path).resolve()
+            if candidate.is_file() and dist in candidate.parents:
+                return FileResponse(candidate)
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+
+    return app
+
+
+async def _to_wav(data: bytes, filename: str) -> bytes:
+    """24 kHz mono WAV for Muse. Without ffmpeg, mock mode skips conversion (the mock ignores audio)."""
+    try:
+        return await to_wav_24k(data, filename)
+    except ConversionError as exc:
+        if not ffmpeg_available():
+            if config.MUSE_MOCK:
+                return b""
+            raise HTTPException(
+                503,
+                "ffmpeg is not installed on the server, so phone recordings can't be converted. "
+                "Ask the operator to run: brew install ffmpeg",
+            ) from exc
+        raise HTTPException(422, f"We couldn't read that recording ({exc}). Please record again.") from exc
+
+
+app = create_app()
