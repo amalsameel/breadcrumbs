@@ -2,6 +2,14 @@
   "name": "echo_then_reply_same_turn",
   "mode": "social",
   "description": "Muse keeps one turn open while the steer's echo (59.4 s) runs straight into seat 2's answer: the partials are the line, then the reply, until 78 s. Once three words the line never said arrive the turn is a person's, so no crumb fires while they talk, nothing barges in, and the turn is not dropped as bot speech. Before the fix the whole answer was treated as echo and a switch fired over it at 76.9 s.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "crumb_text": "So what is something you both love doing on the weekends?",
   "duration": 80.0,
   "turns": [

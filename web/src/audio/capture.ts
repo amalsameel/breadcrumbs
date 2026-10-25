@@ -73,6 +73,10 @@ export interface VadReading {
   /** This frame looks like voice: speech-band energy, not hiss, not a click, above the absolute minimum. */
   voiced: boolean;
   calibrating: boolean;
+  /** ms since the last frame that met the onset or sustain conditions (0 while sustaining, 0 before any
+   * voice, capped at QUIET_MS_CAP). At the falling edge it is the release hangover: the server backdates
+   * the end of the turn by it, so the pause starts when the voice stopped. */
+  quietMs: number;
 }
 
 type WorkletMessage = { type: "frame"; pcm: ArrayBuffer } | ({ type: "vad" } & VadFrame);
@@ -120,6 +124,7 @@ export class Vad {
   static readonly HOLD_MOD_DB = 1.5;
   static readonly ATTACK_MS = 200;
   static readonly RELEASE_MS = 500;
+  static readonly QUIET_MS_CAP = 60_000;
   // Each frame covers the audio since the previous one (100 ms from the worklet).
   private static readonly DEFAULT_STEP_MS = 100;
   private static readonly MAX_STEP_MS = 250;
@@ -132,6 +137,7 @@ export class Vad {
   private belowMs = 0;
   private lastT: number | null = null;
   private isActive = false;
+  private lastVoiceMs: number | null = null; // last frame meeting the onset or sustain conditions
   private lastReading: VadReading | null = null;
 
   update(frame: VadFrame, nowMs: number): VadReading {
@@ -162,6 +168,7 @@ export class Vad {
       this.aboveMs = 0;
     } else if (!this.isActive) {
       const onset = voiced && snrDb >= Vad.ON_SNR_DB && modulation >= Vad.ON_MOD_DB;
+      if (onset) this.lastVoiceMs = nowMs;
       this.aboveMs = onset ? this.aboveMs + step : 0;
       if (this.aboveMs >= Vad.ATTACK_MS) {
         this.isActive = true;
@@ -174,6 +181,7 @@ export class Vad {
         levelDb - toDb(frame.rms) >= Vad.MIN_BAND_DB &&
         snrDb >= Vad.OFF_SNR_DB &&
         modulation >= Vad.HOLD_MOD_DB;
+      if (sustain) this.lastVoiceMs = nowMs;
       this.belowMs = sustain ? 0 : this.belowMs + step;
       if (this.belowMs >= Vad.RELEASE_MS) {
         this.isActive = false;
@@ -188,6 +196,7 @@ export class Vad {
       snrDb,
       voiced,
       calibrating,
+      quietMs: this.lastVoiceMs === null ? 0 : Math.min(Vad.QUIET_MS_CAP, Math.max(0, Math.round(nowMs - this.lastVoiceMs))),
     };
     return this.lastReading;
   }

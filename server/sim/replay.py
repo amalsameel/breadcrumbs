@@ -9,13 +9,22 @@ the opener. By default it then fast-forwards, without ticking, past the opener's
 script time 0 starts clean (`"skip_warmup": false` keeps the warm-up: script time 0 = opener end).
 Scripts should start with a turn at 0.0.
 
-Script keys: name, mode, turns[{seat, text, start, end, label?, echo?, vad_from?, complete_delay?}],
-expect[{between: [a, b], action, kind?, count?, at?, tolerance?}], and optional duration, prior_crumb_at,
-controls[{t, action}], hold_results{"<turn index>": HoldDecision fields + delay_s?}, energy_results[...],
-tts_seconds (3.0), gen_latency_s (0), skip_warmup (true), names, noise[{start, end}] (local VAD active
-with no Muse turn: background noise), crumb_text (the text of every simulated crumb, so an `echo` turn can
-repeat the line the way Muse transcribes the bot's own voice). An `echo` turn has no local VAD, except
-from `vad_from` (script time) to its end: a person answering in the same Muse turn as the echo.
+Script keys: name, mode, turns[{seat, text, start, end, label?, echo?, vad_from?, complete_delay?,
+level_db?, vad?, muse_lag_s?}], expect[{between: [a, b], action, kind?, count?, at?, tolerance?}], and
+optional duration, prior_crumb_at, controls[{t, action}], hold_results{"<turn index>": HoldDecision fields +
+delay_s?}, energy_results[...], tts_seconds (3.0), gen_latency_s (0), skip_warmup (true), names,
+setup ("profiles" or "quick"; "quick" = "Just talk": live at once with no prompts and no opener, voices mapped
+by order of appearance, an icebreaker after T_LONG_S if nobody speaks; use it with "skip_warmup": false so
+script time 0 = go-live), noise[{start, end, level_db?}] (local VAD active with no Muse turn: background noise), crumb_text (the text
+of every simulated crumb, so an `echo` turn can repeat the line the way Muse transcribes the bot's own
+voice), params (Params overrides, applied when the caller passes no Params). An `echo` turn has no local
+VAD, except from `vad_from` (script time) to its end: a person answering in the same Muse turn as the echo.
+
+Foreground (bystanders): every VAD frame carries `level_db` (the loudest active source: a turn's
+`level_db`, default -30 dB like the seats, a noise span's, default -42 dB) and `quiet_ms` (ms since the
+last active source ended, 0 while one is active). `vad: false` is a voice Muse hears but the Table VAD
+does not (far away); `label` can be any string (C, D, ... are unmapped); `muse_lag_s` delays every Muse
+event of that turn behind its VAD (Muse endpointing lag). Calibration turns are -30 dB.
 
 CLI: python -m sim.replay sim/scripts/<name>.json [more.json ...]
 """
@@ -33,6 +42,7 @@ from typing import Any
 
 from config import BARGE_IN_FADE_MS, Params
 from engine.core import Effect, Engine
+from engine.runner import DISPATCH_POLL_S, DISPATCH_WAIT_S
 from engine.hold import match_hold
 from models import Crumb, CrumbKind, EnergyTag, HoldDecision
 
@@ -50,12 +60,17 @@ CRUMB_ACTIONS = frozenset({"opener", "steer", "switch", "manual", "wildcard"})
 DEFAULT_NAMES = {1: "Maya", 2: "Dev"}
 SEAT_LABELS = {1: "A", 2: "B"}
 CALIBRATION_LINES = {"seat1": (1, "Hi, I'm from Austin."), "seat2": (2, "Hey, I'm from Houston, nice to meet you.")}
+SEAT_LEVEL_DB = -30.0  # default level of a turn (and of the calibration turns) at the Table mic
+NOISE_LEVEL_DB = -42.0  # default level of a noise span
+QUIET_MS_CAP = 60_000
 DECISION_ACTIONS = {
     "hold": "hold",
     "release": "release",
     "quiet": "quiet",
     "safety_pause": "safety_pause",
     "dropped_bot_turn": "dropped_as_bot",
+    "background_turn": "background_turn",
+    "dispatch_blocked": "dispatch_blocked",
 }
 SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
@@ -73,9 +88,12 @@ class SimResult:
 class _Sim:
     def __init__(self, script: dict, params: Params | None):
         self.script = script
-        self.params = params or Params()
+        if params is None:
+            params = Params()
+            params.update(script.get("params") or {})
+        self.params = params
         names = {int(k): v for k, v in (script.get("names") or DEFAULT_NAMES).items()}
-        self.engine = Engine(script.get("mode", "social"), names, self.params)
+        self.engine = Engine(script.get("mode", "social"), names, self.params, setup=script.get("setup", "profiles"))
         self.tts_seconds = float(script.get("tts_seconds", 3.0))
         self.gen_latency_s = float(script.get("gen_latency_s", 0.0))
         self.energy_results = list(script.get("energy_results") or [])
@@ -87,7 +105,7 @@ class _Sim:
         self._crumb_n = 0
         self._tts_token: dict[str, int] = {}
         self._playing: set[str] = set()
-        self._vad_spans: list[tuple[float, float]] = []
+        self._vad_spans: list[tuple[float, float, float]] = []  # (start, end, level_db)
         self._turn_index_by_start: dict[float, int] = {}
         self._opener_id: str | None = None
         self.opener_end: float | None = None
@@ -125,13 +143,25 @@ class _Sim:
                 return
 
     def _vad_frame(self, g: float) -> None:
-        active = any(s - TIME_EPS <= g < e - TIME_EPS for s, e in self._vad_spans)
-        self.handle(self.engine.on_vad(active, 0.08 if active else 0.004, g))
+        levels = [lv for s, e, lv in self._vad_spans if s - TIME_EPS <= g < e - TIME_EPS]
+        active = bool(levels)
+        if active:
+            level, quiet = max(levels), 0
+        else:
+            level = -60.0
+            ended = [e for _, e, _ in self._vad_spans if e - TIME_EPS <= g]
+            quiet = min(QUIET_MS_CAP, round((g - max(ended)) * 1000)) if ended else 0
+        rms = 10 ** (level / 20)
+        self.handle(self.engine.on_vad(active, rms, g, level_db=level, quiet_ms=quiet))
 
     # --- inputs ------------------------------------------------------------------------
 
     def schedule_turn(self, label: str | None, text: str, start: float, end: float, *, echo: bool = False,
-                      complete_delay: float = COMPLETE_DELAY_S) -> None:
+                      complete_delay: float = COMPLETE_DELAY_S, level_db: float = SEAT_LEVEL_DB, vad: bool = True,
+                      muse_lag_s: float = 0.0) -> None:
+        if vad and not echo:
+            self._vad_spans.append((start, end, level_db))
+        start, end = start + muse_lag_s, end + muse_lag_s  # Muse reports the turn this much later
         muse_id = next(self._muse_ids)
         words = text.split()
         self.at(start, self._muse, {"type": "speechStart", "turnId": muse_id, "audioProcessedMs": 0})
@@ -146,8 +176,6 @@ class _Sim:
             self.at(max(start, end - 0.05), self._muse, {"type": "speaker", "label": label})
         self.at(end, self._muse, {"type": "speechEnd", "turnId": muse_id})
         self.at(end + complete_delay, self._muse, {"type": "speechComplete", "turnId": muse_id, "transcript": text})
-        if not echo:
-            self._vad_spans.append((start, end))
 
     def _muse(self, evt: dict) -> None:
         self.handle(self.engine.on_muse_event(evt, self.now))
@@ -192,10 +220,17 @@ class _Sim:
         else:
             self._dispatch(kind)
 
-    def _dispatch(self, kind: CrumbKind) -> None:
+    def _dispatch(self, kind: CrumbKind, held_from: float | None = None) -> None:
         if self.engine.pending_cancelled:  # PRD 8.1: speech or Skip arrived while it was generated
             self._record("crumb_cancelled", kind, "cancelled while generating")
             self.handle(self.engine.crumb_cancelled(self.now))
+            return
+        if self.engine.dispatch_blocked(self.now):  # like the runner: hold it while someone may be talking
+            held_from = self.now if held_from is None else held_from
+            if self.now - held_from + TIME_EPS >= DISPATCH_WAIT_S:
+                self.handle(self.engine.dispatch_timed_out(self.now, waited_s=self.now - held_from))
+                return
+            self.at(self.now + DISPATCH_POLL_S, self._dispatch, kind, held_from)
             return
         self._crumb_n += 1
         crumb = Crumb(
@@ -306,12 +341,16 @@ class _Sim:
             start, end = self.base + float(turn["start"]), self.base + float(turn["end"])
             self._turn_index_by_start[round(float(turn["start"]), 3)] = i
             echo = bool(turn.get("echo", False))
+            level = float(turn.get("level_db", SEAT_LEVEL_DB))
             self.schedule_turn(label, turn["text"], start, end, echo=echo,
-                               complete_delay=float(turn.get("complete_delay", COMPLETE_DELAY_S)))
+                               complete_delay=float(turn.get("complete_delay", COMPLETE_DELAY_S)),
+                               level_db=level, vad=bool(turn.get("vad", True)),
+                               muse_lag_s=float(turn.get("muse_lag_s", 0.0)))
             if echo and turn.get("vad_from") is not None:
-                self._vad_spans.append((self.base + float(turn["vad_from"]), end))
+                self._vad_spans.append((self.base + float(turn["vad_from"]), end, level))
         for span in self.script.get("noise") or []:
-            self._vad_spans.append((self.base + float(span["start"]), self.base + float(span["end"])))
+            self._vad_spans.append((self.base + float(span["start"]), self.base + float(span["end"]),
+                                    float(span.get("level_db", NOISE_LEVEL_DB))))
         controls = list(self.script.get("controls") or [])
         if "prior_crumb_at" in self.script:
             controls.append({"t": self.script["prior_crumb_at"], "action": "spark"})
@@ -324,7 +363,7 @@ class _Sim:
 def script_duration(script: dict) -> float:
     if "duration" in script:
         return float(script["duration"])
-    ends = [float(t["end"]) for t in script.get("turns", [])]
+    ends = [float(t["end"]) + float(t.get("muse_lag_s", 0.0)) for t in script.get("turns", [])]
     ends += [float(e["between"][1]) for e in script.get("expect", [])]
     ends += [float(c["t"]) for c in script.get("controls", []) or []]
     ends += [float(n["end"]) for n in script.get("noise", []) or []]

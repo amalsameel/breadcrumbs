@@ -1,0 +1,48 @@
+{
+  "name": "quick_noise_then_person",
+  "mode": "social",
+  "setup": "quick",
+  "skip_warmup": false,
+  "description": "Just talk in a noisy room: a -42 dB fan runs from go-live and latches the room noisy before anyone speaks (the seated level is still unknown). Person 1 starts at 2.4 s, 12 dB over that noise floor, with Muse 0.8 s late: their voice is near, so it defers the icebreaker, their turn is kept (not dropped as bot speech) and the voices map Person 1 = A, Person 2 = B.",
+  "noise": [
+    {
+      "start": 0.0,
+      "end": 16.0,
+      "level_db": -42.0
+    }
+  ],
+  "duration": 16.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "Hi, is this seat taken or can I sit here for a bit before the talk?",
+      "start": 2.4,
+      "end": 7.0,
+      "muse_lag_s": 0.8
+    },
+    {
+      "seat": 2,
+      "text": "Go for it, I am just waiting for the next session to start here.",
+      "start": 7.8,
+      "end": 11.5
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        0.0,
+        16.0
+      ],
+      "action": "opener",
+      "count": 0
+    },
+    {
+      "between": [
+        0.0,
+        16.0
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}

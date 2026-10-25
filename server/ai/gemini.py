@@ -325,14 +325,16 @@ class Gemini:
         schema: type[T],
         max_tokens: int = 400,
         thinking_level: str = "low",
+        job: str | None = None,
     ) -> T:
-        """Structured output parsed into `schema`. Raises GeminiError on failure (or in mock mode)."""
+        """Structured output parsed into `schema`. Raises GeminiError on failure (or in mock mode). `job` names
+        the caller for Claude ("crumb" and "hold" are latency-critical: fast mode, see ai/claude.py)."""
         if self.mock:
             raise GeminiError("mock mode: callers use their deterministic mock path")
         user = payload if isinstance(payload, str) else jsonlib.dumps(payload, ensure_ascii=False)
         if self.claude_available:
             try:
-                return await self.claude.json(system=system, user=user, schema=schema, max_tokens=max_tokens)
+                return await self.claude.json(system=system, user=user, schema=schema, max_tokens=max_tokens, job=job)
             except ClaudeError as exc:
                 log.warning("claude json failed (%s); trying the next provider", exc)
         json_schema = schema_for(schema)

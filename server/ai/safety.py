@@ -253,16 +253,23 @@ def validate_crumb_text(
     names: dict[int, str],
     profiles: dict[int, Profile],
     max_words: int = 28,
+    require_name: bool = True,
+    placeholders: list[str] | tuple[str, ...] = (),
 ) -> tuple[bool, str, list[str]]:
-    """Check one spoken line (crumb text or overlap opener). Returns (ok, cleaned_text, errors)."""
+    """Check one spoken line (crumb text or overlap opener). Returns (ok, cleaned_text, errors).
+
+    `require_name=False` when the people never typed a name ("Just talk"); `placeholders` are the labels
+    used for them instead ("Person 1"), which must never be spoken."""
     cleaned = clean_text(text)
     errors: list[str] = []
     if not cleaned:
         return False, cleaned, ["empty text"]
     if word_count(cleaned) > max_words:
         errors.append(f"too many words ({word_count(cleaned)} > {max_words})")
-    if not name_present(cleaned, names):
+    if require_name and not name_present(cleaned, names):
         errors.append("no participant name")
+    if any(re.search(rf"(?<!\w){re.escape(p)}(?!\w)", cleaned, re.IGNORECASE) for p in placeholders if p):
+        errors.append("placeholder name")
     hit = find_keyword(cleaned, off_limits_keywords(profiles))
     if hit:
         errors.append(f"off-limits term: {hit}")

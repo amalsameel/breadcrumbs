@@ -147,6 +147,19 @@ describe("captions and names", () => {
     assert.equal(sourceCaption(crumb("outside"), names), "outside the box");
   });
 
+  it("a quick table (no profiles) never claims a profile", () => {
+    assert.equal(sourceCaption(crumb("profile_seat1"), names, true), "from something Maya said");
+    assert.equal(sourceCaption(crumb("profile_seat2"), names, true), "from something Dev said");
+    assert.equal(sourceCaption(crumb("overlap"), names, true), "from something you both said");
+    assert.equal(sourceCaption(crumb("conversation"), names, true), "from your conversation");
+  });
+
+  it("the Just talk icebreaker reads as a starter, not 'outside the box'", () => {
+    assert.equal(sourceCaption(crumb("outside", { kind: "opener" }), names, true), "to get you started");
+    assert.equal(sourceCaption(crumb("outside", { kind: "opener" }), names), "outside the box");
+    assert.equal(sourceCaption(crumb("outside"), names, true), "outside the box");
+  });
+
   it("falls back to seat numbers when a name is missing", () => {
     const session = { seats: { 1: { name: "  " }, 2: { name: "Dev" } } };
     assert.equal(seatName(session, 1), "Seat 1");
@@ -434,5 +447,25 @@ describe("orb looks (CrumbOrb contract)", () => {
     assert.equal(approach(0, 0.5), 0);
     assert.equal(approach(1, 0), 1);
     assert.ok(Math.abs(approach(0.5, 0.5) - (1 - Math.exp(-1))) < 1e-12);
+  });
+});
+
+describe("Table setups (source)", () => {
+  it("a quick table skips the lobby QR codes and the calibration screen", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const table = await readFile(new URL("../../../pages/Table.tsx", import.meta.url), "utf8");
+    const quick = table.slice(table.indexOf("if (quick) {"), table.indexOf("switch (view.session.phase)", table.indexOf("if (quick) {") + 20));
+    assert.match(quick, /<QuickConsent onStart=\{actions\.startQuick\} \/>/);
+    assert.match(quick, /case "calibrating":\s*return <QuickStarting/);
+    assert.match(quick, /case "ended":\s*return <QuickTrail[^>]*onDone=\{actions\.wipe\}/);
+    assert.ok(!quick.includes("<Calibration") && !quick.includes("<Lobby"));
+  });
+
+  it("the quick consent card says exactly what happens", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const src = await readFile(new URL("../QuickSetup.tsx", import.meta.url), "utf8");
+    assert.match(src, /Breadcrumbs listens and transcribes your conversation live\. Nothing is stored\./);
+    assert.match(src, /We're both in/);
+    assert.match(src, /\(optional\)/);
   });
 });

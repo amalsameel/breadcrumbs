@@ -3,12 +3,17 @@
 Drives the whole product over real HTTP + WebSockets, the way two phones and the Table would:
 create -> consent x2 -> answers -> profiles -> ready x2 -> Table events + audio sockets (80 ms silence
 frames in real time, VAD at 10 Hz) -> calibration via dev turns -> opener -> lively turns -> silence ->
-steer about 5 s after the last turn -> Drop a crumb -> End -> opt-in x2 -> trail -> wiped.
+steer about 3 s after the last turn -> Drop a crumb -> End -> opt-in x2 -> trail -> wiped.
 The script plays the Table's part for TTS: it answers every crumb and system line with tts_state
 start/end. It never prints transcript text, only event kinds and timings.
 
+`--setup quick` drives the "Just talk" setup instead: create (no join links) -> phone links refused ->
+"We're both in" (POST /start) on the Table -> audio -> live with no prompts -> the icebreaker about 3 s into
+the first silence -> lively turns (the live memory arrives) -> steer about 3 s after the last turn -> Drop a
+crumb -> End -> the Table's own trail -> Done (DELETE) -> wiped. `--setup both` runs both, profiles first.
+
 Usage (server running with DEV_TOOLS=true):
-    cd server && .venv/bin/python -m sim.smoke_e2e [--base http://localhost:8000]
+    cd server && .venv/bin/python -m sim.smoke_e2e [--base http://localhost:8000] [--setup profiles|quick|both]
 Exit code 0 when every check passes.
 """
 from __future__ import annotations
@@ -199,9 +204,8 @@ async def dev_turn(table: TableClient, seat: int, text: str) -> float:
     return duration
 
 
-async def run(base: str) -> None:
+async def run(base: str, setup: str = "profiles") -> None:
     tl = Timeline()
-    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
     async with httpx.AsyncClient(base_url=base, timeout=30) as http:
         print("Static web app")
         for path in ("/", "/table/x", "/join/x/1"):
@@ -210,73 +214,177 @@ async def run(base: str) -> None:
         cfg = (await http.get("/api/config")).json()
         tl.check(cfg["dev_tools"] is True, "DEV_TOOLS is on (needed for dev turns)")
         print(f"  mock={cfg['mock']} ffmpeg={cfg['ffmpeg']}")
-
-        print("Phones: consent, interview, profile, ready")
-        sid = (await http.post("/api/sessions", json={"mode": "social", "quick": True})).json()["session_id"]
-        tl.mark("session created")
-        for seat in (1, 2):
-            r = await http.post(f"/api/sessions/{sid}/seats/{seat}/consent", json={"typed_name": NAMES[seat], "agreed": True})
-            tl.check(r.status_code == 200, f"seat {seat} consent")
-            r = await http.post(
-                f"/api/sessions/{sid}/seats/{seat}/answers",
-                data={"question_id": "q1"},
-                files={"audio": ("answer.wav", tiny_wav(), "audio/wav")},
-            )
-            tl.check(r.status_code == 200 and bool(r.json().get("transcript")), f"seat {seat} answer transcribed")
-            r = await http.post(f"/api/sessions/{sid}/seats/{seat}/profile")
-            tl.check(r.status_code == 200 and len(r.json()["items"]) > 0, f"seat {seat} profile built ({len(r.json()['items'])} items)")
-
-        async with connect(f"{ws_base}/ws/events/{sid}?role=table") as events_ws:
-            table = TableClient(events_ws, tl)
-            reader = asyncio.create_task(table.reader())
-            await table.wait(lambda e: e.get("type") == "session", 5, "session on connect")
-
-            for seat in (1, 2):
-                r = await http.post(f"/api/sessions/{sid}/seats/{seat}/ready")
-                tl.check(r.status_code == 200, f"seat {seat} ready")
-            await table.wait(lambda e: e.get("type") == "session" and e["session"]["phase"] == "calibrating", 10, "calibrating")
-            tl.mark("phase calibrating")
-
-            stop_audio = asyncio.Event()
-            async with connect(f"{ws_base}/ws/audio/{sid}") as audio_ws:
-                streamer = asyncio.create_task(stream_audio(audio_ws, table, stop_audio))
-                try:
-                    await drive_live(table, tl, http, sid)
-                finally:
-                    stop_audio.set()
-                    await streamer
-
-            print("End and trail")
-            r = await http.post(f"/api/sessions/{sid}/end")
-            tl.check(r.status_code == 200, "POST end")
-            await table.wait(lambda e: e.get("type") == "session" and e["session"]["phase"] == "ended", 5, "ended")
-            tl.mark("phase ended")
-            for seat, contact in ((1, "@maya.runs"), (2, "dev@example.com")):
-                r = await http.post(f"/api/sessions/{sid}/seats/{seat}/trail-optin", json={"share": True, "contact": contact})
-                tl.check(r.status_code == 200, f"seat {seat} opted in")
-            trails = {}
-            for seat in (1, 2):
-                deadline = time.monotonic() + 15
-                while True:
-                    r = await http.get(f"/api/sessions/{sid}/seats/{seat}/trail")
-                    if r.status_code == 200:
-                        trails[seat] = r.json()
-                        break
-                    if time.monotonic() > deadline:
-                        raise SmokeFailure(f"trail for seat {seat} never became ready ({r.status_code})")
-                    await asyncio.sleep(0.2)
-                t = trails[seat]
-                tl.mark(f"seat {seat} trail fetched (matched={t['matched']}, items={len(t['trail'])})")
-            tl.check(trails[1]["partner_contact"] == "dev@example.com" and trails[2]["partner_contact"] == "@maya.runs", "contacts swapped on a mutual yes")
-            tl.check(all(i["for_seat"] == s for s in (1, 2) for i in trails[s]["trail"]), "each phone sees only its own trail")
-            await table.wait(lambda e: e.get("type") == "wiped", 5, "wiped")
-            tl.mark("session wiped")
-            await asyncio.wait_for(reader, timeout=5)
-            tl.check(table.closed_code == 4404, f"Table socket closed with 4404 (got {table.closed_code})")
-        r = await http.get(f"/api/sessions/{sid}")
-        tl.check(r.status_code == 404, "GET session is 404 after the wipe")
-
+        if setup in ("profiles", "both"):
+            await run_profiles(base, http, tl)
+        if setup in ("quick", "both"):
+            await run_quick(base, http, tl)
     print_summary(tl)
+
+
+async def run_profiles(base: str, http: httpx.AsyncClient, tl: Timeline) -> None:
+    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+    print("With profiles. Phones: consent, interview, profile, ready")
+    sid = (await http.post("/api/sessions", json={"setup": "profiles", "mode": "social", "quick": True})).json()["session_id"]
+    tl.mark("session created")
+    for seat in (1, 2):
+        r = await http.post(f"/api/sessions/{sid}/seats/{seat}/consent", json={"typed_name": NAMES[seat], "agreed": True})
+        tl.check(r.status_code == 200, f"seat {seat} consent")
+        r = await http.post(
+            f"/api/sessions/{sid}/seats/{seat}/answers",
+            data={"question_id": "q1"},
+            files={"audio": ("answer.wav", tiny_wav(), "audio/wav")},
+        )
+        tl.check(r.status_code == 200 and bool(r.json().get("transcript")), f"seat {seat} answer transcribed")
+        r = await http.post(f"/api/sessions/{sid}/seats/{seat}/profile")
+        tl.check(r.status_code == 200 and len(r.json()["items"]) > 0, f"seat {seat} profile built ({len(r.json()['items'])} items)")
+
+    async with connect(f"{ws_base}/ws/events/{sid}?role=table") as events_ws:
+        table = TableClient(events_ws, tl)
+        reader = asyncio.create_task(table.reader())
+        await table.wait(lambda e: e.get("type") == "session", 5, "session on connect")
+
+        for seat in (1, 2):
+            r = await http.post(f"/api/sessions/{sid}/seats/{seat}/ready")
+            tl.check(r.status_code == 200, f"seat {seat} ready")
+        await table.wait(lambda e: e.get("type") == "session" and e["session"]["phase"] == "calibrating", 10, "calibrating")
+        tl.mark("phase calibrating")
+
+        stop_audio = asyncio.Event()
+        async with connect(f"{ws_base}/ws/audio/{sid}") as audio_ws:
+            streamer = asyncio.create_task(stream_audio(audio_ws, table, stop_audio))
+            try:
+                await drive_live(table, tl, http, sid)
+            finally:
+                stop_audio.set()
+                await streamer
+
+        print("End and trail")
+        r = await http.post(f"/api/sessions/{sid}/end")
+        tl.check(r.status_code == 200, "POST end")
+        await table.wait(lambda e: e.get("type") == "session" and e["session"]["phase"] == "ended", 5, "ended")
+        tl.mark("phase ended")
+        for seat, contact in ((1, "@maya.runs"), (2, "dev@example.com")):
+            r = await http.post(f"/api/sessions/{sid}/seats/{seat}/trail-optin", json={"share": True, "contact": contact})
+            tl.check(r.status_code == 200, f"seat {seat} opted in")
+        trails = {}
+        for seat in (1, 2):
+            deadline = time.monotonic() + 15
+            while True:
+                r = await http.get(f"/api/sessions/{sid}/seats/{seat}/trail")
+                if r.status_code == 200:
+                    trails[seat] = r.json()
+                    break
+                if time.monotonic() > deadline:
+                    raise SmokeFailure(f"trail for seat {seat} never became ready ({r.status_code})")
+                await asyncio.sleep(0.2)
+            t = trails[seat]
+            tl.mark(f"seat {seat} trail fetched (matched={t['matched']}, items={len(t['trail'])})")
+        tl.check(trails[1]["partner_contact"] == "dev@example.com" and trails[2]["partner_contact"] == "@maya.runs", "contacts swapped on a mutual yes")
+        tl.check(all(i["for_seat"] == s for s in (1, 2) for i in trails[s]["trail"]), "each phone sees only its own trail")
+        await table.wait(lambda e: e.get("type") == "wiped", 5, "wiped")
+        tl.mark("session wiped")
+        await asyncio.wait_for(reader, timeout=5)
+        tl.check(table.closed_code == 4404, f"Table socket closed with 4404 (got {table.closed_code})")
+    r = await http.get(f"/api/sessions/{sid}")
+    tl.check(r.status_code == 404, "GET session is 404 after the wipe")
+
+
+async def run_quick(base: str, http: httpx.AsyncClient, tl: Timeline) -> None:
+    """"Just talk": no phones, consent on the Table, live at once, the icebreaker, memory, the Table trail."""
+    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+    print("Just talk: create, phone links refused, We're both in")
+    created = (await http.post("/api/sessions", json={})).json()
+    sid = created["session_id"]
+    tl.check(created.get("setup") == "quick" and created.get("join_urls") == {}, "create defaults to Just talk (no join links)")
+    tl.mark("session created")
+    r = await http.post(f"/api/sessions/{sid}/seats/1/consent", json={"typed_name": "Maya", "agreed": True})
+    tl.check(r.status_code == 409, "a phone link is refused (this table doesn't need phones)")
+    async with connect(f"{ws_base}/ws/events/{sid}?role=table") as events_ws:
+        table = TableClient(events_ws, tl)
+        reader = asyncio.create_task(table.reader())
+        _, _, first = await table.wait(lambda e: e.get("type") == "session", 5, "session on connect")
+        tl.check(first["session"]["setup"] == "quick", "the Table sees setup quick")
+        r = await http.post(f"/api/sessions/{sid}/start", json={"names": {"1": "", "2": ""}})
+        tl.check(r.status_code == 200, "POST start (both consented on the Table, no names)")
+        r = await http.post(f"/api/sessions/{sid}/start", json={})
+        tl.check(r.status_code == 409, "a second start is refused")
+        summary = (await http.get(f"/api/sessions/{sid}")).json()
+        tl.check([summary["seats"][k]["name"] for k in ("1", "2")] == ["Person 1", "Person 2"], "blank names are Person 1 / Person 2")
+
+        stop_audio = asyncio.Event()
+        async with connect(f"{ws_base}/ws/audio/{sid}") as audio_ws:
+            streamer = asyncio.create_task(stream_audio(audio_ws, table, stop_audio))
+            try:
+                await drive_quick(table, tl, http, sid)
+            finally:
+                stop_audio.set()
+                await streamer
+
+        print("End, the Table's trail, Done")
+        r = await http.post(f"/api/sessions/{sid}/end")
+        tl.check(r.status_code == 200, "POST end")
+        _, _, trail_evt = await table.wait(lambda e: e.get("type") == "table_trail", 15, "table_trail")
+        items = trail_evt["trail"]["items"]
+        tl.mark(f"table trail ({len(items)} threads)")
+        tl.check(bool(items) and not any("Person" in i["text"] for i in items), "the trail has threads and never writes the labels")
+        r = await http.get(f"/api/sessions/{sid}/trail")
+        tl.check(r.status_code == 200 and r.json()["trail"] == trail_evt["trail"], "GET trail returns the same trail")
+        r = await http.delete(f"/api/sessions/{sid}")
+        tl.check(r.status_code == 200, "Done (DELETE) wipes the session")
+        await table.wait(lambda e: e.get("type") == "wiped", 5, "wiped")
+        await asyncio.wait_for(reader, timeout=5)
+        tl.check(table.closed_code == 4404, f"Table socket closed with 4404 (got {table.closed_code})")
+    r = await http.get(f"/api/sessions/{sid}")
+    tl.check(r.status_code == 404, "GET session is 404 after the wipe")
+
+
+async def drive_quick(table: TableClient, tl: Timeline, http: httpx.AsyncClient, sid: str) -> None:
+    print("Live at once, then the icebreaker")
+    idx, t_live, _ = await table.wait(lambda e: e.get("type") == "session" and e["session"]["phase"] == "live", 10, "live")
+    tl.mark("phase live")
+    idx, t_ice, ice = await table.wait(crumb_of("opener"), 10, "icebreaker", since=idx)
+    early = [e.get("type") for _, e in table.events[:idx] if e.get("type") in ("system_say", "calibration")]
+    tl.check(not early, "no say-hi prompts and no calibration events")
+    tl.mark(f"icebreaker {ice['crumb']['id']} {t_ice - t_live:.2f} s after going live ({ice['latency_ms']:.0f} ms)")
+    tl.check(2.6 <= t_ice - t_live <= 4.0, f"the icebreaker arrives about 3 s into the first silence ({t_ice - t_live:.2f} s)")
+    ice_end = await table.wait_played(ice["crumb"]["id"])
+
+    print("Lively conversation (memory is learned from it)")
+    await asyncio.sleep(1.0)
+    last_end = tl.now()
+    i = 0
+    while i < len(LIVELY_LINES) and (tl.now() - ice_end < LIVELY_MIN_S or i < 4):
+        seat, text = LIVELY_LINES[i]
+        duration = await dev_turn(table, seat, text)
+        await asyncio.sleep(duration)
+        last_end = tl.now()
+        i += 1
+        await asyncio.sleep(GAP_BETWEEN_TURNS_S if i < len(LIVELY_LINES) else 0)
+    tl.mark(f"{i} lively turns done; the last one ended at {last_end:.2f}s")
+    crumbs = [e for _, e in table.events[idx:] if e.get("type") == "crumb"]
+    tl.check(not crumbs, "no crumb while the conversation was lively")
+    memories = [e["memory"] for _, e in table.events[idx:] if e.get("type") == "memory"]
+    tl.check(bool(memories) and any(memories[-1].values()), f"memory learned live ({sum(map(len, memories[-1].values())) if memories else 0} items, no text printed)")
+
+    print("Silence")
+    idx2, t_crumb, steer = await table.wait(crumb_of(("steer", "switch")), 15, "automatic crumb", since=idx)
+    delay = t_crumb - last_end
+    tl.mark(f"{steer['crumb']['kind']} crumb {steer['crumb']['id']} {delay:.2f} s after the last turn (cache_hit={steer['cache_hit']})")
+    tl.check(steer["crumb"]["kind"] == "steer", "a lively conversation gets a steer, not a switch")
+    tl.check(2.6 <= delay <= 4.0, f"steer arrives about 3 s into the silence ({delay:.2f} s)")
+    tl.check("Person" not in steer["crumb"]["text"], "the labels are never spoken")
+    await table.wait_played(steer["crumb"]["id"])
+
+    print("Drop a crumb")
+    await asyncio.sleep(0.5)
+    t_spark = tl.mark("control spark")
+    await table.send({"type": "control", "action": "spark"})
+    _, t_manual, manual = await table.wait(crumb_of("manual"), 5, "manual crumb", since=idx2)
+    tl.mark(f"manual crumb {manual['crumb']['id']} (source={manual['crumb']['source']})")
+    tl.check(t_manual - t_spark <= 3.0, f"manual crumb within 3 s ({t_manual - t_spark:.2f} s)")
+    await table.wait_played(manual["crumb"]["id"])
+    metrics = (await http.get(f"/api/sessions/{sid}/metrics")).json()["metrics"]
+    tl.check(metrics["false_interruptions"] == 0, "no false interruptions")
 
 
 async def drive_live(table: TableClient, tl: Timeline, http: httpx.AsyncClient, sid: str) -> None:
@@ -317,7 +425,7 @@ async def drive_live(table: TableClient, tl: Timeline, http: httpx.AsyncClient, 
     delay = t_crumb - last_end
     tl.mark(f"{steer['crumb']['kind']} crumb {steer['crumb']['id']} {delay:.2f} s after the last turn ({steer['latency_ms']:.0f} ms gen, cache_hit={steer['cache_hit']})")
     tl.check(steer["crumb"]["kind"] == "steer", "a lively conversation gets a steer, not a switch")
-    tl.check(4.6 <= delay <= 7.0, f"steer arrives about 5 s into the silence ({delay:.2f} s)")
+    tl.check(2.6 <= delay <= 4.0, f"steer arrives about 3 s into the silence ({delay:.2f} s)")
     decision = next((e["decision"] for _, e in table.events[idx:idx2] if e.get("type") == "decision" and e["decision"]["action"] == "steer"), None)
     if decision:
         print(f"           why: {decision['reason']} (silence {decision['inputs'].get('silence_s')} s, staleness {decision['inputs'].get('staleness')})")
@@ -344,9 +452,10 @@ def print_summary(tl: Timeline) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", default="http://localhost:8000")
+    parser.add_argument("--setup", choices=("profiles", "quick", "both"), default="profiles")
     args = parser.parse_args()
     try:
-        asyncio.run(run(args.base.rstrip("/")))
+        asyncio.run(run(args.base.rstrip("/"), args.setup))
     except (SmokeFailure, httpx.HTTPError, OSError) as exc:
         print(f"\nSMOKE FAIL: {exc}")
         return 1

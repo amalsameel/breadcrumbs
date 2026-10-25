@@ -5,9 +5,10 @@ import { startCapture, type CaptureHandle, type VadReading } from "../audio/capt
 import { CrumbPlayer } from "../audio/player";
 import { captionStage, estimateSpeechS } from "../components/table/format";
 import { BARGE_IN_FADE_MS, PlaybackGate, speakLine } from "../components/table/playback";
-import { initialState, tableReducer, type TableState } from "../components/table/tableState";
+import { initialState, isQuick, tableReducer, type TableState } from "../components/table/tableState";
 import { api, ApiError } from "./api";
 import type { ClientEvent, ControlAction, Seat, ServerEvent } from "./types";
+import { vadMessage } from "./vadMessage";
 import { AudioSocket, EventSocket } from "./ws";
 
 export type {
@@ -25,6 +26,7 @@ export type {
 const FORBIDDEN_RETRY_MS = 3000;
 const PAUSE_SYNC_GRACE_MS = 1500;
 const ERROR_TOAST_MS = 6000;
+const TRAIL_POLL_MS = 2000;
 
 // ---- Mic errors -------------------------------------------------------------------
 
@@ -52,6 +54,11 @@ function micErrorMessage(err: unknown): string {
 
 export interface TableActions {
   startListening(): Promise<void>;
+  /**
+   * Quick setup ("Just talk"): "We're both in" records both consents from the laptop (optional names)
+   * and opens the mic in the same gesture. Throws with a user-facing message if the server refuses.
+   */
+  startQuick(names: Record<Seat, string>): Promise<void>;
   control(action: ControlAction): void;
   spark(): void;
   skip(): void;
@@ -221,6 +228,31 @@ export function useTable(sid: string): [TableView, TableActions] {
     };
   }, [sid, micOn, bothConsented, sessionOver, retryTick]);
 
+  // Quick setup: after End the laptop shows the trail. It arrives as `table_trail`; poll as a fallback
+  // (GET answers {trail: null} while it is still being written).
+  const quick = isQuick(state.session);
+  const awaitingTrail = quick && phase === "ended" && !state.tableTrail && !state.wiped && state.load !== "not_found";
+  useEffect(() => {
+    if (!awaitingTrail) return;
+    let cancelled = false;
+    const poll = () =>
+      api.tableTrail(sid).then(
+        (res) => {
+          if (!cancelled && res.trail) dispatch({ type: "server", event: { type: "table_trail", trail: res.trail }, at: performance.now() });
+        },
+        (err: unknown) => {
+          if (cancelled || !(err instanceof ApiError) || err.status !== 404) return;
+          dispatch({ type: "load_failed", notFound: true, message: err.message });
+        },
+      );
+    void poll();
+    const timer = window.setInterval(() => void poll(), TRAIL_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sid, awaitingTrail]);
+
   // Keep capture in sync with the server's listening state (covers a rejected toggle or a reconnect).
   // A local toggle wins for a short grace window while the server catches up.
   const listeningPaused = state.engine?.listening_paused ?? false;
@@ -261,7 +293,7 @@ export function useTable(sid: string): [TableView, TableActions] {
       // (barge-in, PRD 6.7). The chime and first 300 ms of the voice stay a grace (PRD 8.11.3).
       const levelDb = reading?.levelDb ?? 20 * Math.log10(Math.max(rms, 1e-9));
       const verdict = gate.observe({ active, levelDb, voiced: reading?.voiced ?? active }, now);
-      if (verdict.send) send({ type: "vad", active, rms });
+      if (verdict.send) send(vadMessage(active, rms, reading));
       if (verdict.fade) playerRef.current?.fadeOut(BARGE_IN_FADE_MS);
     },
     [send, gate],
@@ -313,6 +345,34 @@ export function useTable(sid: string): [TableView, TableActions] {
   const actions = useMemo<TableActions>(
     () => ({
       startListening,
+      startQuick: async (names) => {
+        // The mic opens inside this click (it unlocks playback too); nothing leaves the laptop until the
+        // server confirms both consents (onVad and the PCM uplink both wait for them).
+        const micStarting = startListening();
+        const clean = (n: string) => n.replace(/\s+/g, " ").trim().slice(0, 60);
+        const body: Partial<Record<"1" | "2", string>> = {};
+        if (clean(names[1])) body["1"] = clean(names[1]);
+        if (clean(names[2])) body["2"] = clean(names[2]);
+        try {
+          await api.start(sid, { names: body });
+        } catch (err) {
+          // 409 = already started (a second click or another tab): carry on with the server's state.
+          if (!(err instanceof ApiError && err.status === 409)) {
+            // No consent on record: close the mic again rather than leave it open on the lobby.
+            await micStarting;
+            captureRef.current?.stop();
+            captureRef.current = null;
+            dispatch({ type: "mic", mic: { status: "idle" } });
+            throw new Error(err instanceof Error ? `Couldn't start: ${err.message}` : "Couldn't start. Try again.");
+          }
+        }
+        try {
+          const session = await api.getSession(sid);
+          dispatch({ type: "server", event: { type: "session", session }, at: performance.now() });
+        } catch {
+          /* the events socket brings the new summary anyway */
+        }
+      },
       control,
       spark: () => control("spark"),
       skip: () => {

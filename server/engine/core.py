@@ -7,6 +7,7 @@ numeric inputs only, never transcript text.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -20,7 +21,7 @@ from config import (
     WILDCARD_MIN_GAP_S,
     Params,
 )
-from models import Crumb, CrumbKind, EnergyTag, HoldDecision, HoldKind, Mode, Turn
+from models import Crumb, CrumbKind, EnergyTag, HoldDecision, HoldKind, Mode, Setup, Turn
 from engine import staleness as stale_mod
 from engine.hold import (
     HOLD_CONFIDENCE_MIN,
@@ -43,6 +44,7 @@ from engine.policy import (
     evaluate,
     next_action,
     thresholds,
+    unanswered_switch_s,
 )
 from engine.state import (
     BOT_SPEECH_MAX_S,
@@ -50,15 +52,26 @@ from engine.state import (
     ECHO_MIN_WORDS,
     ECHO_REPLY_WORDS,
     ECHO_WINDOW_S,
+    SEAT_ACTIVE_MIN_FRAC,
+    SEAT_LEVEL_ALPHA,  # noqa: F401 - foreground constants, importable from engine.core
+    SEAT_LEVEL_MIN_SAMPLES,  # noqa: F401
     STUCK_TURN_S,
+    UPGRADABLE_REASONS,
+    VAD_EVIDENCE_FRAC,  # noqa: F401
     VAD_GRACE_S,
+    VADLOG_FRAMES,  # noqa: F401
     BotInterval,
     BotSpeech,
     Calibration,
     PauseTimer,
+    SeatLevel,
     TurnRecord,
     TurnTracker,
+    VadLog,
+    VadStats,
+    classify_turn,
     count_words,
+    vad_near,
     echo_overlap,
     echo_tail_words,
     is_backchannel,
@@ -75,11 +88,17 @@ AWAIT_PLAYBACK_S = 8.0  # dispatched crumb not reported playing by then (chime +
 ROUND_WARNING_GAP_S = 5.0  # the 1-minute warning leaves room to answer the previous crumb (no back to back)
 ROUND_WARNING_REASON = "One minute left in the round: time check crumb"
 NOISE_LATCH_CLEAR_S = 4.0  # VAD quiet this long: the next onset gets its own confirmation window again
+NOISE_RISE_DB = 6.0  # in a latched room, a voice this far above the noise floor is someone at the table
+# Foreground: a turn is judged on the VAD from this long before Muse reported its start (Muse lags the mic).
+MUSE_LOOKBACK_S = 1.0
+VAD_NEAR_WINDOW_S = 0.5  # "near right now" is judged on the latest frames of the current VAD stretch
+ENDPOINT_LAG_KEPT = 200
 BOT_LINES_KEPT = 8  # texts of the latest bot lines, for the echo check
 # Usage: the energy tagger is skipped while automatic crumbs stay blocked for at least this long (safety
 # pause, or the 10-minute rate cap): its topic and energy only steer automatic crumbs. A skipped tag is not
 # lost: the first committed turn once the block is shorter tags again, before the next automatic crumb.
 ENERGY_SKIP_BLOCKED_S = 60.0
+ICEBREAKER_REASON = "Nobody has spoken yet: a light icebreaker"
 
 
 @dataclass
@@ -107,10 +126,16 @@ def _percentile(values: list[float], q: float) -> float | None:
 
 
 class Engine:
-    def __init__(self, mode: Mode, names: dict[int, str], params: Params):
+    def __init__(self, mode: Mode, names: dict[int, str], params: Params, *, setup: Setup = "profiles"):
         self.mode: Mode = mode
         self.names: dict[int, str] = {int(k): v for k, v in names.items()}
         self.params = params
+        # "quick" ("Just talk"): no say-hi prompts and no opener. Live starts with the Table's audio, labels map
+        # to Person 1 / 2 by order of first appearance, and a light icebreaker goes out if nobody speaks.
+        self.setup: Setup = setup
+        self._quick = setup == "quick"
+        self._icebreaker_due = False  # quick: armed at go-live until someone at the table speaks
+        self._spoke = False  # quick: a seat turn has closed since go-live
 
         self._phase: EnginePhase = "calibrating"
         self._now = 0.0
@@ -133,13 +158,22 @@ class Engine:
         self._vad_active = False
         self._vad_human = False  # current VAD stretch already counted as human speech
         self._last_human_activity_at = -math.inf
-        # Background noise (PRD 8.3): local VAD only counts as speech while Muse confirms it, or for
-        # VAD_UNCONFIRMED_S after its onset. Once a stretch outlives that unconfirmed, the room is noisy:
-        # later onsets need Muse too, until Muse hears someone or the VAD rests for NOISE_LATCH_CLEAR_S.
+        # Background noise (PRD 8.3): local VAD never moves the pause anchor. An onset only defers a crumb,
+        # for VAD_DEFER_S (shared by bursts), or up to VAD_NEAR_MAX_S while it sounds like someone at the
+        # table. A stretch that outlives VAD_DEFER_S with no Muse turn marks the room noisy: later onsets
+        # stop deferring until a seat turn closes or the VAD rests for NOISE_LATCH_CLEAR_S.
         self._vad_since: float | None = None
+        self._stretch_since: float | None = None  # onset of the current VAD stretch
         self._vad_quiet_since = -math.inf
         self._muse_heard_at = -math.inf
         self._noise_latched = False
+        self._noise_db: float | None = None  # level of the noise that latched the room (its floor)
+        # Foreground: the VAD log and the seated level judge every Muse turn at speechEnd (classify_turn).
+        self._vadlog = VadLog()
+        self._seat_level = SeatLevel()
+        self._background_closed_at = -math.inf
+        self._background_turns = 0
+        self._endpoint_lag_ms: deque[float] = deque(maxlen=ENDPOINT_LAG_KEPT)
         self._bot_lines: dict[str, str] = {}  # speech id -> text of recent crumbs and sys_ lines (echo check)
 
         self._listening_paused = False
@@ -174,6 +208,11 @@ class Engine:
         """The round timer ran out (PRD 15.3): no crumb follows, so nothing is worth preparing."""
         return self._round_ended
 
+    @property
+    def safety_paused(self) -> bool:
+        """A distress phrase paused automatic crumbs for this session (PRD 15.3)."""
+        return self._auto_paused
+
     def round_left_s(self, now: float) -> float | None:
         """Seconds left in the round (None: the mode has no round timer or the session is not live)."""
         return self._round_remaining(now)
@@ -206,6 +245,8 @@ class Engine:
         self._touch(now)
         if self._phase == "ended":
             return []
+        if self._quick:
+            return self._begin_quick(now)
         return self._begin_calibration(now, resync=False)
 
     def on_muse_reconnect(self, now: float) -> list[Effect]:
@@ -241,7 +282,9 @@ class Engine:
             return []
         kind = evt.get("type")
         if kind == "speechStart":
-            return self._on_speech_start(self._turn_id(evt), now)
+            seat = evt.get("seat") if evt.get("dev") else None
+            return self._on_speech_start(self._turn_id(evt), now, dev=bool(evt.get("dev")),
+                                         dev_seat=seat if seat in (1, 2) else None)
         if kind == "transcript":
             return self._on_transcript(str(evt.get("transcript") or ""), now)
         if kind == "speaker":
@@ -260,11 +303,13 @@ class Engine:
         except (TypeError, ValueError):
             return -1
 
-    def _on_speech_start(self, muse_id: int, now: float) -> list[Effect]:
+    def _on_speech_start(self, muse_id: int, now: float, *, dev: bool = False, dev_seat: int | None = None) -> list[Effect]:
         rec, created = self._tracker.start(muse_id, now)
         if not created:
             return []
-        rec.turn.gap_before = self._gap_before(now)
+        rec.dev = dev
+        rec.dev_seat = dev_seat
+        rec.turn.gap_before = self._gap_before(rec, now)
         effects: list[Effect] = []
         if self._echo_lines(rec, now):
             # Muse transcribes our own voice (PRD 8.11): a turn that starts during a bot line, or within
@@ -275,14 +320,18 @@ class Engine:
             rec.suspect_at_start = self._bot.suspect(now, self._tail_s)
             return effects
         crumb_iv = self._bot.crumb_playing()
-        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_active:
-            # Local VAD hears the room too: a real voice, so fade the crumb now. A Muse speechStart alone
-            # during a crumb is usually the crumb's own echo (Muse reports it a few hundred ms late), so it
-            # stays provisional and local VAD decides barge-in (PRD 8.11, F19).
+        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_near(now):
+            # Local VAD hears a near voice too: a real person, so fade the crumb now. A Muse speechStart
+            # alone during a crumb is usually the crumb's own echo (Muse reports it a few hundred ms late)
+            # or a bystander, so it stays provisional and local VAD decides barge-in (PRD 8.11, F19).
             effects += self._barge_in(now, source="speechStart")
         elif self._bot.suspect(now, self._tail_s):
             rec.provisional = True  # may be our own voice: decided at speechEnd (PRD 8.11)
-        if not rec.provisional:
+        if not rec.provisional and (rec.dev or self._vad_near(now)):
+            # The Table mic hears someone near: act at once, as before (cancel a crumb being prepared, end
+            # holds). Otherwise the turn stays pending: it blocks crumbs while open but changes nothing else
+            # until speechEnd decides whether it was someone at the table (classify_turn).
+            rec.near_at_start = True
             self._muse_heard(now)
             effects += self._human_activity(now)
         return effects
@@ -307,13 +356,15 @@ class Engine:
         effects: list[Effect] = []
         crumb_iv = self._bot.crumb_playing()
         if (not closing and crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S
-                and self._vad_active):
-            # Words that are not the line, and the room is loud too: a real voice (barge-in as before).
+                and self._vad_near(now)):
+            # Words that are not the line, and a near voice in the room too: a real person (barge-in as before).
             rec.provisional = False
+            rec.near_at_start = True
             self._muse_heard(now)
             return self._barge_in(now, source="speechStart")
         if not rec.suspect_at_start:
             rec.provisional = False
+            rec.near_at_start = True
             self._muse_heard(now)
             effects += self._human_activity(now)
         return effects
@@ -328,9 +379,10 @@ class Engine:
         rec.echo = False
         rec.provisional = False
         rec.reply_after_echo = True
+        rec.near_at_start = True
         self._muse_heard(now)
         crumb_iv = self._bot.crumb_playing()
-        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_active:
+        if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S and self._vad_near(now):
             return self._barge_in(now, source="speechStart")  # cutting in while the line still plays
         return self._human_activity(now)
 
@@ -340,8 +392,8 @@ class Engine:
         while len(self._bot_lines) > BOT_LINES_KEPT:
             self._bot_lines.pop(next(iter(self._bot_lines)))
 
-    def _gap_before(self, now: float) -> float | None:
-        others_open = sum(1 for r in self._tracker.open_records()) > 1
+    def _gap_before(self, rec: TurnRecord, now: float) -> float | None:
+        others_open = any(r is not rec and r.near_at_start for r in self._tracker.open_records())
         if others_open:
             return 0.0
         if self._phase == "live":
@@ -363,8 +415,6 @@ class Engine:
             effects += self._echo_verdict(rec, now)
         elif rec.open and rec.echo:
             effects += self._echo_reply_check(rec, now)
-        elif rec.open and not rec.provisional:
-            self._muse_heard(now)  # Muse hears a person: local VAD activity right now is speech
         if rec.echo:
             return effects  # our own line coming back: not a caption for the people at the table
         return [{"type": "partial", "text": text, "label": rec.turn.label}] + effects
@@ -375,7 +425,8 @@ class Engine:
             return []
         rec.turn.label = label
         rec.turn.seat = self._calib.label_map.get(label)  # type: ignore[assignment]
-        if rec.is_human:
+        # By order of appearance, only a turn already judged a seat may take a free seat.
+        if rec.is_human and rec.fg != "background" and (not self._calib.ordering or rec.fg == "seat"):
             return self._observe_label(rec, now)
         return []
 
@@ -404,7 +455,9 @@ class Engine:
         return self._commit(rec, now)
 
     def _close(self, rec: TurnRecord, now: float) -> list[Effect]:
-        """speechEnd: decide human vs bot, restart the pause timer, arm a lexical hold, map the label."""
+        """speechEnd: decide bot vs human, then seat vs background (classify_turn). A seat turn restarts the
+        pause timer from the end of its voice, arms a lexical hold and maps the label; a background turn
+        changes nothing but a short settle."""
         self._tracker.mark_closed(rec)
         rec.turn.ended_at = now
         effects: list[Effect] = []
@@ -426,20 +479,89 @@ class Engine:
                 overlap_ratio=round(ratio, 3), duration_s=round(now - rec.turn.started_at, 2), turn_id=rec.turn.turn_id,
             ))
         else:
-            if rec.provisional:
-                rec.provisional = False
-                effects += self._human_activity(now)
-            self._muse_heard(now)
-            self._timer.reset(now)
-            self._tracker.last_human_end = now
-            if self._is_live_turn(rec.turn):
-                self._last_live_human_end = now
-            effects += self._arm_lexical_hold(rec, now, rec.pre_hold if rec.final is None else match_hold(rec.final, self.params.HOLD_TAIL_WORDS))
-            if rec.turn.label is not None:
-                effects += self._observe_label(rec, now)
+            stats = self._vadlog.stats(self._turn_window_start(rec), now)
+            rec.vad_stats = stats
+            fg, rec.fg_reason = self._classify(rec, stats)
+            rec.fg = fg
+            rec.upgradable = fg == "background" and rec.fg_reason in UPGRADABLE_REASONS
+            if fg == "seat":
+                effects += self._seat_turn(rec, now, stats)
+            else:
+                effects += self._background_turn(rec, now, stats)
         if rec.final is not None:
             effects += self._commit(rec, now)
         return effects
+
+    def _turn_window_start(self, rec: TurnRecord) -> float:
+        """The VAD over a turn starts up to MUSE_LOOKBACK_S before Muse's speechStart (Muse lags the mic),
+        at the first active frame in that look-back: the silence before the voice is not part of the turn."""
+        start = rec.turn.started_at
+        first = next((f.t for f in self._vadlog.window(start - MUSE_LOOKBACK_S, start) if f.active), None)
+        return first if first is not None else start
+
+    def _classify(self, rec: TurnRecord, stats: VadStats) -> tuple[Literal["seat", "background"], str]:
+        mapped = rec.turn.label is not None and rec.turn.label in self._calib.label_map
+        return classify_turn(rec, stats, self._seat_level, mapped, self._calib.complete, self.params,
+                             ordering=self._calib.ordering)
+
+    def _seat_turn(self, rec: TurnRecord, now: float, stats: VadStats, *, closed_at: float | None = None) -> list[Effect]:
+        """A turn by someone at the table: it counts as speech (if it was pending), and the pause starts at
+        the end of its voice (backdated from speechEnd by at most ENDPOINT_BACKDATE_MAX_S)."""
+        closed_at = now if closed_at is None else closed_at
+        effects: list[Effect] = []
+        rec.provisional = False
+        if not rec.near_at_start:
+            # Pending until now: its speech counts from when it started (a crumb decided after that start
+            # was meant for a silence that had already ended).
+            effects += self._human_activity(rec.turn.started_at)
+        self._muse_heard(closed_at)
+        self._noise_latched = False
+        self._noise_db = None
+        if self._quick and self._phase == "live":
+            self._spoke = True  # someone at the table spoke: no icebreaker from here on
+            self._icebreaker_due = False
+        if stats.evidence and stats.level_db is not None and stats.active_frac + EPS >= SEAT_ACTIVE_MIN_FRAC:
+            self._seat_level.observe(stats.level_db)
+        end_ref = self._voice_end(closed_at, stats)
+        self._timer.reset(end_ref)
+        self._tracker.last_human_end = end_ref
+        if self._is_live_turn(rec.turn):
+            self._last_live_human_end = end_ref
+        self._endpoint_lag_ms.append(max(0.0, closed_at - end_ref) * 1000.0)
+        effects += self._arm_lexical_hold(rec, now, rec.pre_hold if rec.final is None else match_hold(rec.final, self.params.HOLD_TAIL_WORDS))
+        if rec.turn.label is not None:
+            effects += self._observe_label(rec, now)
+        return effects
+
+    def _voice_end(self, closed_at: float, stats: VadStats) -> float:
+        """Where the pause after a seat turn starts: the end of voice the Table mic measured (Muse reports
+        speechEnd late), never more than ENDPOINT_BACKDATE_MAX_S before speechEnd. A near voice still on
+        at speechEnd keeps speechEnd; noise still on uses the last frame at the seated level."""
+        if self._vad_near(closed_at):
+            return closed_at
+        end = stats.voice_end_t
+        if self._vad_active and self._seat_level.known and self.params.BYSTANDER_GATING:
+            end = self._vadlog.last_at_or_above(
+                closed_at - self.params.ENDPOINT_BACKDATE_MAX_S - MUSE_LOOKBACK_S, closed_at,
+                self._seat_level.db - self.params.NEAR_MARGIN_DB,  # type: ignore[operator]
+            )
+        if end is None:
+            return closed_at
+        return min(closed_at, max(closed_at - self.params.ENDPOINT_BACKDATE_MAX_S, end))
+
+    def _background_turn(self, rec: TurnRecord, now: float, stats: VadStats) -> list[Effect]:
+        """Not someone at the table (a bystander, a far voice, an empty fragment): no timer reset, no
+        human activity, no hold, no label. It only blocked crumbs while open, plus a short settle."""
+        self._background_closed_at = now
+        self._background_turns += 1
+        return [self._decision(
+            "background_turn", f"Not someone at the table ({rec.fg_reason}): turn ignored", now,
+            turn_id=rec.turn.turn_id, duration_s=round(now - rec.turn.started_at, 2),
+            words=count_words(rec.best_text), active_frac=round(stats.active_frac, 2),
+            level_db=_r(stats.level_db, 1), seat_db=_r(self._seat_level.db, 1),
+            label_mapped=rec.turn.label is not None and rec.turn.label in self._calib.label_map,
+            cause=rec.fg_reason,
+        )]
 
     def _commit(self, rec: TurnRecord, now: float) -> list[Effect]:
         """speechComplete (or timeout): final text, turn features, staleness, holds, prefetch, energy."""
@@ -456,6 +578,27 @@ class Engine:
             return [self._turn_effect(rec)]
 
         effects: list[Effect] = []
+        if rec.fg == "background" and rec.upgradable and rec.vad_stats is not None:
+            # Judged on 0 words or a filler at speechEnd: the final transcript may say otherwise.
+            fg, reason = self._classify(rec, rec.vad_stats)
+            if fg == "seat":
+                rec.fg, rec.fg_reason, rec.upgradable = "seat", reason, False
+                self._background_turns = max(0, self._background_turns - 1)
+                effects += self._seat_turn(rec, now, rec.vad_stats, closed_at=t.ended_at)
+        if rec.fg == "background":
+            # Kept out of the conversation: no staleness, no hold check, no prefetch, no energy tag. The
+            # safety check still runs on every human voice (pausing too often is the safe failure).
+            t.background = True
+            effects = [self._turn_effect(rec)]
+            if not self._auto_paused and is_distress(text):
+                self._auto_paused = True
+                effects.append(self._decision(
+                    "safety_pause",
+                    "Possible distress detected: automatic crumbs paused for this session (manual Drop still works)",
+                    now, turn_id=t.turn_id,
+                ))
+                effects += self._drop_opener(now)
+            return effects
         if not self._auto_paused and is_distress(text):
             self._auto_paused = True
             effects.append(self._decision(
@@ -478,15 +621,20 @@ class Engine:
 
     def _maybe_tag_energy(self, now: float) -> list[Effect]:
         """Every ENERGY_EVERY_N_TURNS live turns, but only with new words since the last tag and while
-        an automatic crumb could still use the answer."""
+        an automatic crumb could still use the answer. "Just talk" learns its memory from this call, so
+        there only the safety pause stops it: under a rate cap it still runs, every 2 x N turns (the memory
+        keeps learning at no extra calls), and the context covers every turn since the last tag."""
         n = self.params.ENERGY_EVERY_N_TURNS
-        if n <= 0 or len(self._live_turns) - self._tagged_turns < n:
+        new_turns = len(self._live_turns) - self._tagged_turns
+        if n <= 0 or new_turns < n:
             return []
         words = sum(t.words for t in self._live_turns)
-        if words <= self._tagged_words or self.auto_blocked_for(now) >= ENERGY_SKIP_BLOCKED_S:
+        capped = self.auto_blocked_for(now) >= ENERGY_SKIP_BLOCKED_S
+        if words <= self._tagged_words or self._auto_paused or (capped and (not self._quick or new_turns < 2 * n)):
             return []
         self._tagged_turns, self._tagged_words = len(self._live_turns), words
-        return [{"type": "tag_energy", "context": self._context(ENERGY_CONTEXT_TURNS)}]
+        context_turns = max(ENERGY_CONTEXT_TURNS, min(new_turns, 2 * ENERGY_CONTEXT_TURNS))
+        return [{"type": "tag_energy", "context": self._context(context_turns)}]
 
     def _is_live_turn(self, turn: Turn) -> bool:
         return self._phase == "live" and self._live_at is not None and turn.started_at >= self._live_at
@@ -498,7 +646,7 @@ class Engine:
 
     def _silence_followed(self, rec: TurnRecord) -> bool:
         no_speech_since = self._last_human_activity_at <= rec.turn.ended_at + EPS
-        others_open = any(r is not rec and not r.provisional for r in self._tracker.open_records())
+        others_open = any(r is not rec and not r.provisional and r.near_at_start for r in self._tracker.open_records())
         return no_speech_since and not others_open
 
     def _arm_lexical_hold(self, rec: TurnRecord, now: float, kind: HoldKind | None) -> list[Effect]:
@@ -639,10 +787,16 @@ class Engine:
 
     # ------------------------------------------------------------------ inputs: VAD, TTS, controls
 
-    def on_vad(self, active: bool, rms: float, now: float) -> list[Effect]:
+    def on_vad(self, active: bool, rms: float, now: float, level_db: float | None = None,
+               quiet_ms: int | None = None) -> list[Effect]:
+        """A Table VAD frame (10 Hz). It never moves the pause anchor: an onset only defers crumbs
+        (`_vad_defers`), and only a near voice cancels a crumb being prepared or barges in."""
         self._touch(now)
         if self._phase == "ended" or self._listening_paused:
             return []  # mic stream stopped: frames are stale
+        if level_db is None:  # an older Table: the full-band RMS stands in for the speech-band level
+            level_db = 20.0 * math.log10(max(float(rms), 1e-6))
+        self._vadlog.add(now, bool(active), float(level_db), quiet_ms)
         was_active, self._vad_active = self._vad_active, bool(active)
         if not active:
             self._vad_human = False
@@ -650,19 +804,27 @@ class Engine:
                 self._vad_quiet_since = now
             return []
         if not was_active or self._vad_since is None:
+            self._stretch_since = now
             rested = now - self._vad_quiet_since + EPS >= NOISE_LATCH_CLEAR_S
             if rested:
                 self._noise_latched = False
-            # The confirmation window is kept through short releases: bursts of noise (nearby talk, dishes,
-            # a TV) share one, so they cannot each count as fresh speech and hold the timer forever. A new
-            # window opens after a quiet spell of NOISE_LATCH_CLEAR_S, or once Muse heard someone since.
+                self._noise_db = None
+            # The defer window is kept through short releases: bursts of noise (nearby talk, dishes, a TV)
+            # share one, so they cannot each defer the crumb afresh. A new window opens after a quiet spell
+            # of NOISE_LATCH_CLEAR_S, or once a seat turn closed since.
             if self._vad_since is None or rested or self._muse_heard_at > self._vad_since:
                 self._vad_since = now
+        if self._stretch_since is None:
+            self._stretch_since = now
         effects: list[Effect] = []
-        if not self._vad_speech(now):
-            # Unconfirmed past VAD_UNCONFIRMED_S: background noise, not a person. It no longer holds the
-            # pause timer, cancels crumbs, or barges in (issue: steady room noise froze every crumb).
+        if self._vad_age(now) + EPS >= self.params.VAD_DEFER_S and not self._muse_turn_open():
+            # Outlived the defer window with no Muse turn: background noise, not a person. Later onsets no
+            # longer defer crumbs, cancel them, or barge in (issue: room noise froze every crumb), unless
+            # they rise NOISE_RISE_DB above the noise floor measured here.
+            if not self._noise_latched:
+                self._noise_db = self._noise_floor(now)
             self._noise_latched = True
+        if not self._vad_near(now):
             return effects
         crumb_iv = self._bot.crumb_playing()
         if crumb_iv is not None and now - crumb_iv.start + EPS >= VAD_GRACE_S:
@@ -671,7 +833,6 @@ class Engine:
             return effects
         if self._bot.suspect(now, self._tail_s):
             return effects  # chime grace, bot speech or its tail: likely echo
-        self._timer.reset(now)
         if not self._vad_human:
             self._vad_human = True
             effects += self._human_activity(now)
@@ -737,13 +898,15 @@ class Engine:
                 self._timer.freeze(self.silence_s(now))
                 self._listening_paused = True
                 self._vad_active = self._vad_human = False
+                self._stretch_since = None
             return []
         if action == "resume_listening":
             if self._listening_paused:
                 self._listening_paused = False
                 self._vad_active = self._vad_human = False
-                self._vad_since = None
+                self._vad_since = self._stretch_since = None
                 self._noise_latched = False
+                self._noise_db = None
                 self._timer.unfreeze(now)
             return []
         return []  # end / xray are handled by the runner
@@ -800,11 +963,30 @@ class Engine:
         return (
             self._phase == "live"
             and self._pending is None
-            and not self._turn_open()
-            and not self._vad_speech(self._now)
+            and not self.dispatch_blocked(self._now)
             and not self._bot.playing
             and self._awaiting_playback(self._now) is None
         )
+
+    def dispatch_blocked(self, now: float) -> bool:
+        """Someone may be talking: an open (unreleased) Muse turn, a VAD onset that still defers, or the
+        settle after a background turn. The runner holds a generated crumb while this is true."""
+        return self._turn_open(now) or self._vad_defers(now) or self._settling(now)
+
+    def dispatch_timed_out(self, now: float, waited_s: float | None = None) -> list[Effect]:
+        """The runner held a generated crumb for its whole wait and dropped it: nothing was delivered. A
+        still-wanted request (manual, opener, warning) is re-queued; an automatic one leaves the rate cap."""
+        self._touch(now)
+        p = self._pending
+        if p is None:
+            return []
+        self._cancel_pending(requeue=True)
+        effects = self.crumb_cancelled(now)
+        effects.append(self._decision(
+            "dispatch_blocked", "Someone may be talking: crumb held back, then dropped", now,
+            kind=p.kind, waited_s=_r(waited_s), requeued=p.requeued,
+        ))
+        return effects
 
     def _awaiting_playback(self, now: float) -> str | None:
         """A crumb sent to the Table that has not reported playing yet (its chime is still on)."""
@@ -854,6 +1036,8 @@ class Engine:
         self._timer.reset(now)
         if crumb.kind == "opener":
             self._warmup_ref = now
+        if self._quick and not rec.cancelled:
+            self._icebreaker_due = False  # any crumb that reached the room breaks the ice
 
     def crumb_failed(self, now: float) -> None:
         self._touch(now)
@@ -879,6 +1063,11 @@ class Engine:
         if p is None or p.cancelled:
             return
         p.cancelled = True
+        if self._is_icebreaker(p.kind):
+            # Never re-queued: once someone at the table speaks it is not wanted, and if it was only noise
+            # the icebreaker is armed again and waits for the next T_LONG_S of silence.
+            self._icebreaker_due = not self._spoke
+            return
         if not requeue or p.auto:
             return
         p.requeued = True
@@ -890,6 +1079,7 @@ class Engine:
     def _drop_opener(self, now: float) -> list[Effect]:
         """PRD 15.3: the opener is automatic, so after a distress signal one still waiting for silence or
         being generated is dropped (a generating one is vetoed or faded like any cancelled crumb)."""
+        self._icebreaker_due = False
         queued = self._queued is not None and self._queued[0] == "opener"
         p = self._pending
         generating = p is not None and p.kind == "opener"
@@ -901,6 +1091,9 @@ class Engine:
         if not (queued or generating):
             return []
         return [self._decision("calibration", "Opening crumb skipped: automatic crumbs are paused", now, step="done")]
+
+    def _is_icebreaker(self, kind: CrumbKind) -> bool:
+        return self._quick and kind == "opener"
 
     def _take_back_requeue(self, p: _Pending) -> None:
         if p.round_warning:
@@ -920,6 +1113,7 @@ class Engine:
         effects += self._expire_hold(now)
         effects += self._deferred_hold_check(now)
         effects += self._calibration_fallback(now)
+        effects += self._icebreaker_check(now)
         effects += self._round_timer(now)
         effects += self._barge_in_check(now)
         effects += self._deliver_queued(now)
@@ -961,6 +1155,26 @@ class Engine:
         records = sorted(self._tracker.epoch_records(), key=lambda r: (r.turn.started_at, r.turn.turn_id))
         labels = [r.turn.label for r in records if r.is_human and r.turn.label is not None]
         return self._after_calibration_steps(self._calib.fallback(labels), now, fallback=True)
+
+    def _icebreaker_check(self, now: float) -> list[Effect]:
+        """Quick setup: nobody at the table has spoken since go-live and the silence reached T_LONG_S, so a
+        light icebreaker goes out (like the opener: no cooldowns, never while someone may be talking)."""
+        if not self._icebreaker_due or self._phase != "live":
+            return []
+        if self._spoke or self._auto_paused:
+            self._icebreaker_due = False
+            return []
+        if self._listening_paused or not self._can_deliver_now():
+            return []
+        hold = self._active_hold(now)
+        if hold is not None and hold.suppresses:
+            return []
+        th = effective_thresholds(thresholds(self.params, self.mode, self._staleness.gap_ref), hold.kind if hold else None)
+        if self.silence_s(now) + EPS < th.t_long:
+            return []
+        self._icebreaker_due = False
+        return self._deliver("opener", ICEBREAKER_REASON, now, auto=False,
+                             inputs={"silence_s": _r(self.silence_s(now)), "t_long": _r(th.t_long)})
 
     def _round_timer(self, now: float) -> list[Effect]:
         remaining = self._round_remaining(now)
@@ -1007,9 +1221,10 @@ class Engine:
         if crumb_iv is None or now - crumb_iv.start + EPS < VAD_GRACE_S:
             return []
         pre_existing = any(
-            not r.provisional and r.turn.started_at < crumb_iv.start for r in self._tracker.open_records()
+            not r.provisional and r.near_at_start and r.turn.started_at < crumb_iv.start
+            for r in self._tracker.open_records()
         )
-        if pre_existing or (self._vad_human and self._vad_speech(now)):
+        if pre_existing or (self._vad_human and self._vad_near(now)):
             return self._barge_in(now, source="talking at playback start")
         return []
 
@@ -1034,8 +1249,10 @@ class Engine:
             pass  # the hold classifier has not answered yet: this pause may be an intentional one
         elif out.action is not None:
             effects += self._deliver(out.action, out.reason, now, auto=True, inputs=self._inputs(now, inp))
-        elif (self._phase == "live" and out.band == "warming" and not answer_pending
+        elif (self._phase == "live" and out.band == "warming" and not inp.turn_active and not self._vad_near(now)
               and self._warming_prefetch_anchor != self._timer.anchor):
+            # Voiced even while a hold answer is pending or far noise runs: the band is short, and a late
+            # take would leave the steer to synthesize on the spot (one wasted take when a hold is confirmed).
             self._warming_prefetch_anchor = self._timer.anchor
             upcoming = self.next_auto_crumb(now)
             if upcoming is not None:
@@ -1057,7 +1274,7 @@ class Engine:
         inp = self._tick_inputs(now)
         th = effective_thresholds(inp.base, inp.hold)
         round_left = self._round_remaining(now)
-        for silence in (th.t_long, th.t_exc):
+        for silence in sorted({th.t_long, th.t_exc, unanswered_switch_s(th, self.params, inp.hold)}):
             wait = max(0.0, silence - inp.silence_s)
             if round_left is not None and wait + EPS >= round_left:
                 break  # the round is over by then: no automatic crumb
@@ -1111,10 +1328,11 @@ class Engine:
         return TickInputs(
             live=live,
             listening_paused=self._listening_paused,
-            seats_unmapped=not self._calib.complete,
+            # Quick setup: voices map as they appear, so crumbs never wait for both (one may stay quiet).
+            seats_unmapped=not self._calib.complete and not self._quick,
             auto_paused=self._auto_paused,
-            turn_active=self._turn_open(),
-            vad_active=self._vad_speech(now),
+            turn_active=self._turn_open(now) or self._settling(now),
+            vad_active=self._vad_defers(now),
             tts_playing=self._bot.playing or self._awaiting_playback(now) is not None,
             hold=hold.kind if hold is not None else None,
             silence_s=self.silence_s(now),
@@ -1198,14 +1416,15 @@ class Engine:
         ]
 
     def _human_activity(self, now: float) -> list[Effect]:
-        """Human speech: crumbs_this_silence resets, the quiet state ends, automatic holds release, and a
-        crumb still being generated is cancelled (PRD 8.1: it was meant for a silence that just ended)."""
-        self._last_human_activity_at = now
+        """Human speech that started at `now`: crumbs_this_silence resets, the quiet state ends, automatic
+        holds release, and a crumb decided before it that is still being generated is cancelled (PRD 8.1:
+        it was meant for a silence that just ended). A pending turn confirmed at speechEnd passes its start."""
+        self._last_human_activity_at = max(self._last_human_activity_at, now)
         self._crumbs_this_silence = 0
         self._quiet_announced = False
         effects: list[Effect] = []
         p = self._pending
-        if p is not None and not p.cancelled:
+        if p is not None and not p.cancelled and now + EPS >= p.decided_at:
             self._cancel_pending(requeue=True)
             effects.append(self._decision(
                 "barge_in", "Someone started talking while the crumb was being prepared: cancelling it", now,
@@ -1216,36 +1435,117 @@ class Engine:
         return effects
 
     def _human_talking(self) -> bool:
-        return self._human_turn_open() or (self._vad_human and self._vad_speech(self._now))
+        return self._human_turn_open() or self._vad_near(self._now)
 
     def _human_turn_open(self) -> bool:
-        return any(not r.provisional for r in self._tracker.open_records())
+        """A Muse turn is open that started with a near voice at the table (someone there is talking)."""
+        return any(not r.provisional and r.near_at_start for r in self._tracker.open_records())
 
-    def _turn_open(self) -> bool:
-        """A Muse turn is open (our own line echoed back by Muse does not count)."""
+    def _turn_open(self, now: float | None = None) -> bool:
+        """A Muse turn that blocks crumbs is open: not our own echo, and not released (_released)."""
+        now = self._now if now is None else now
+        return any(self._turn_blocks(r, now) for r in self._tracker.open_records())
+
+    def _muse_turn_open(self) -> bool:
         return any(not r.echo for r in self._tracker.open_records())
 
-    def _muse_heard(self, now: float) -> None:
-        """Muse heard a person: the local VAD activity around now is speech, not background noise."""
-        self._muse_heard_at = max(self._muse_heard_at, now)
-        self._noise_latched = False
+    def _turn_blocks(self, rec: TurnRecord, now: float) -> bool:
+        return not rec.echo and rec.fg != "background" and not self._released(rec, now)
 
-    def _vad_speech(self, now: float) -> bool:
-        """Local VAD activity that counts as speech: Muse confirms it (a human turn is open or was heard
-        within VAD_UNCONFIRMED_S), or the stretch is younger than that and the room is not known noisy."""
-        if not self._vad_active:
+    def _released(self, rec: TurnRecord, now: float) -> bool:
+        """A pending turn stops blocking crumbs when, after OPEN_TURN_MIN_S, the Table mic has heard no
+        near voice for OPEN_TURN_RELEASE_S (a bystander Muse keeps open, a TV). A near onset blocks again
+        at once (_vad_defers); a seat close still moves the anchor."""
+        p = self.params
+        if not p.BYSTANDER_GATING or rec.near_at_start or rec.dev:
             return False
-        if self._human_turn_open():
+        if now - rec.turn.started_at + EPS < p.OPEN_TURN_MIN_S:
+            return False
+        stats = self._vadlog.stats(now - p.OPEN_TURN_RELEASE_S, now)
+        if not stats.evidence:
+            return False  # during bot speech the Table holds frames back: no evidence, no release
+        if stats.active_frac <= EPS:
             return True
-        window = self.params.VAD_UNCONFIRMED_S
+        return self._seat_level.known and not vad_near(stats, self._seat_level, p)
+
+    def _settling(self, now: float) -> bool:
+        """Just after a background turn closed: Muse may have split one speaker's turn in two."""
+        return now - self._background_closed_at + EPS < self.params.BACKGROUND_SETTLE_S
+
+    def _muse_heard(self, now: float) -> None:
+        """A seat turn (or a near voice Muse confirmed): the VAD around now is someone at the table."""
+        self._muse_heard_at = max(self._muse_heard_at, now)
+
+    def _vad_age(self, now: float) -> float:
+        """Seconds since the defer window of the current VAD activity opened (bursts share one window)."""
         ref = self._muse_heard_at
         if not self._noise_latched and self._vad_since is not None:
             ref = max(ref, self._vad_since)
-        return now - ref + EPS < window
+        return now - ref
+
+    def _noise_floor(self, now: float) -> float | None:
+        """Level of the noise latching the room: the shared defer window before the current onset when that
+        onset is younger than VAD_DEFER_S (an earlier burst opened the window), else the last VAD_DEFER_S."""
+        since = self._stretch_since if self._stretch_since is not None else now
+        if self._vad_since is not None and now - since + EPS < self.params.VAD_DEFER_S:
+            return self._vadlog.stats(self._vad_since, since - 0.05).level_db
+        return self._vadlog.stats(now - self.params.VAD_DEFER_S, now).level_db
+
+    def _vad_near(self, now: float) -> bool:
+        """The VAD is on and sounds like someone at the table: its latest frames reach the seated level
+        (unknown level, or gating off: the room is not known noisy, or the voice rises above its noise
+        floor). In a latched room, a stretch at the floor with no Muse turn stops counting as near after
+        VAD_NEAR_MAX_S: steady noise close to the seats' level no longer freezes the pause or barges in."""
+        if not self._vad_active:
+            return False
+        since = self._stretch_since if self._stretch_since is not None else now
+        stats = self._vadlog.stats(max(since, now - VAD_NEAR_WINDOW_S), now)
+        above = (self._noise_db is not None and stats.level_db is not None
+                 and stats.level_db + EPS >= self._noise_db + NOISE_RISE_DB)
+        if not self._seat_level.known or not self.params.BYSTANDER_GATING:
+            if self._noise_latched and self._noise_db is not None:
+                return above and stats.active_frac + EPS >= self.params.NEAR_ACTIVE_FRAC
+            return not self._noise_latched
+        if (self._noise_latched and not above and not self._muse_turn_open()
+                and now - max(since, self._muse_heard_at) + EPS >= self.params.VAD_NEAR_MAX_S):
+            return False
+        return vad_near(stats, self._seat_level, self.params)
+
+    def _vad_defers(self, now: float) -> bool:
+        """A VAD onset defers crumbs (never resets the pause): for VAD_DEFER_S unless the room is known
+        noisy, and up to VAD_NEAR_MAX_S while it sounds near (Muse may be late to open the turn)."""
+        if not self._vad_active:
+            return False
+        near = self._vad_near(now)
+        if self._vad_age(now) + EPS < self.params.VAD_DEFER_S and (not self._noise_latched or near):
+            return True
+        since = self._stretch_since if self._stretch_since is not None else now
+        return near and now - since + EPS < self.params.VAD_NEAR_MAX_S
 
     # ------------------------------------------------------------------ calibration (PRD 6.5)
 
+    def _begin_quick(self, now: float) -> list[Effect]:
+        """Quick setup: live at once (no prompts, no opener). Labels map by order of first appearance; the
+        20 s warm-up runs from here, and the icebreaker waits for T_LONG_S of silence."""
+        self._calib.begin(now, resync=False, auto=True)
+        self._phase = "live"
+        self._live_at = now
+        self._warmup_ref = now
+        self._timer.reset(now)
+        self._icebreaker_due = not self._auto_paused
+        return [
+            self._decision("calibration", "Just talk: listening, voices map to Person 1 and 2 as they appear", now,
+                           step="auto"),
+            {"type": "live"},
+        ]
+
     def _begin_calibration(self, now: float, *, resync: bool) -> list[Effect]:
+        if self._quick:
+            # A new Muse session means new labels: they map again by order of appearance, with no prompts
+            # and without pausing automatic crumbs.
+            self._calib.begin(now, resync=True, auto=True)
+            return [self._decision("calibration", "Muse reconnected: voices map again as they appear", now,
+                                   step="auto", resync=True)]
         self._calib.begin(now, resync)
         if not resync:
             self._phase = "calibrating"
@@ -1273,12 +1573,29 @@ class Engine:
         ]
 
     def _observe_label(self, rec: TurnRecord, now: float) -> list[Effect]:
-        if not self._calib.active or rec.turn.label is None or rec.epoch != self._tracker.epoch:
+        if not (self._calib.active or self._calib.ordering) or rec.turn.label is None or rec.epoch != self._tracker.epoch:
             return []
-        return self._after_calibration_steps(self._calib.observe(rec.turn.label, rec.turn.started_at), now)
+        stats = rec.vad_stats
+        if not rec.dev:  # a dev turn has no voice behind it: it maps as typed
+            if count_words(rec.best_text) == 0:
+                return []  # an empty fragment is nobody's voice yet
+            if stats is not None and stats.evidence and stats.active_frac < self.params.FAR_ACTIVE_FRAC:
+                return []  # the Table mic barely heard it: a voice away from the table, never a seat
+        # Calibration turns are seat turns, so the ones that map also seed the seated level (_seat_turn).
+        steps = self._calib.observe(rec.turn.label, rec.turn.started_at, seat=rec.dev_seat)
+        return self._after_calibration_steps(steps, now)
 
     def _after_calibration_steps(self, steps: list[str], now: float, *, fallback: bool = False) -> list[Effect]:
         effects: list[Effect] = []
+        if self._quick:
+            # By order of appearance: no prompts and no phase change (live already). The X-ray reads the
+            # label map from the snapshot; the Table gets no `calibration` events in this setup.
+            for step in steps:
+                effects += self._backfill_seats()
+                person = "Person 1" if step == "seat1" else "Person 2"
+                effects.append(self._decision("calibration", f"{person} voice mapped (order of appearance)", now,
+                                              step=step, label_map=self.label_map))
+            return effects
         for step in steps:
             effects += self._backfill_seats()
             how = "15 s fallback, order of appearance" if fallback else "first new voice after the prompt"
@@ -1329,7 +1646,9 @@ class Engine:
         return self.params.TTS_TAIL_MS / 1000.0
 
     def silence_s(self, now: float) -> float:
-        running = not (self._turn_open() or self._vad_speech(now) or self._bot.playing)
+        """Seconds since the pause anchor. Reads 0 while the bot speaks or someone near is talking; it keeps
+        growing through bystander turns and far noise (they only block firing, see dispatch_blocked)."""
+        running = not (self._bot.playing or self._human_turn_open() or self._vad_near(now))
         return self._timer.silence(now, running)
 
     def _recompute_staleness(self, now: float) -> None:
@@ -1358,7 +1677,7 @@ class Engine:
         for rec in sorted(self._tracker.records(), key=lambda r: r.turn.started_at):
             t = rec.turn
             name = self._speaker_name(t)
-            if rec.committed and not t.dropped_as_bot and name and t.ended_at >= now - seconds and t.text:
+            if rec.committed and not t.dropped_as_bot and not t.background and name and t.ended_at >= now - seconds and t.text:
                 lines.append(f"{name}: {t.text}")
         return "\n".join(lines)
 
@@ -1415,7 +1734,11 @@ class Engine:
             "auto_paused": self._auto_paused,
             "turn_active": inp.turn_active,
             "vad_active": self._vad_active,
-            "noise_suspected": self._vad_active and not inp.vad_active,
+            "noise_suspected": self._vad_active and not inp.vad_active and not self._vad_near(now),
+            "defer": self._defer(now),
+            "foreground_open": self._human_turn_open(),
+            "seat_level_db": _r(self._seat_level.db, 1) if self._seat_level.known else None,
+            "background_turns": self._background_turns,
             "tts_playing": inp.tts_playing,
             "pending_delivery": inp.pending_delivery,
             "crumbs_this_silence": self._crumbs_this_silence,
@@ -1445,4 +1768,16 @@ class Engine:
             "false_interruptions": self._false_interruptions,
             "latency_ms_p50": _percentile(latencies, 0.50),
             "latency_ms_p95": _percentile(latencies, 0.95),
+            "endpoint_lag_ms_p50": _r(_percentile(list(self._endpoint_lag_ms), 0.50), 0),
+            "endpoint_lag_ms_p95": _r(_percentile(list(self._endpoint_lag_ms), 0.95), 0),
         }
+
+    def _defer(self, now: float) -> Literal["turn", "vad", "settle"] | None:
+        """Why a crumb would wait right now (X-ray "Defer" chip)."""
+        if self._turn_open(now):
+            return "turn"
+        if self._vad_defers(now):
+            return "vad"
+        if self._settling(now):
+            return "settle"
+        return None

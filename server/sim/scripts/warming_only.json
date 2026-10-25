@@ -2,6 +2,14 @@
   "name": "warming_only",
   "mode": "social",
   "description": "Lively, then a 4.5 s pause (warming band only), then speech: no crumb.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "turns": [
     {
       "seat": 1,

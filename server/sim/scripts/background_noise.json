@@ -1,7 +1,15 @@
 {
   "name": "background_noise",
   "mode": "social",
-  "description": "A fan keeps the local VAD active from 50 s on, with no Muse turn after the lively exchange ends at 53.9 s. Unconfirmed VAD stops counting as speech 2.5 s after Muse last heard someone, so a steer still fires about 5 s later (61.3 s), and the noise does not barge in on it.",
+  "description": "A fan keeps the local VAD active from 50 s on (-42 dB, well under the seated -30 dB), with no Muse turn after the lively exchange ends at 53.9 s. Local VAD never moves the pause anchor (it only defers a crumb for VAD_DEFER_S after the last seat turn), so the steer fires T_LONG_S after the last seat turn, at 58.9 s (it was 61.3 s when unconfirmed VAD still reset the timer), and the noise does not barge in on it. Pinned to the pre-3 s thresholds.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "noise": [
     {
       "start": 50.0,
@@ -86,8 +94,8 @@
       ],
       "action": "steer",
       "count": 1,
-      "at": 61.3,
-      "tolerance": 0.3
+      "at": 58.9,
+      "tolerance": 0.4
     },
     {
       "between": [

@@ -1,14 +1,12 @@
-// Top bar: wordmark with a small orb, the table's mode, the round countdown and quiet status pills
-// (connection, mic, speech service). Every status is spelled out in text, never color alone.
-import type { Mode } from "../../lib/types";
+// Top bar: wordmark with a small orb, the round countdown and quiet status pills (connection, mic,
+// speech service). Every status is spelled out in text, never color alone.
 import type { AudioLinkStatus, MicState, MuseStatus } from "../../lib/useTable";
 import type { SocketStatus } from "../../lib/ws";
 import { OrbDot } from "../CrumbOrb";
-import { formatClock, MODE_LABEL } from "./format";
+import { formatClock } from "./format";
 import { Badge } from "./primitives";
 
 interface TopBarProps {
-  mode: Mode | null;
   socket: SocketStatus;
   audioLink: AudioLinkStatus;
   mic: MicState;
@@ -21,7 +19,6 @@ interface TopBarProps {
 }
 
 export default function TopBar({
-  mode,
   socket,
   audioLink,
   mic,
@@ -39,7 +36,6 @@ export default function TopBar({
           <OrbDot palette="ember" className="size-6" />
           Breadcrumbs
         </span>
-        {mode && <Badge className="hidden sm:inline-flex">{MODE_LABEL[mode]}</Badge>}
         {mock && <Badge className="border-dashed">Mock mode</Badge>}
       </div>
 

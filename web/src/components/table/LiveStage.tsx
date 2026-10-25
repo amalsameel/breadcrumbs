@@ -18,7 +18,7 @@ import {
   micOnMessage,
 } from "./format";
 import { useNow } from "./hooks";
-import { isSpeaking, recapCrumb, visibleCrumb } from "./tableState";
+import { isQuick, isSpeaking, recapCrumb, visibleCrumb } from "./tableState";
 import { Icon } from "./Icon";
 import StartListening from "./StartListening";
 
@@ -30,9 +30,12 @@ interface LiveStageProps {
 
 export default function LiveStage({ view, names, onStartListening }: LiveStageProps) {
   const now = useNow(250);
-  // A reconnect re-maps the voices while the phase stays live: the spoken prompt is captioned here.
+  const quick = isQuick(view.session);
+  // A reconnect re-maps the voices while the phase stays live: the spoken prompt is captioned here. A
+  // quick table never calibrates, so any spoken system line there (an icebreaker) is captioned too.
   const resyncing = isResyncStep(view.calibrationStep);
-  const resyncLine = resyncing && view.systemLine && captionStage(view.systemLine, now) === "full" ? view.systemLine : null;
+  const resyncLine =
+    (resyncing || quick) && view.systemLine && captionStage(view.systemLine, now) === "full" ? view.systemLine : null;
   const crumb = resyncLine ? null : visibleCrumb(view.crumbs, now);
   const recap = resyncLine || crumb ? null : recapCrumb(view.crumbs, now);
   const last = view.crumbs.at(-1) ?? null;
@@ -44,6 +47,8 @@ export default function LiveStage({ view, names, onStartListening }: LiveStagePr
   // After a Table reload or a lost mic there is no capture: offer the same gesture again (PRD 14.1).
   const micOff = view.mic.status !== "on";
   const live = resyncLine ? resyncLine.text : crumb ? crumb.text : "";
+  // A quick table starts with no introductions: a gentle line until someone speaks or a crumb lands.
+  const showWelcome = quick && !resyncLine && view.crumbs.length === 0 && view.turns.length === 0 && orb.mode !== "paused";
 
   return (
     <div className="mx-auto flex w-full max-w-[1460px] flex-1 flex-col items-center justify-center px-4 py-6 sm:px-8">
@@ -78,6 +83,7 @@ export default function LiveStage({ view, names, onStartListening }: LiveStagePr
               dimmed={crumb.status === "interrupted"}
               crumb={crumb.crumb}
               names={names}
+              quick={quick}
               className={CAPTION_SLOT_ITEM}
             />
           ) : showQuietHint ? (
@@ -87,6 +93,8 @@ export default function LiveStage({ view, names, onStartListening }: LiveStagePr
             </Hint>
           ) : showSafety ? (
             <Hint key="safety">Breadcrumbs stepped back and will stay quiet. Drop a crumb if you want one.</Hint>
+          ) : showWelcome ? (
+            <Hint key="welcome">Just talk. If the conversation pauses, Breadcrumbs will offer something to pick up.</Hint>
           ) : recap ? (
             <motion.div
               key={`recap-${recap.id}`}

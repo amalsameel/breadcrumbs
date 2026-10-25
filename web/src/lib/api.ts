@@ -1,12 +1,15 @@
 // Typed REST client (PRD Section 13 + docs/CONTRACTS.md section 4). Same origin as the page.
 import type {
   AppConfig,
+  CreateSessionBody,
   CreateSessionResponse,
   InterviewQuestion,
   Mode,
   Profile,
   Seat,
   SessionSummary,
+  StartSessionBody,
+  Trail,
   TrailResponse,
 } from "./types";
 
@@ -42,8 +45,12 @@ const seatPath = (sid: string, seat: Seat) => `/api/sessions/${sid}/seats/${seat
 
 export const api = {
   config: () => request<AppConfig>("GET", "/api/config"),
-  createSession: (mode: Mode, quick: boolean) =>
-    request<CreateSessionResponse>("POST", "/api/sessions", { mode, quick }),
+  createSession: (body: CreateSessionBody) => request<CreateSessionResponse>("POST", "/api/sessions", body),
+  /** Quick setup: records both consents from the Table and starts the engine (409 if not quick or already started). */
+  start: (sid: string, body: StartSessionBody) =>
+    request<unknown>("POST", `/api/sessions/${sid}/start`, body),
+  /** Quick setup: the Table's trail once the session ends (null while it is still being written). */
+  tableTrail: (sid: string) => request<{ trail: Trail | null }>("GET", `/api/sessions/${sid}/trail`),
   getSession: (sid: string) => request<SessionSummary>("GET", `/api/sessions/${sid}`),
   consent: (sid: string, seat: Seat, typed_name: string, agreed: boolean) =>
     request<{ ok: boolean }>("POST", `${seatPath(sid, seat)}/consent`, { typed_name, agreed }),

@@ -232,6 +232,21 @@ describe("Vad detects speech", () => {
     assert.equal(typeof last.levelDb, "number");
   });
 
+  it("quietMs is 0 while the voice sustains and measures the time since it stopped at the falling edge", () => {
+    const noise = pink(12, 0.01, 11);
+    const voice = concat(new Float32Array(3 * FS), speechLike(6, 0.04), new Float32Array(3 * FS)); // voice ends at 9.0 s
+    const rs = run(mix(noise, voice));
+    assert.ok(rs.slice(0, 30).every((r) => r.quietMs === 0), "0 before any voice");
+    const midWord = rs.filter((r) => r.active && r.t > 3.5 && r.t < 4.3);
+    assert.ok(midWord.length > 0 && midWord.every((r) => r.quietMs === 0), "0 while sustaining");
+    const fallIdx = rs.findIndex((r, i) => i > 0 && rs[i - 1].active && !r.active && r.t > 9);
+    assert.ok(fallIdx > 0, "the stretch released");
+    const fall = rs[fallIdx];
+    const truth = (fall.t - 9.0) * 1000;
+    assert.ok(Math.abs(fall.quietMs - truth) <= 100, `quietMs ${fall.quietMs} vs ${truth.toFixed(0)} since the voice stopped`);
+    assert.ok(rs.at(-1).quietMs > fall.quietMs, "keeps counting while quiet");
+  });
+
   it("reset keeps the floor but clears the speech state", () => {
     const vad = new Vad();
     for (let t = 100; t <= 2000; t += 100) vad.update({ rms: 0.001, speech: 0.0008, zcr: 0.1, impulse: 2 }, t);

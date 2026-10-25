@@ -15,6 +15,8 @@ interface CrumbCaptionProps {
   dimmed?: boolean;
   crumb?: Crumb;
   names?: Record<Seat, string>;
+  /** A quick table (no profiles): the source line says what someone said, never "profile". */
+  quick?: boolean;
   /** Smaller type for calibration prompts. */
   size?: "hero" | "prompt";
   /** Placement from the caption slot (CAPTION_SLOT_ITEM stacks it over a leaving line). */
@@ -23,7 +25,16 @@ interface CrumbCaptionProps {
 
 const EASE_OUT: [number, number, number, number] = [0.22, 1, 0.36, 1];
 
-export default function CrumbCaption({ id, text, dimmed = false, crumb, names, size = "hero", className = "" }: CrumbCaptionProps) {
+export default function CrumbCaption({
+  id,
+  text,
+  dimmed = false,
+  crumb,
+  names,
+  quick = false,
+  size = "hero",
+  className = "",
+}: CrumbCaptionProps) {
   const reduce = useReducedMotion() ?? false;
   const words = wordsOf(text);
   const stagger = captionStaggerS(words.length);
@@ -63,13 +74,20 @@ export default function CrumbCaption({ id, text, dimmed = false, crumb, names, s
           </motion.span>
         ))}
       </blockquote>
-      {crumb && names && <SourceLine crumb={crumb} names={names} delayS={reduce ? 0 : 0.18} />}
+      {crumb && names && <SourceLine crumb={crumb} names={names} quick={quick} delayS={reduce ? 0 : 0.18} />}
     </motion.figure>
   );
 }
 
-function SourceLine({ crumb, names, delayS }: { crumb: Crumb; names: Record<Seat, string>; delayS: number }) {
-  const caption = sourceCaption(crumb, names);
+interface SourceLineProps {
+  crumb: Crumb;
+  names: Record<Seat, string>;
+  quick: boolean;
+  delayS: number;
+}
+
+function SourceLine({ crumb, names, quick, delayS }: SourceLineProps) {
+  const caption = sourceCaption(crumb, names, quick);
   return (
     <motion.figcaption
       className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-[15px] text-ink-muted"

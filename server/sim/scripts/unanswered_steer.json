@@ -2,6 +2,14 @@
   "name": "unanswered_steer",
   "mode": "social",
   "description": "Steer at 5 s, then nobody speaks: one switch 6.5 s after the steer ends, then nothing more (max 2 unanswered).",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "duration": 93.9,
   "turns": [
     {

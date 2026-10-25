@@ -2,7 +2,7 @@
 //   node --import ./src/components/table/__tests__/register.mjs --test src/components/table/__tests__/
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { initialState, isSpeaking, recapCrumb, tableReducer, visibleCrumb } from "../tableState.ts";
+import { initialState, isQuick, isSpeaking, quickStage, recapCrumb, tableReducer, visibleCrumb } from "../tableState.ts";
 
 const server = (state, event, at = 1000) => tableReducer(state, { type: "server", event, at });
 
@@ -326,5 +326,59 @@ describe("wipe", () => {
     const s = tableReducer(server(initialState, crumbEvent("c_1")), { type: "wiped" });
     assert.equal(s.wiped, true);
     assert.deepEqual(s.crumbs, []);
+  });
+});
+
+// ---- Quick setup ("Just talk"): consent on the laptop -> live -> trail on the laptop ----------------
+
+describe("quick setup flow", () => {
+  const quickSession = (phase, over = {}) => ({ ...session(phase), setup: "quick", ...over });
+  const memory = { 1: ["climbing"], 2: ["moved from Austin"], shared: ["coffee"], threads: ["the Lisbon trip"] };
+  const trail = { items: [{ for_seat: 1, text: "Ask Dev how the Lisbon trip went." }] };
+
+  it("isQuick is true only for setup quick (older servers without setup run the profiles flow)", () => {
+    assert.equal(isQuick(quickSession("lobby")), true);
+    assert.equal(isQuick({ ...session("lobby"), setup: "profiles" }), false);
+    assert.equal(isQuick(session("lobby")), false);
+    assert.equal(isQuick(null), false);
+  });
+
+  it("walks consent -> starting -> live -> trail_pending -> trail -> wiped", () => {
+    let s = initialState;
+    assert.equal(quickStage(s), "loading");
+    s = server(s, { type: "session", session: quickSession("lobby") });
+    assert.equal(quickStage(s), "consent");
+    // POST /start: both seats consent from the laptop; calibrating until the Table's audio arrives.
+    s = server(s, { type: "session", session: quickSession("calibrating") });
+    assert.equal(quickStage(s), "starting");
+    s = server(s, { type: "session", session: quickSession("live") });
+    assert.equal(quickStage(s), "live");
+    s = server(s, { type: "memory", memory });
+    assert.deepEqual(s.memory, memory);
+    s = server(s, { type: "session", session: quickSession("ended") });
+    assert.equal(quickStage(s), "trail_pending");
+    s = server(s, { type: "table_trail", trail });
+    assert.equal(quickStage(s), "trail");
+    assert.deepEqual(s.tableTrail, trail);
+    s = tableReducer(s, { type: "wiped" });
+    assert.equal(quickStage(s), "wiped");
+  });
+
+  it("a wipe (Done or the server's 10 minute timer) forgets the memory and the trail", () => {
+    let s = server(initialState, { type: "session", session: quickSession("ended") });
+    s = server(s, { type: "memory", memory });
+    s = server(s, { type: "table_trail", trail });
+    s = server(s, { type: "wiped" });
+    assert.equal(s.memory, null);
+    assert.equal(s.tableTrail, null);
+    assert.equal(s.session, null);
+    assert.equal(s.wiped, true);
+  });
+
+  it("a later memory event replaces the earlier one", () => {
+    let s = server(initialState, { type: "memory", memory });
+    const next = { ...memory, threads: [] };
+    s = server(s, { type: "memory", memory: next });
+    assert.deepEqual(s.memory.threads, []);
   });
 });

@@ -1,0 +1,150 @@
+{
+  "name": "bystander_fragments",
+  "mode": "social",
+  "description": "A bystander behind the table says 'yeah' / 'uh' every 3 s (Muse label C, too far for the Table VAD) while a fan runs at -42 dB from 50 s. Each fragment blocks crumbs only while open (plus a 0.4 s settle) and is judged background at speechEnd: it never restarts the pause. The steer lands 3.0 s after the last seat turn (56.9 s), once.",
+  "noise": [
+    {
+      "start": 50.0,
+      "end": 62.0,
+      "level_db": -42.0
+    }
+  ],
+  "duration": 62.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 49.2,
+      "end": 53.9
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "yeah",
+      "start": 54.5,
+      "end": 55.0,
+      "vad": false
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "uh",
+      "start": 57.5,
+      "end": 58.0,
+      "vad": false
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "yeah",
+      "start": 60.5,
+      "end": 61.0,
+      "vad": false
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "uh",
+      "start": 63.5,
+      "end": 64.0,
+      "vad": false
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "yeah",
+      "start": 66.5,
+      "end": 67.0,
+      "vad": false
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "uh",
+      "start": 69.5,
+      "end": 70.0,
+      "vad": false
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        53.9,
+        56.6
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        56.6,
+        62.0
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 56.9,
+      "tolerance": 0.3
+    },
+    {
+      "between": [
+        53.9,
+        62.0
+      ],
+      "action": "crumb_interrupted",
+      "count": 0
+    }
+  ]
+}

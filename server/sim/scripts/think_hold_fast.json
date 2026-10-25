@@ -1,0 +1,87 @@
+{
+  "name": "think_hold_fast",
+  "mode": "social",
+  "description": "The last turn ends 'hmm': a think hold doubles the thresholds, so nothing before 6.0 s into the pause, then a steer at 6.0 s (59.9 s).",
+  "duration": 62.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is a really good question about my training, hmm.",
+      "start": 49.2,
+      "end": 53.9
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        53.9,
+        59.7
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        59.7,
+        60.2
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 59.9,
+      "tolerance": 0.15
+    }
+  ]
+}

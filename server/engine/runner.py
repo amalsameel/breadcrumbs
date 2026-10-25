@@ -6,7 +6,9 @@ The Engine is pure; this runner is its async shell. It owns:
 - the prefetch schedule: text only, and only for slots that need it (a turn that opens a pause a steer could
   fill refreshes at once, other turns after a 1.5 s debounce, a 30 s check while live), plus lazy voicing
   of the one crumb the pause will get when it enters the warming band,
-- the Muse realtime client, bound to the Table's `/ws/audio` socket.
+- the Muse realtime client, bound to the Table's `/ws/audio` socket,
+- the live memory (ai/memory.py): what the conversation taught us about both people, updated from the
+  periodic energy tag call (no extra model call) and sent to the Table as `memory` events.
 
 Every AI call runs as a background task with a timeout, so the tick loop never waits on the network.
 Failures are logged with their exception type only (never transcript text) and never stop the loops.
@@ -23,13 +25,15 @@ from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 import config
-from ai.classifiers import classify_hold, tag_energy
+from ai.classifiers import classify_hold, tag_energy_memory
 from ai.crumbs import ConvoCtx, CrumbService, Delivery
+from ai.memory import Memory, recent
 from ai.profiles import allowed_items
+from ai.safety import off_limits_keywords
 from ai.elevenlabs import get_elevenlabs
 from ai.tts import SESSION_LINE_CACHE_ITEMS, SYSTEM_LINES, AudioCache, synthesize_cached
 from engine.core import Effect, Engine
-from models import Crumb, CrumbKind, EnergyTag, HoldDecision, OverlapSet
+from models import Crumb, CrumbKind, HoldDecision, OverlapSet
 from muse.realtime import MockMuseRealtime, MuseRealtimeClient, make_realtime_client
 from session_store import Session
 
@@ -44,7 +48,8 @@ DELIVER_TIMEOUT_S = 12.0  # CrumbService has its own 6 s text + 4 s TTS budgets;
 SAY_TIMEOUT_S = 5.0
 MAX_BOT_SPEECH_S = 30.0  # longer than any crumb or system line; an interval still open after this was lost
 CLASSIFY_TIMEOUT_S = 6.0
-ENERGY_TIMEOUT_S = 6.0
+ENERGY_TIMEOUT_S = 8.0  # the tag plus the memory items (a longer answer than the tag alone)
+KNOWN_ITEMS = 4  # newest memory items per list sent back to the tagger (the server de-duplicates anyway)
 PREFETCH_TIMEOUT_S = 40.0
 FULL_TRANSCRIPT_S = 1e9
 ROUND_WARNING_INSTRUCTION = "one minute left in the round"
@@ -52,9 +57,14 @@ DEV_TURN_ID_BASE = 100_000  # dev turns never collide with Muse turnIds
 DEV_SECONDS_PER_WORD = 0.3
 DEV_PARTIAL_EVERY_S = 0.5
 DEV_COMPLETE_DELAY_S = 0.2
+# A generated crumb waits while someone may be talking (a Muse turn not yet judged, a fresh VAD onset, the
+# settle after a background turn), up to this long, then it is dropped (its text goes back to the cache).
+DISPATCH_WAIT_S = 2.0
+DISPATCH_POLL_S = 0.1
 LABELS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 TURN_EVENT_FIELDS = (
     "turn_id", "seat", "label", "text", "words", "dropped_as_bot", "is_question", "is_backchannel", "hold",
+    "background",
 )
 KEYWORD_MIN_CHARS = 5
 KEYWORD_STOP = frozenset(
@@ -66,8 +76,10 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]+")
 
 
 def profile_keywords(names: dict[int, str], session: Session, limit: int = 40) -> list[str]:
-    """Muse `keywords`: both names, then distinctive words from each person's allowed profile items."""
-    words: list[str] = [n for n in names.values() if n]
+    """Muse `keywords`: both names, then distinctive words from each person's allowed profile items. A
+    placeholder name ("Person 1") is not a word anyone will say."""
+    anonymous = getattr(session, "anonymous", frozenset())
+    words: list[str] = [n for s, n in names.items() if n and s not in anonymous]
     for profile in session.profiles.values():
         for item in allowed_items(profile):
             for w in _WORD_RE.findall(item.text):
@@ -99,14 +111,18 @@ class SessionRunner:
         self.session = session
         self.clock = clock
         self.names = session.names
-        self.engine = Engine(session.mode, self.names, session.params)
+        setup = getattr(session, "setup", "profiles")  # test doubles may be bare namespaces
+        self.engine = Engine(session.mode, self.names, session.params, setup=setup)
         self.crumbs = crumbs or CrumbService(
             mode=session.mode,
             names=self.names,
             profiles=session.profiles,
             overlaps=overlaps,
             location=config.EVENT_LOCATION,
+            setup=setup,
+            anonymous=getattr(session, "anonymous", frozenset()),
         )
+        self.memory = Memory()  # learned from the conversation; wiped with the session, never logged
         self._on_round_end = on_round_end
         self._tasks: set[asyncio.Task] = set()
         self._loops: list[asyncio.Task] = []
@@ -165,6 +181,7 @@ class SessionRunner:
         if close is not None:
             close()
         self._lines.clear()
+        self.memory.clear()
 
     def end(self) -> None:
         """Session End: freeze the engine and send one last snapshot to the Table."""
@@ -177,7 +194,7 @@ class SessionRunner:
 
     def snapshot(self, now: float | None = None) -> dict:
         now = self.clock() if now is None else now
-        return {**self.engine.snapshot(now), "cached": self.crumbs.cached_summary(now)}
+        return {**self.engine.snapshot(now), "cached": self.crumbs.cached_summary(now), "memory": self.memory.to_dict()}
 
     # ------------------------------------------------------------------ loops
 
@@ -212,8 +229,8 @@ class SessionRunner:
 
     # ------------------------------------------------------------------ inputs from the Table
 
-    def on_vad(self, active: bool, rms: float) -> None:
-        self._apply(self.engine.on_vad(bool(active), float(rms), self.clock()))
+    def on_vad(self, active: bool, rms: float, level_db: float | None = None, quiet_ms: int | None = None) -> None:
+        self._apply(self.engine.on_vad(bool(active), float(rms), self.clock(), level_db=level_db, quiet_ms=quiet_ms))
 
     def on_tts_state(self, crumb_id: str, playing: bool) -> None:
         crumb_id = str(crumb_id)
@@ -371,16 +388,17 @@ class SessionRunner:
 
     async def _play_dev_turn(self, seat: int, text: str, duration: float, turn_id: int) -> None:
         words = text.split()
-        self._feed({"type": "speechStart", "turnId": turn_id})
+        # Dev turns have no VAD behind them: "dev" marks them as a seat (never judged as a bystander).
+        self._feed({"type": "speechStart", "turnId": turn_id, "dev": True, "seat": seat})
         steps = max(1, int(duration / DEV_PARTIAL_EVERY_S))
         for i in range(1, steps + 1):
             await asyncio.sleep(duration / steps)
             partial = " ".join(words[: max(1, round(len(words) * i / steps))])
             self._feed({"type": "transcript", "transcript": partial, "final": False})
         self._feed({"type": "speaker", "label": self._dev_label(seat)})
-        self._feed({"type": "speechEnd", "turnId": turn_id})
+        self._feed({"type": "speechEnd", "turnId": turn_id, "dev": True})
         await asyncio.sleep(DEV_COMPLETE_DELAY_S)
-        self._feed({"type": "speechComplete", "turnId": turn_id, "transcript": text})
+        self._feed({"type": "speechComplete", "turnId": turn_id, "transcript": text, "dev": True})
 
     def _feed(self, evt: dict) -> None:
         if not self._stopped:
@@ -465,6 +483,7 @@ class SessionRunner:
             depth_max=self.engine.depth_max(now),
             minutes_live=self.engine.minutes_live(now),
             instruction=instruction,
+            memory=None if self.memory.empty else self.memory.to_dict(),
         )
 
     async def _deliver(self, kind: CrumbKind, *, instruction: str | None = None) -> None:
@@ -493,6 +512,27 @@ class SessionRunner:
             log.info("crumb dropped (kind=%s, cancelled while generating)", kind)
             self._apply(self.engine.crumb_cancelled(now))
             return
+        # Someone may be talking (a Muse turn that is not judged yet, a fresh VAD onset, a background turn
+        # settling): hold the crumb until that clears, up to DISPATCH_WAIT_S. A seat turn in the meantime
+        # cancels it (above, re-checked each poll); a background one lets it go after the settle.
+        held_from = now
+        while self.engine.dispatch_blocked(now):
+            if now - held_from >= DISPATCH_WAIT_S - 1e-9:
+                log.info("crumb dropped (kind=%s, held %.1f s while someone may be talking)", kind, now - held_from)
+                self._apply(self.engine.dispatch_timed_out(now, waited_s=now - held_from))
+                restore = getattr(self.crumbs, "restore", None)
+                if restore is not None:
+                    restore(delivery)  # a ready text is not thrown away
+                return
+            await asyncio.sleep(DISPATCH_POLL_S)
+            now = self.clock()
+            if self._stopped or self.engine.phase == "ended":
+                self.engine.crumb_failed(now)
+                return
+            if self.engine.pending_cancelled:
+                log.info("crumb dropped (kind=%s, cancelled while held)", kind)
+                self._apply(self.engine.crumb_cancelled(now))
+                return
         self._dispatch(delivery, (now - started) * 1000.0, now)
 
     def _dispatch(self, delivery: Delivery, latency_ms: float, now: float) -> None:
@@ -553,9 +593,15 @@ class SessionRunner:
             self._apply(self.engine.apply_hold_decision(turn_id, decision, self.clock()))
 
     async def _tag_energy(self, context: str) -> None:
+        """The energy tag, and (from the same call) what these turns say about each person."""
         self._energy_busy = True
+        blocked = off_limits_keywords(self.session.profiles)
         try:
-            tag: EnergyTag = await asyncio.wait_for(tag_energy(context), timeout=ENERGY_TIMEOUT_S)
+            tag, delta = await asyncio.wait_for(
+                tag_energy_memory(context, names=self.names, known=recent(self.memory.to_dict(), KNOWN_ITEMS),
+                                  off_limits=blocked),
+                timeout=ENERGY_TIMEOUT_S,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -563,8 +609,12 @@ class SessionRunner:
             return
         finally:
             self._energy_busy = False
-        if not self._stopped:
-            self._apply(self.engine.apply_energy_tag(tag, self.clock()))
+        if self._stopped:
+            return
+        self._apply(self.engine.apply_energy_tag(tag, self.clock()))
+        if self.memory.merge(delta, blocked=blocked):
+            self.session.broadcast({"type": "memory", "memory": self.memory.to_dict()}, roles=("table",))
+            log.info("memory updated (%d items)", self.memory.count())
 
     # ------------------------------------------------------------------ prefetch (PRD 8.10)
 

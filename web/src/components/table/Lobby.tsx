@@ -1,11 +1,11 @@
-// Lobby + profiles phase (PRD 6.2, F1): a big headline, then one rounded showcase that holds the
-// table's mode, the two seat QR cards around the orb, the setup steps and the mic warm-up.
+// Lobby + profiles phase for the "With profiles" setup (PRD 6.2, F1): a big headline, then one rounded
+// showcase that holds the two seat QR cards around the orb, the setup steps and the mic warm-up.
 import { motion } from "framer-motion";
 import type { Seat, SessionSummary } from "../../lib/types";
 import type { MicState } from "../../lib/useTable";
-import CrumbOrb, { OrbDot } from "../CrumbOrb";
+import CrumbOrb from "../CrumbOrb";
 import SeatQr from "../SeatQr";
-import { isInsecureUrl, isLocalUrl, lobbyStep, micOnMessage, MODE_LABEL, MODE_PALETTE, MODES, type LobbyStep } from "./format";
+import { isInsecureUrl, isLocalUrl, lobbyStep, micOnMessage, type LobbyStep } from "./format";
 import { Icon } from "./Icon";
 import { SegmentTrack } from "./primitives";
 import StartListening from "./StartListening";
@@ -59,27 +59,6 @@ export default function Lobby({ session, joinUrls, mic, onStartListening }: Lobb
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.55, delay: 0.06, ease: EASE_OUT }}
       >
-        <div className="flex justify-center">
-          <SegmentTrack as="ul" label="Conversation mode" className="bg-bg-sunken/60">
-            {MODES.map((m) => {
-              const active = m === session.mode;
-              return (
-                <li
-                  key={m}
-                  aria-current={active ? "true" : undefined}
-                  className={`inline-flex min-h-10 items-center gap-2 rounded-full px-4 text-[15px] font-medium ${
-                    active ? "bg-bg-raised text-ink shadow-raised" : "text-ink-muted"
-                  }`}
-                >
-                  <OrbDot palette={MODE_PALETTE[m]} className="size-4" />
-                  {MODE_LABEL[m]}
-                  {active && <span className="sr-only">(this table)</span>}
-                </li>
-              );
-            })}
-          </SegmentTrack>
-        </div>
-
         <div className="grid items-center justify-items-center gap-6 md:grid-cols-2 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] lg:gap-8">
           <SeatQr seat={1} url={joinUrls[1]} summary={session.seats["1"]} />
           <figure className="order-first flex flex-col items-center gap-4 text-center md:col-span-2 lg:order-none lg:col-span-1 lg:w-[min(22vw,300px)]">

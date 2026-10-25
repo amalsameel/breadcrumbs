@@ -23,6 +23,11 @@ T = TypeVar("T", bound=BaseModel)
 THINKING_HEADROOM_TOKENS = 4000
 # Server-side refusal fallback (the scalar "default" form routes by refusal category).
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# Fast mode (research preview, Claude API only): the same model at up to 2.5x output speed, at premium
+# pricing. Asked only for the jobs in config.CLAUDE_FAST_JOBS (the crumb draft and the hold classifier);
+# a 429 retries once at standard speed, a 400/403 about speed turns it off for the process.
+FAST_BETA = "fast-mode-2026-02-01"
+FAST_MODELS = ("claude-opus-5-5", "claude-opus-5", "claude-opus-4-8")
 WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 2}
 
 
@@ -43,6 +48,11 @@ def _first_citation(message: Any) -> tuple[str | None, str | None]:
             if getattr(cite, "type", None) == "web_search_result_location" and getattr(cite, "url", None):
                 return cite.url, getattr(cite, "title", None)
     return None, None
+
+
+def _about_fast_mode(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "speed" in text or "fast" in text
 
 
 def _check_stop(message: Any) -> None:
@@ -72,6 +82,7 @@ class Claude:
         self._client = client
         self.timeout_s = timeout_s
         self.max_retries = max_retries
+        self._fast_off = False  # the account or model refused fast mode once: standard speed from then on
 
     @property
     def available(self) -> bool:
@@ -99,23 +110,47 @@ class Claude:
             body["system"] = system
         return body
 
-    async def json(self, *, system: str, user: str, schema: type[T], max_tokens: int, effort: str | None = None) -> T:
-        """Structured output validated into `schema` (SDK `parse` + `output_format`)."""
+    async def json(self, *, system: str, user: str, schema: type[T], max_tokens: int, effort: str | None = None,
+                   job: str | None = None) -> T:
+        """Structured output validated into `schema` (SDK `parse` + `output_format`). `job` names the caller
+        ("crumb", "hold", ...): latency-critical jobs ask for fast mode (config.CLAUDE_FAST_JOBS)."""
         started = time.monotonic()
+        body = self._common(system=system, user=user, max_tokens=max_tokens)
+        if job == "crumb" and config.CLAUDE_CRUMB_MODEL != config.CLAUDE_MODEL:
+            body["model"] = config.CLAUDE_CRUMB_MODEL  # the user's override for the crumb draft only
+        body["output_format"] = schema
+        body["output_config"] = {"effort": effort or self.effort}
         try:
-            message = await self._messages.parse(
-                **self._common(system=system, user=user, max_tokens=max_tokens),
-                output_format=schema,
-                output_config={"effort": effort or self.effort},
-            )
+            message = await self._parse(body, fast=self._fast_for(job, body["model"]))
         except Exception as exc:  # noqa: BLE001 - classified by the gateway, which falls back
             raise ClaudeError(f"json call failed: {type(exc).__name__}") from exc
         _check_stop(message)
         parsed = getattr(message, "parsed_output", None)
         if parsed is None:
             raise ClaudeError("no parsed output")
-        log.info("claude json %s ok in %.0f ms (req %s)", schema.__name__, (time.monotonic() - started) * 1000, message._request_id)
+        speed = getattr(getattr(message, "usage", None), "speed", None)
+        log.info("claude json %s ok in %.0f ms (speed %s, req %s)", schema.__name__, (time.monotonic() - started) * 1000,
+                 speed or "standard", message._request_id)
         return parsed
+
+    def _fast_for(self, job: str | None, model: str) -> bool:
+        return job is not None and job in config.CLAUDE_FAST_JOBS and not self._fast_off and model in FAST_MODELS
+
+    async def _parse(self, body: dict[str, Any], *, fast: bool) -> Any:
+        """`messages.parse`, in fast mode when asked; a fast-mode refusal falls back to standard speed once."""
+        if fast:
+            try:
+                return await self._messages.parse(**{**body, "betas": [*body["betas"], FAST_BETA]}, speed="fast")
+            except Exception as exc:  # noqa: BLE001
+                status = getattr(exc, "status_code", None)
+                if status == 429:  # fast mode has its own rate limit: this call goes at standard speed
+                    log.info("claude fast mode rate limited (429); retrying at standard speed")
+                elif status in (400, 403) and _about_fast_mode(exc):
+                    self._fast_off = True
+                    log.warning("claude fast mode unavailable (%s %s); standard speed from now on", status, type(exc).__name__)
+                else:
+                    raise
+        return await self._messages.parse(**body)
 
     async def text(self, *, system: str | None, user: str, max_tokens: int, effort: str | None = None) -> str:
         try:

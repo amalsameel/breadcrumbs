@@ -306,8 +306,9 @@ def test_steer_wanted_only_when_a_steer_could_fire_in_the_coming_pause():
     assert e.steer_wanted(end)
     nxt = e.next_auto_crumb(end)
     assert nxt is not None and nxt[0] == "steer" and abs(nxt[1] - e.params.T_LONG_S) < 0.05
+    e.on_vad(True, 0.05, end + 0.3)  # someone at the table already talks again: the pause has not started
     e.on_muse_event({"type": "speechStart", "turnId": 90}, end + 0.3)
-    assert not e.steer_wanted(end + 0.4)  # someone already talks again: the pause has not started
+    assert not e.steer_wanted(end + 0.4)
 
 
 def test_warming_band_asks_to_voice_exactly_the_crumb_the_pause_gets():

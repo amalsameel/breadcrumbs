@@ -1,20 +1,5 @@
 // Pure helpers for the Table screen: names, captions, durations and orb state derivation.
-import type { Crumb, EngineSnapshot, Mode, Phase, Seat, SeatKey, SessionSummary } from "../../lib/types";
-
-export const MODE_LABEL: Record<Mode, string> = {
-  social: "Social",
-  networking: "Networking",
-  speed_dating: "Speed dating",
-};
-
-/** Each mode's orb palette (matches the Home screen's mode cards). */
-export const MODE_PALETTE: Record<Mode, "ember" | "cocoa" | "lilac"> = {
-  social: "ember",
-  networking: "cocoa",
-  speed_dating: "lilac",
-};
-
-export const MODES: Mode[] = ["social", "networking", "speed_dating"];
+import type { Crumb, EngineSnapshot, Phase, Seat, SeatKey, SessionSummary } from "../../lib/types";
 
 export type LobbyStep = 1 | 2 | 3;
 
@@ -36,15 +21,19 @@ export function seatNames(session: SessionSummary | null): Record<Seat, string> 
   return { 1: seatName(session, 1), 2: seatName(session, 2) };
 }
 
-/** The subtle "where did this come from" line under a crumb (PRD 6.7). */
-export function sourceCaption(crumb: Crumb, names: Record<Seat, string>): string {
+/**
+ * The subtle "where did this come from" line under a crumb (PRD 6.7). A quick table has no profiles:
+ * what it knows about each person was said out loud, so it never claims a profile.
+ */
+export function sourceCaption(crumb: Crumb, names: Record<Seat, string>, quick = false): string {
+  if (quick && crumb.kind === "opener") return "to get you started"; // the icebreaker: a greeting, not a source
   switch (crumb.source) {
     case "overlap":
-      return "from something you both shared";
+      return quick ? "from something you both said" : "from something you both shared";
     case "profile_seat1":
-      return `from ${names[1]}'s profile`;
+      return quick ? `from something ${names[1]} said` : `from ${names[1]}'s profile`;
     case "profile_seat2":
-      return `from ${names[2]}'s profile`;
+      return quick ? `from something ${names[2]} said` : `from ${names[2]}'s profile`;
     case "conversation":
       return "from your conversation";
     case "outside":

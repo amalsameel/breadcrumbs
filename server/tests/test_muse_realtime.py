@@ -451,3 +451,54 @@ async def test_flushed_backlog_is_paced_to_real_time() -> None:
     assert len(fake.binary) == frames and client.dropped_frames == 0
     assert max_lead_s(fake.binary_at) <= 0.5 + 0.1
     assert "error" not in rec.status_names
+
+
+# --- diagnostics: numbers only ------------------------------------------------------------------------
+
+
+class _Msgs:
+    def __init__(self, msgs: list[str]) -> None:
+        self.msgs = msgs
+
+    def __aiter__(self):  # noqa: ANN204
+        async def gen():  # noqa: ANN202
+            for m in self.msgs:
+                yield m
+        return gen()
+
+
+async def test_error_event_log_carries_the_backlog_as_numbers(caplog: pytest.LogCaptureFixture) -> None:
+    async def on_event(evt: dict) -> None:
+        return None
+
+    client = MuseRealtimeClient(on_event, ["Maya"], api_key="k")
+    for _ in range(QUEUE_MAXSIZE + 3):
+        client.push_audio(FRAME)
+    client._pacer.lead_s = 1.25
+    caplog.set_level("WARNING", logger="breadcrumbs.muse")
+    await client._recv_loop(_Msgs([json.dumps({"type": "error", "message": "Ingress audio slower than real-time"})]))
+    line = next(r for r in caplog.records if "muse error event" in r.getMessage())
+    assert line.args[1:] == (QUEUE_MAXSIZE, 3, 1.25)
+    assert all(isinstance(a, (int, float)) for a in line.args[1:])
+    assert len(str(line.args[0])) <= 200
+
+
+def test_dropped_frames_are_logged_at_most_once_a_minute(caplog: pytest.LogCaptureFixture, monkeypatch) -> None:
+    async def on_event(evt: dict) -> None:
+        return None
+
+    client = MuseRealtimeClient(on_event, [], api_key="k")
+    caplog.set_level("INFO", logger="breadcrumbs.muse")
+    now = [1000.0]
+    monkeypatch.setattr(realtime.time, "monotonic", lambda: now[0])
+    client._log_drops()
+    assert not [r for r in caplog.records if "dropped" in r.getMessage()]  # nothing dropped: no line
+    client._queue.dropped = 5
+    client._log_drops()
+    client._queue.dropped = 9
+    now[0] += 30.0
+    client._log_drops()  # within the minute: no second line
+    now[0] += 31.0
+    client._log_drops()
+    lines = [r for r in caplog.records if "frames dropped" in r.getMessage()]
+    assert [r.args[0] for r in lines] == [5, 9]

@@ -43,6 +43,11 @@ MUSE_SPARK_MODEL = "muse-spark-1.3"
 # Claude is the first text provider when ANTHROPIC_API_KEY is set (Gemini, then Muse Spark, are fallbacks).
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-5-5")
 CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "low")  # live path: fast, short crumbs
+# Latency-critical jobs (the crumb draft and the hold classifier) ask for Opus fast mode (same model, faster
+# output); every other job stays at standard speed. Empty disables it. Falls back to standard on refusal.
+CLAUDE_FAST_JOBS = frozenset(j.strip() for j in os.environ.get("CLAUDE_FAST_JOBS", "crumb,hold").split(",") if j.strip())
+# An override for the crumb draft model only (the user's choice; the default is CLAUDE_MODEL).
+CLAUDE_CRUMB_MODEL = os.environ.get("CLAUDE_CRUMB_MODEL", "").strip() or CLAUDE_MODEL
 # Crumb voice: ElevenLabs first when ELEVENLABS_API_KEY is set, then Gemini TTS, else the Table's browser voice.
 ELEVENLABS_API_BASE = "https://api.elevenlabs.io"
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()  # empty = the built-in default voice
@@ -59,9 +64,10 @@ BASELINE_TURNS = 10
 BASELINE_SECONDS = 180
 DEFAULT_GAP_S = 1.2
 GAP_CLAMP = (0.4, 2.5)
-T_NORMAL_S = 3.0  # normal pause: never intervene below this
-T_LONG_S = 5.0  # unusually long pause: steer (or switch if stale)
-T_EXC_S = 6.5  # exceptionally long pause: context switch (tune within 6.0 to 7.0)
+T_NORMAL_S = 1.5  # normal pause: never intervene below this (the orb starts to glow here)
+T_LONG_S = 3.0  # unusually long pause: steer (or switch if stale)
+T_EXC_S = 4.5  # exceptionally long pause: context switch
+UNANSWERED_SWITCH_S = 6.0  # follow-up switch after a crumb nobody answered (at least T_EXC_S)
 ADAPTIVE_THRESHOLDS = False  # Section 8.4 optional tuning
 MODE_MULTIPLIER = {"social": 1.0, "networking": 1.0, "speed_dating": 1.0}
 STALE_SWITCH = 0.60
@@ -107,6 +113,9 @@ TONE = {
 }
 
 
+RENAMED_PARAMS = {"VAD_UNCONFIRMED_S": "VAD_DEFER_S"}  # old X-ray keys still tune their replacement
+
+
 @dataclass
 class Params:
     """Live-tunable engine parameters (one instance per session; X-ray can PATCH them)."""
@@ -131,9 +140,24 @@ class Params:
     MAX_CRUMBS_PER_10_MIN: int = MAX_CRUMBS_PER_10_MIN
     TTS_TAIL_MS: int = TTS_TAIL_MS
     WILDCARD_ENABLED: bool = False  # F22, off by default
-    # Background noise: local VAD activity that Muse has not confirmed as a speech turn within this many
-    # seconds stops counting as speech (it no longer freezes the pause timer).
-    VAD_UNCONFIRMED_S: float = 2.5
+    UNANSWERED_SWITCH_S: float = UNANSWERED_SWITCH_S
+    # Background noise: a local VAD onset only defers a crumb (it never restarts the pause): for this many
+    # seconds, or up to VAD_NEAR_MAX_S while it sounds like someone at the table (covers Muse lag).
+    VAD_DEFER_S: float = 1.5
+    VAD_NEAR_MAX_S: float = 4.0
+    # Bystanders: each Muse turn is judged at speechEnd from its label, words and the Table VAD over it.
+    # Only a seat turn restarts the pause timer and counts as conversation; False treats every turn as a seat.
+    BYSTANDER_GATING: bool = True
+    NEAR_ACTIVE_FRAC: float = 0.35  # VAD coverage of a near voice
+    FAR_ACTIVE_FRAC: float = 0.15  # below this coverage a voice is far
+    NEAR_MARGIN_DB: float = 8.0  # near: level at least the seated level minus this
+    FAR_MARGIN_DB: float = 12.0  # far: level below the seated level minus this
+    FILLER_MAX_WORDS: int = 1  # a seat-label "uh" the Table mic did not hear as near is background
+    DRIFT_MIN_WORDS: int = 1  # an unmapped label counts as a seat only when near, with this many words
+    OPEN_TURN_MIN_S: float = 2.5  # an open turn the Table mic does not hear stops blocking after this long
+    OPEN_TURN_RELEASE_S: float = 2.0  # ... once there was no near voice at the table for this long
+    BACKGROUND_SETTLE_S: float = 0.4  # after a background turn closes (Muse may split one speaker's turn)
+    ENDPOINT_BACKDATE_MAX_S: float = 1.2  # the pause starts at the end of voice, at most this before speechEnd
     # Self-hearing by text: a Muse turn during or just after bot speech whose words overlap the line being
     # spoken by at least this fraction is the bot's own echo (no barge-in, never a human turn).
     ECHO_TEXT_OVERLAP: float = 0.5
@@ -142,7 +166,7 @@ class Params:
     # makes the call pointless. While that answer is out, automatic crumbs wait for it up to this many
     # seconds past the long threshold, so the classifier keeps the same window as when it was asked at
     # the commit. A lexical hold hit is classified at once, as before.
-    HOLD_CHECK_SILENCE_S: float = 1.0
+    HOLD_CHECK_SILENCE_S: float = 0.8
     HOLD_MAX_S: dict = field(default_factory=lambda: dict(HOLD_MAX_S))
     STALENESS_WEIGHTS: dict = field(default_factory=lambda: dict(STALENESS_WEIGHTS))
 
@@ -153,6 +177,7 @@ class Params:
         """Apply a partial update from the X-ray panel, coercing to each field's type."""
         names = {f.name: f for f in fields(self)}
         for key, value in changes.items():
+            key = RENAMED_PARAMS.get(key, key)
             if key not in names:
                 continue
             current = getattr(self, key)

@@ -1,7 +1,15 @@
 {
   "name": "bursty_noise",
   "mode": "social",
-  "description": "Noise in bursts (2.0 s on, 0.6 s off, like nearby talk or dishes) from 50 s on, with no Muse turn after the exchange ends at 53.9 s. The bursts share one confirmation window instead of each getting a fresh 2.5 s: the burst that starts at 55.2 s, right after Muse last heard someone, still counts (it could be the same person), then the room is marked noisy and a steer fires at 62.1 s (57.2 + 5.0 - 0.1), without barging in. Before the fix no crumb ever fired.",
+  "description": "Noise in bursts (2.0 s on, 0.6 s off, like nearby talk or dishes, -42 dB) from 50 s on, with no Muse turn after the exchange ends at 53.9 s. The bursts never move the pause anchor and share one defer window, so the steer fires T_LONG_S after the last seat turn, at 58.9 s (62.1 s when unconfirmed VAD still reset the timer; before the first fix no crumb ever fired), without barging in. Pinned to the pre-3 s thresholds.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "noise": [
     {
       "start": 50.0,
@@ -122,8 +130,8 @@
       ],
       "action": "steer",
       "count": 1,
-      "at": 62.1,
-      "tolerance": 0.3
+      "at": 58.9,
+      "tolerance": 0.4
     },
     {
       "between": [

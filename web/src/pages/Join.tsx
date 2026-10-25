@@ -21,11 +21,10 @@ import {
 import type { LocalProgress, StepKind } from "../components/phone/flow";
 import { InterviewStep } from "../components/phone/InterviewStep";
 import { PhoneScreen, StepHeading } from "../components/phone/PhoneScreen";
-import { GoneStep, LiveStep, WaitingStep } from "../components/phone/QuietSteps";
+import { GoneStep, LiveStep, NoPhonesStep, WaitingStep } from "../components/phone/QuietSteps";
 import { ReviewStep } from "../components/phone/ReviewStep";
 import { useSeatSession } from "../components/phone/useSeatSession";
 import { Button } from "../components/ui/Button";
-import { MODE_COPY } from "../components/ui/modes";
 import { Spinner } from "../components/ui/Spinner";
 import { api, ApiError } from "../lib/api";
 import type { InterviewQuestion, Profile, Seat, SessionSummary, TrailResponse } from "../lib/types";
@@ -42,9 +41,43 @@ export default function Join() {
   }
   return (
     <MotionConfig reducedMotion="user">
-      <SeatFlow key={`${sid}:${seat}`} sid={sid} seat={seat} />
+      <SetupGate key={`${sid}:${seat}`} sid={sid} seat={seat} />
     </MotionConfig>
   );
+}
+
+/**
+ * A "Just talk" table runs entirely on the laptop, so a phone that opens its link sees a friendly note
+ * and never claims a seat (no seat socket, no cookie). Anything else goes on to the phone flow, which
+ * handles a missing session or a network error itself.
+ */
+function SetupGate({ sid, seat }: { sid: string; seat: Seat }) {
+  const [setup, setSetup] = useState<"checking" | "quick" | "phones">("checking");
+  useEffect(() => {
+    let cancelled = false;
+    api.getSession(sid).then(
+      (s) => !cancelled && setSetup(s.setup === "quick" ? "quick" : "phones"),
+      () => !cancelled && setSetup("phones"),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [sid]);
+  if (setup === "checking") {
+    return (
+      <PhoneScreen>
+        <LoadingOrError error={null} onRetry={() => undefined} />
+      </PhoneScreen>
+    );
+  }
+  if (setup === "quick") {
+    return (
+      <PhoneScreen>
+        <NoPhonesStep />
+      </PhoneScreen>
+    );
+  }
+  return <SeatFlow sid={sid} seat={seat} />;
 }
 
 const MILESTONES = 4; // consent, interview, review, ready
@@ -128,7 +161,7 @@ function SeatFlow({ sid, seat }: { sid: string; seat: Seat }) {
   // The trail outlives the session (it is wiped right after both phones fetch it).
   if (trail) {
     return (
-      <PhoneScreen modeLabel={summary ? MODE_COPY[summary.mode].label : undefined}>
+      <PhoneScreen>
         <TrailStep
           sid={sid}
           seat={seat}
@@ -172,14 +205,12 @@ function SeatFlow({ sid, seat }: { sid: string; seat: Seat }) {
 
   return (
     <PhoneScreen
-      modeLabel={MODE_COPY[summary.mode].label}
       progress={showProgress ? { current: idx, total: MILESTONES, label: `Step ${idx + 1} of ${MILESTONES}` } : undefined}
     >
       {step === "consent" && (
         <section aria-labelledby="step-title">
           <StepHeading id="step-title" eyebrow={`Seat ${seat}`} title="Before we listen" />
           <ConsentForm
-            mode={summary.mode}
             partnerName={partner}
             onSubmit={async (name) => {
               try {

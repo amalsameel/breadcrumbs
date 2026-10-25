@@ -2,6 +2,14 @@
   "name": "self_echo_transcript",
   "mode": "social",
   "description": "Muse transcribes the crumb's own voice, reported late: the words repeat the line, so there is no barge-in, the turn is dropped as bot speech, it never counts as a reply, and the follow-up switch still fires.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "crumb_text": "So what is something you both love doing on the weekends?",
   "duration": 72.0,
   "turns": [

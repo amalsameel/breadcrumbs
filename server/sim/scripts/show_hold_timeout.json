@@ -2,6 +2,14 @@
   "name": "show_hold_timeout",
   "mode": "social",
   "description": "'let me pull it up' + 80 s silence: no crumb before 60 s, then normal thresholds counted from the timeout.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "duration": 89.0,
   "turns": [
     {

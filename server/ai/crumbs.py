@@ -26,8 +26,9 @@ import config
 from ai import heuristics as h
 from ai.facts import Fact, get_fact
 from ai.gemini import Gemini, GeminiError, get_gemini
+from ai.memory import MEMORY_KEYS, prompt_view
 from ai.profiles import allowed_items
-from ai.prompts import canned_crumbs, crumb_system
+from ai.prompts import CANNED_ANONYMOUS, ICEBREAKERS, canned_crumbs, crumb_system
 from ai.safety import (
     UNSAFE_KEYWORDS,
     clean_text,
@@ -38,8 +39,8 @@ from ai.safety import (
     truncate_words,
     validate_crumb_text,
 )
-from ai.tts import synthesize
-from models import Crumb, CrumbFormat, CrumbKind, CrumbSource, Mode, OverlapSet, Profile, ProfileItem
+from ai.tts import SYSTEM_LINES, synthesize, synthesize_cached
+from models import Crumb, CrumbFormat, CrumbKind, CrumbSource, Mode, OverlapSet, Profile, ProfileItem, Setup
 
 log = logging.getLogger("breadcrumbs.ai.crumbs")
 
@@ -60,7 +61,7 @@ STEER_STALE_TURNS = 3
 NATURAL_VOICE_MIN_LEAD_S = 1.8
 NATURAL_VOICE_MARGIN_S = 0.3  # over the recent natural latency (which can only raise the lead needed)
 VOICE_FAST_BUDGET_S = 4.0
-VOICE_FRESH_RESERVE_S = 1.0  # lead kept for the fast voice when waiting for a fresher steer text
+VOICE_FRESH_RESERVE_S = 0.6  # lead kept for the fast voice when waiting for a fresher steer text
 AUDIO_CACHE_ITEMS = 8  # voiced lines kept per session, by (text, fast)
 FACT_CACHE_ITEMS = 16  # grounded facts kept per session, by topic stems
 # A live (cache miss) generation is skipped when the recent generations took longer than its budget:
@@ -75,6 +76,12 @@ LIVE_DRAFT_MIN_SAMPLES = 2
 MISS_JOIN_S = 0.5
 MISS_JOIN_MARGIN_S = 0.2
 MISS_LIVE_MIN_S = 0.3
+# A steer miss (the automatic 3 s crumb) never waits out the miss budget: it joins the running steer
+# prefetch only when that is due within MISS_JOIN_S (by the recent draft median), and otherwise serves at
+# once the slightly older steer, then the ready switch, then the overlap or canned fallback.
+STEER_JOIN_SLACK_S = 0.1
+SERVED_KEPT = 4  # cache entries just served, kept so a crumb dropped before dispatch can be put back
+MEMORY_OF_KEPT = 32  # crumb id -> the memory item it was built on (only the latest crumbs can still be served)
 # The round warning (F21) always says the time out loud, whatever crumb carries it.
 ROUND_WARNING_LEAD = "One minute left."
 TOPIC_MAX_CHARS = 80
@@ -101,6 +108,13 @@ OUTSIDE_QUESTIONS: dict[str, list[tuple[str, str]]] = {
         ("spontaneous", "{n2}, what's the most spontaneous thing you've done on a weekend? {n1}, top it."),
     ],
 }
+# The same outside questions for people who never typed a name ("Just talk"): no names, still hand the turn over.
+OUTSIDE_QUESTIONS_ANONYMOUS: list[tuple[str, str]] = [
+    ("local favorites", "What's one spot in {place} you'd take each other to this week? Whoever has a favorite, go first."),
+    ("hidden talents", "What's a skill each of you has that would surprise the other? Whoever thinks theirs is weirder, go."),
+    ("small joys", "What's the best small thing that happened to each of you this week? Whoever remembers first, go."),
+    ("dream trip", "If you could leave for any trip tomorrow, where would you go? Whoever packs lighter answers first."),
+]
 WOULD_YOU_RATHER: list[tuple[str, str]] = [
     ("time travel", "Would you rather visit the past or the future for a day? {n1} first, then {n2}."),
     ("superpowers", "Would you rather be able to fly or be invisible for a day? {n2} first, then {n1}."),
@@ -118,6 +132,8 @@ class ConvoCtx:
     depth_max: int
     minutes_live: float
     instruction: str | None = None  # e.g. "one minute left in the round"
+    # What the conversation taught us about them (ai/memory.py): {"1": [...], "2": [...], "shared", "threads"}
+    memory: dict[str, list[str]] | None = None
 
 
 @dataclass
@@ -144,13 +160,16 @@ class CrumbDraft(BaseModel):
 
 
 def validate_crumb(
-    crumb: Crumb, *, names: dict[int, str], profiles: dict[int, Profile], max_words: int = 28
+    crumb: Crumb, *, names: dict[int, str], profiles: dict[int, Profile], max_words: int = 28,
+    require_name: bool = True, placeholders: list[str] | tuple[str, ...] = (),
 ) -> tuple[bool, Crumb, list[str]]:
     """Word cap, a participant name, no removed ids, no off-limits or unsafe terms, em dashes -> commas.
 
     Returns (ok, cleaned_crumb, errors). Unknown item ids are stripped from the cleaned crumb.
+    `require_name` / `placeholders`: see ai.safety.validate_crumb_text (people who typed no name).
     """
-    _, text, errors = validate_crumb_text(crumb.text, names=names, profiles=profiles, max_words=max_words)
+    _, text, errors = validate_crumb_text(crumb.text, names=names, profiles=profiles, max_words=max_words,
+                                          require_name=require_name, placeholders=placeholders)
     removed = {i for p in profiles.values() for i in p.removed_item_ids}
     known = {i.id for p in profiles.values() for i in p.items}
     bad = [i for i in crumb.source_item_ids if i in removed]
@@ -186,6 +205,8 @@ class _Plan:
     fact_budget_s: float = FACT_BUDGET_S
     max_words: int = config.CRUMB_MAX_WORDS
     live: bool = False  # a cache miss on the live path: no web search (it never fits MISS_FACT_BUDGET_S)
+    memory_item: str | None = None  # a memory item or open thread the crumb picks up (source "conversation")
+    memory_key: str | None = None  # where it is in the memory: "1", "2", "shared" or "threads"
 
 
 @dataclass
@@ -210,9 +231,16 @@ class CrumbService:
         overlaps: OverlapSet,
         location: str,
         gemini: Gemini | None = None,
+        setup: Setup = "profiles",
+        anonymous: frozenset[int] | set[int] = frozenset(),
     ) -> None:
         self.mode = mode
         self.names = names
+        # "quick" ("Just talk"): no profiles or overlaps; switches come from the live memory and outside
+        # questions, and the opener is a light icebreaker. `anonymous` seats never typed a name: their label
+        # ("Person 1") is never spoken and crumbs need no name.
+        self.setup: Setup = setup
+        self.anonymous = frozenset(int(s) for s in anonymous)
         self.profiles = profiles
         self.overlaps = overlaps
         self.location = location
@@ -231,18 +259,25 @@ class CrumbService:
         self._gen_tasks: dict[str, asyncio.Task] = {}  # slot -> text generation in flight (one per slot)
         self._gen_lines: dict[str, int | None] = {}  # slot -> the latest line its generation was built on
         self._steer_next: tuple[ConvoCtx, float] | None = None  # a fresh steer to start once the running one ends
+        self._gen_started: dict[str, float] = {}  # slot -> loop time its running generation started
+        self._served: OrderedDict[str, tuple[str, _CacheEntry]] = OrderedDict()  # crumb id -> (slot, entry)
         self._voice_tasks: dict[str, tuple[asyncio.Task, bool]] = {}  # crumb text -> (voicing in flight, fast)
         self._audio: OrderedDict[tuple[str, bool], bytes] = OrderedDict()  # (text, fast) -> WAV
         self._facts: OrderedDict[str, Fact | None] = OrderedDict()  # topic key -> fact (None: nothing usable)
         self._fact_tasks: dict[str, asyncio.Task] = {}
         self._draft_ms: deque[float] = deque(maxlen=LIVE_DRAFT_SAMPLES)  # recent model generation times
         self._natural_s: deque[float] = deque(maxlen=LIVE_DRAFT_SAMPLES)  # recent natural voice times (or lower bounds)
+        self.used_memory: set[str] = set()  # memory items and threads a delivered crumb picked up (lowercase)
+        self._memory_of: dict[str, tuple[str, str]] = {}  # crumb id -> (memory key, item) it was built on
+        self._icebreakers_used = 0
 
     # -- public API -----------------------------------------------------------------------------
 
     async def opener(self, convo: ConvoCtx) -> Delivery:
-        """Best unused overlap opener (F11), validated, marked used immediately."""
+        """Best unused overlap opener (F11), validated, marked used immediately. "Just talk": the icebreaker."""
         started = time.perf_counter()
+        if self.setup == "quick":
+            return await self._icebreaker(convo, started)
         crumb = self._overlap_crumb_validated("opener", convo)
         if crumb is None:
             plan = self._plan("switch", convo, as_kind="opener")
@@ -253,12 +288,42 @@ class CrumbService:
         audio = await self._synth(crumb.text, OPENER_TTS_BUDGET_S, fast=True)
         return Delivery(crumb=crumb, audio_wav=audio, cache_hit=False, gen_ms=_ms_since(started))
 
+    async def _icebreaker(self, convo: ConvoCtx, started: float) -> Delivery:
+        """A light, fixed opening question (no model call, so it lands with the 3 s pause). It has no names,
+        so its voice is kept once per process."""
+        place = short_place(self.location)
+        crumb: Crumb | None = None
+        for offset in range(len(ICEBREAKERS)):
+            text = ICEBREAKERS[(self._icebreakers_used + offset) % len(ICEBREAKERS)].format(place=place)
+            plan = _Plan("opener", "outside", ["question"])
+            candidate = self._crumb(plan, "question", text, "both", [], "icebreaker", 1,
+                                    "Icebreaker: nobody had spoken yet, so a light opening question.", convo)
+            ok, cleaned, _ = validate_crumb(candidate, names=self.names, profiles=self.profiles, require_name=False,
+                                            placeholders=self._placeholders())
+            if ok:
+                crumb = cleaned
+                break
+        if crumb is None:
+            crumb = self._canned("opener", convo)
+        self._icebreakers_used += 1
+        self.mark_delivered(crumb)
+        try:
+            audio = await asyncio.wait_for(
+                synthesize_cached(crumb.text, SYSTEM_LINES, self.gemini, fast=True, budget_s=OPENER_TTS_BUDGET_S),
+                timeout=OPENER_TTS_BUDGET_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - the Table falls back to speechSynthesis
+            log.warning("tts skipped (%s)", type(exc).__name__)
+            audio = None
+        return Delivery(crumb=crumb, audio_wav=audio, cache_hit=False, gen_ms=_ms_since(started))
+
     async def get(self, kind: CrumbKind, convo: ConvoCtx, now: float) -> Delivery:
         """A crumb for `kind`: the cached one when still valid (instant), otherwise generated now.
 
         A miss whose prefetch is still running joins it instead of paying for a second generation of the
         same slot. The join and the live call share one MISS_BUDGET_S (see MISS_JOIN_S), so a miss is
-        never slower than a plain live call plus the fast voice (F8).
+        never slower than a plain live call plus the fast voice (F8). A steer (the 3 s automatic crumb) joins
+        only a refill due within MISS_JOIN_S; otherwise it serves the older steer, then the ready switch, at once.
         """
         started = time.perf_counter()
         if kind == "opener":
@@ -266,21 +331,36 @@ class CrumbService:
         key = _cache_key(kind)
         entry = self._usable(key, now, convo) if key else None
         joined = False
+        steer_now = False  # a steer miss that must not wait: stale steer, ready switch, then fallback
         if entry is None and key in self._gen_tasks:
-            joined = True
-            await _wait_task(self._gen_tasks[key], self._join_budget_s())
-            entry = self._usable(key, now, convo)
+            budget = self._join_budget_s()
+            remaining = self._steer_remaining_s() if key == "steer" else None
+            if remaining is not None and remaining > MISS_JOIN_S:
+                steer_now = True
+                log.info("steer miss: the running prefetch is %.1f s away; not waiting for it", remaining)
+            else:
+                if remaining is not None:
+                    budget = min(budget, max(0.0, remaining + STEER_JOIN_SLACK_S))
+                joined = True
+                await _wait_task(self._gen_tasks[key], budget)
+                entry = self._usable(key, now, convo)
         left_s = MISS_BUDGET_S - (time.perf_counter() - started)
-        live_ok = left_s >= MISS_LIVE_MIN_S and self._live_call_fits(left_s)
+        live_ok = not steer_now and left_s >= MISS_LIVE_MIN_S and self._live_call_fits(left_s)
+        slot = key
         if entry is None and key == "steer" and not live_ok:
             entry = self._stale_steer(now, convo)  # a slightly older steer beats a late canned line
+            if entry is None and steer_now and not convo.instruction:
+                entry = self._valid("switch", now, convo)  # the ready switch beats a canned line too
+                if entry is not None:
+                    slot, kind = "switch", "switch"
         if entry is not None:
             crumb: Crumb | None = entry.crumb.model_copy(update={"kind": kind})
             if convo.instruction:
                 crumb = self._with_instruction(crumb, convo)  # type: ignore[arg-type]
             if crumb is not None:
-                self._cache.pop(key, None)  # type: ignore[arg-type]
-                log.info("crumb cache %s (%s)", "joined its prefetch" if joined else "hit", key)
+                self._cache.pop(slot, None)  # type: ignore[arg-type]
+                self._remember_served(crumb.id, slot, entry)  # type: ignore[arg-type]
+                log.info("crumb cache %s (%s)", "joined its prefetch" if joined else "hit", slot)
                 audio = await self._audio_for(crumb.text)  # a lead-in makes a new text: voiced fresh
                 return Delivery(crumb=crumb, audio_wav=audio, cache_hit=not joined, gen_ms=_ms_since(started))
             # The cached crumb is too long to carry the instruction: keep it for later, generate one now.
@@ -291,7 +371,7 @@ class CrumbService:
             plan.max_words = max(10, config.CRUMB_MAX_WORDS - _lead_words(convo.instruction))
         if live_ok:
             crumb = await self._build_live(plan, convo, left_s)
-        else:  # the join used the budget (or the live call would be abandoned): fall back at once
+        else:  # the join used the budget (or the live call would be abandoned, or a steer cannot wait): fall back at once
             log.info("live crumb generation skipped (%.1f s of the miss budget left); using fallback", max(0.0, left_s))
             crumb = self._fallback(kind, convo)
         if convo.instruction:
@@ -347,7 +427,8 @@ class CrumbService:
         generated (up to `lead_s`), then voices it once: the natural model when at least
         NATURAL_VOICE_MIN_LEAD_S is left, else the fast one. A line already voiced, or being voiced, is
         never sent again. A steer for the turn that opened this pause that is still being written is
-        waited for (leaving VOICE_FRESH_RESERVE_S for the fast voice) rather than voicing the older one.
+        waited for (leaving VOICE_FRESH_RESERVE_S for the fast voice) rather than voicing the older one; with
+        no fresh steer by then, the older steer (or the ready switch) that get() will serve is voiced instead.
         """
         key = _cache_key(kind)
         if key is None:
@@ -358,9 +439,13 @@ class CrumbService:
         while key == "steer" and self._fresher_steer_coming(convo) and loop.time() < deadline:
             await _wait_task(self._gen_tasks["steer"], deadline - loop.time())
         if self._usable(key, now, convo) is None:
-            # No fresh text yet: join its generation (or start it: this crumb is about to be needed).
-            await _wait_task(self._start_generation(key, convo, now), max(0.0, lead_s))
+            # No fresh text yet: join its generation (or start it: this crumb is about to be needed). A steer
+            # joins only until its deadline, then voices what get() would serve on a miss.
+            budget = deadline - loop.time() if key == "steer" else lead_s
+            await _wait_task(self._start_generation(key, convo, now), max(0.0, budget))
         entry = self._usable(key, now, convo)
+        if entry is None and key == "steer":
+            entry = self._stale_steer(now, convo) or (None if convo.instruction else self._valid("switch", now, convo))
         if entry is None:
             return
         text = entry.crumb.text
@@ -388,6 +473,32 @@ class CrumbService:
             return NATURAL_VOICE_MIN_LEAD_S
         return max(NATURAL_VOICE_MIN_LEAD_S, statistics.median(self._natural_s) + NATURAL_VOICE_MARGIN_S)
 
+    def restore(self, delivery: Delivery) -> None:
+        """A cache-hit crumb the runner dropped before sending it (someone may have been talking): put its
+        text back in its slot if the slot is still empty, so the next crumb does not pay for it again."""
+        if not delivery.cache_hit:
+            return
+        served = self._served.pop(delivery.crumb.id, None)
+        if served is None:
+            return
+        slot, entry = served
+        if slot not in self._cache and entry.crumb.id not in self._delivered:
+            self._cache[slot] = entry
+            log.info("crumb cache restored (%s)", slot)
+
+    def _remember_served(self, crumb_id: str, slot: str, entry: _CacheEntry) -> None:
+        self._served[crumb_id] = (slot, entry)
+        while len(self._served) > SERVED_KEPT:
+            self._served.popitem(last=False)
+
+    def _steer_remaining_s(self) -> float | None:
+        """Seconds until the running steer prefetch is likely done (recent draft median), or None when there
+        is nothing to go by (mock mode, too few samples)."""
+        started = self._gen_started.get("steer")
+        if started is None or self.gemini.mock or len(self._draft_ms) < LIVE_DRAFT_MIN_SAMPLES:
+            return None
+        return statistics.median(self._draft_ms) / 1000.0 - (asyncio.get_running_loop().time() - started)
+
     def invalidate(self, reason: str) -> None:
         self._cache.clear()
         self._epoch += 1
@@ -395,6 +506,8 @@ class CrumbService:
             task.cancel()
         self._gen_tasks.clear()
         self._gen_lines.clear()
+        self._gen_started.clear()
+        self._served.clear()
         self._steer_next = None
         log.info("crumb cache invalidated (%s)", reason)
 
@@ -422,6 +535,7 @@ class CrumbService:
         if crumb.id in self._delivered:
             return
         self._delivered.add(crumb.id)
+        self._served.pop(crumb.id, None)
         self.history.append(crumb)
         for model_fast in (False, True):
             self._audio.pop((crumb.text, model_fast), None)  # its audio lived as long as the crumb
@@ -431,6 +545,11 @@ class CrumbService:
         topic = crumb.topic.strip().lower()
         if topic and topic not in self.used_topics:
             self.used_topics.append(topic)
+        picked = self._memory_of.pop(crumb.id, None)
+        if picked is not None:
+            self.used_memory.add(picked[1].lower())
+            if picked[0] in ("1", "2"):
+                self.featured_count[int(picked[0])] += 1
         ids = set(crumb.source_item_ids)
         self.used_item_ids |= ids
         for index, overlap in enumerate(self.overlaps.overlaps):
@@ -444,7 +563,7 @@ class CrumbService:
             self.featured_count[seat] += 1
             self._last_profile_seat = seat
         if crumb.kind in ("switch", "manual"):  # wildcards sit outside the rotation
-            if crumb.source.startswith("profile"):
+            if crumb.source.startswith("profile") or picked is not None:  # a memory item is the personal side
                 self._last_alt = "profile"
             elif crumb.source == "outside":
                 self._last_alt = "outside"
@@ -499,6 +618,18 @@ class CrumbService:
         """
         if wildcard:
             return _Plan("switch", "outside", self._formats(["would_you_rather", "question"]))
+        if self.setup == "quick":
+            # No profiles or overlaps: alternate something they said (an open thread first, then the
+            # less-featured person's items, then what they share) with an outside question.
+            order = ("memory", "outside") if self._last_alt == "outside" else ("outside", "memory")
+            for alt in order:
+                picked = self._memory_pick(convo) if alt == "memory" else None
+                if alt == "outside":
+                    return _Plan("switch", "outside", self._formats(["fun_fact", "question"]))
+                if picked is not None:
+                    key, item = picked
+                    return _Plan("switch", "conversation", self._formats(["callback", "question"]),
+                                 seat=int(key) if key in ("1", "2") else None, memory_item=item, memory_key=key)
         unused = self._unused_overlaps(convo.depth_max)
         if unused:
             fmt: list[CrumbFormat] = ["collab", "question"] if self.mode == "networking" else ["question"]
@@ -513,6 +644,21 @@ class CrumbService:
                 if items:
                     return _Plan("switch", _profile_source(seat), self._formats(["question"]), items=items[:1], seat=seat)
         return _Plan("switch", "outside", outside_formats)
+
+    def _memory(self, convo: ConvoCtx) -> dict[str, list[str]]:
+        """The live memory minus what a delivered crumb already picked up."""
+        memory = convo.memory or {}
+        return {k: [i for i in memory.get(k, []) if i.lower() not in self.used_memory] for k in MEMORY_KEYS}
+
+    def _memory_pick(self, convo: ConvoCtx) -> tuple[str, str] | None:
+        """The memory item a switch should pick up: the newest open thread, then the newest item of the
+        less-featured person, then the other person, then something they share."""
+        memory = self._memory(convo)
+        keys = ["threads", *(str(s) for s in self._seat_order()), "shared"]
+        for key in keys:
+            if memory.get(key):
+                return key, memory[key][-1]
+        return None
 
     def _formats(self, preferred: list[str]) -> list[CrumbFormat]:
         allowed = config.ALLOWED_FORMATS[self.mode]
@@ -578,6 +724,15 @@ class CrumbService:
             payload["verified_fact"] = {"text": plan.fact.text, "url": plan.fact.url}
         if convo.instruction:
             payload["instruction"] = convo.instruction
+        memory = prompt_view(self._memory(convo), self.names)
+        if memory is not None:
+            payload["memory"] = memory
+        if plan.memory_item:
+            payload["requested_memory"] = plan.memory_item
+        if self.setup == "quick":
+            payload["setup"] = "just talk"
+        if self.anonymous:
+            payload["names_unknown"] = sorted(str(s) for s in self.anonymous)
         return payload
 
     def _profile_text(self, seat: int, depth_max: int) -> str:
@@ -608,6 +763,7 @@ class CrumbService:
             task = asyncio.ensure_future(self._generate(key, convo, now, self._epoch))
             self._gen_tasks[key] = task
             self._gen_lines[key] = self._line_key(convo)
+            self._gen_started[key] = asyncio.get_running_loop().time()
             task.add_done_callback(partial(self._generation_done, key))
         return task
 
@@ -616,6 +772,7 @@ class CrumbService:
         if self._gen_tasks.get(key) is task:
             del self._gen_tasks[key]
             self._gen_lines.pop(key, None)
+            self._gen_started.pop(key, None)
         if not task.cancelled() and task.exception() is not None:
             log.warning("prefetch %s failed (%s)", key, type(task.exception()).__name__)
         nxt, self._steer_next = (self._steer_next, None) if key == "steer" else (None, self._steer_next)
@@ -726,10 +883,12 @@ class CrumbService:
         started = loop.time()  # the loop clock: the same one the budgets (asyncio.wait_for) run on
         draft = await self.gemini.json(
             model=config.GEMINI_MODEL,
-            system=crumb_system(self.mode),
+            system=crumb_system(self.mode, quick=self.setup == "quick", anonymous=bool(self.anonymous),
+                                memory=bool(convo.memory and any(convo.memory.values()))),
             payload=self._payload(plan, convo),
             schema=CrumbDraft,
             max_tokens=400,
+            job="crumb",
         )
         self._draft_ms.append((loop.time() - started) * 1000.0)
         return self._from_draft(draft, plan, convo)
@@ -750,6 +909,10 @@ class CrumbService:
     ) -> Crumb:
         self._counter += 1
         fact = plan.fact if plan.source == "outside" else None
+        if plan.memory_item and plan.memory_key:
+            self._memory_of[f"c_{self._counter}"] = (plan.memory_key, plan.memory_item)
+            while len(self._memory_of) > MEMORY_OF_KEPT:
+                self._memory_of.pop(next(iter(self._memory_of)))
         return Crumb(
             id=f"c_{self._counter}",
             kind=plan.kind,
@@ -766,8 +929,7 @@ class CrumbService:
         )
 
     def _check(self, crumb: Crumb, plan: _Plan, convo: ConvoCtx) -> tuple[bool, Crumb, list[str]]:
-        ok, cleaned, errors = validate_crumb(crumb, names=self.names, profiles=self.profiles,
-                                             max_words=plan.max_words)
+        ok, cleaned, errors = self._validate(crumb, max_words=plan.max_words)
         allowed = self._allowed_ids()
         if any(i not in allowed for i in cleaned.source_item_ids):
             errors.append("item not allowed")
@@ -801,13 +963,23 @@ class CrumbService:
             return {i.id for i in self._allowed(int(plan.source[-1]))}
         return None
 
+    def _validate(self, crumb: Crumb, *, max_words: int = config.CRUMB_MAX_WORDS) -> tuple[bool, Crumb, list[str]]:
+        """validate_crumb for this session: a name is required only when both people typed one, and the
+        label of a person who did not ("Person 1") is never spoken."""
+        return validate_crumb(crumb, names=self.names, profiles=self.profiles, max_words=max_words,
+                              require_name=not self.anonymous, placeholders=self._placeholders())
+
+    def _placeholders(self) -> list[str]:
+        return [self.names[s] for s in sorted(self.anonymous) if self.names.get(s)]
+
     def _with_instruction(self, crumb: Crumb, convo: ConvoCtx) -> Crumb | None:
         """Prefix the instruction's spoken lead-in (the round warning). None when it no longer fits."""
         lead = _lead_in(convo.instruction)
         if lead is None or "minute" in crumb.text.lower():
             return crumb
         ok, text, _ = validate_crumb_text(f"{lead} {crumb.text}", names=self.names, profiles=self.profiles,
-                                          max_words=config.CRUMB_MAX_WORDS)
+                                          max_words=config.CRUMB_MAX_WORDS, require_name=not self.anonymous,
+                                          placeholders=self._placeholders())
         if not ok:
             return None
         return crumb.model_copy(update={"text": text})
@@ -825,7 +997,7 @@ class CrumbService:
             plan = _Plan(kind, "overlap", ["question"], overlap_index=index)
             crumb = self._crumb(plan, "question", ov.opener, "both", ov.item_ids_seat1 + ov.item_ids_seat2,
                                 _short_topic(ov.summary), self._overlap_depth(index), why, convo)
-            ok, cleaned, _ = validate_crumb(crumb, names=self.names, profiles=self.profiles)
+            ok, cleaned, _ = self._validate(crumb)
             if ok:
                 return cleaned
         return None
@@ -836,11 +1008,12 @@ class CrumbService:
         n1, n2 = self.names.get(1, "Seat 1"), self.names.get(2, "Seat 2")
         why = "Fallback: generation failed validation twice, so a safe canned crumb was used."
         candidates: list[Crumb] = []
-        for index, (fmt, template) in enumerate(canned_crumbs(self.mode)):
+        templates = CANNED_ANONYMOUS if self.anonymous else canned_crumbs(self.mode)
+        for index, (fmt, template) in enumerate(templates):
             plan = _Plan(kind, "outside", ["question"])
             crumb = self._crumb(plan, fmt, template.format(name1=n1, name2=n2), "both", [],
                                 f"canned {index + 1}", 1, why, convo)
-            ok, cleaned, _ = validate_crumb(crumb, names=self.names, profiles=self.profiles)
+            ok, cleaned, _ = self._validate(crumb)
             if ok and cleaned.text not in spoken:
                 return cleaned
             candidates.append(cleaned)
@@ -855,6 +1028,8 @@ class CrumbService:
     # -- mock generation (deterministic templates that pass validate_crumb) -------------------------
 
     def _mock_crumb(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
+        if plan.memory_item:
+            return self._mock_memory(plan, convo, attempt)
         if plan.source == "conversation":
             return self._mock_callback(plan, convo, attempt)
         if plan.source == "overlap" and plan.overlap_index is not None:
@@ -871,6 +1046,14 @@ class CrumbService:
         speaker, other = self.names[seat], self.names[3 - seat]
         snippet = h.quote_snippet(line, 6)
         topic = convo.current_topic or h.short(" ".join(h.content_words(snippet)), 4) or "the last thing said"
+        if self.anonymous:
+            if attempt == 0 and snippet and "callback" in plan.formats:
+                text = f'Wait, "{snippet}"? I want the story behind that. And the other one of you, what would you ask first?'
+                fmt, why = "callback", "Steer: building on the last words said to keep the current topic going."
+            else:
+                text = "What would you ask about what was just said? The one who was listening, go for it."
+                fmt, why = "question", "Steer: handing the follow-up to the one who was listening."
+            return self._crumb(plan, fmt, text, "both", [], topic, min(2, max(1, convo.depth_max)), why, convo)
         if attempt == 0 and snippet and "callback" in plan.formats:
             text = f'{other}, {speaker} just said "{snippet}". What do you want to ask about that?'
             fmt, why = "callback", f"Steer: building on {speaker}'s last words to keep the current topic going."
@@ -878,6 +1061,31 @@ class CrumbService:
             text = f"{other}, what would you ask {speaker} about what they just said? Go for it."
             fmt, why = "question", f"Steer: handing {other} the follow-up on {speaker}'s last point."
         return self._crumb(plan, fmt, text, _seat_label(3 - seat), [], topic, min(2, max(1, convo.depth_max)), why, convo)
+
+    def _mock_memory(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
+        """A switch that picks up something said earlier (a memory item or an open thread)."""
+        item = (plan.memory_item or "").rstrip(" ?.!")
+        key = plan.memory_key
+        topic = h.short(item, 6) or "an earlier thread"
+        owner_seat = int(key) if key in ("1", "2") else None
+        if key == "threads":
+            text = (f"Going back to something from earlier: {item}? Whoever has the answer, go first."
+                    if self.anonymous or attempt else
+                    f"{self.names[1]} and {self.names[2]}, going back to earlier: {item}? {self.names[2]} first.")
+            why = "Switch: an open thread from earlier in this conversation."
+        elif owner_seat is not None and not self.anonymous:
+            owner, other = self.names[owner_seat], self.names[3 - owner_seat]
+            text = f"{other}, {owner} mentioned {item} earlier. What do you want to know about that?"
+            why = f"Switch: something {owner} mentioned earlier, so they get featured."
+        elif owner_seat is not None:
+            text = f"Earlier one of you mentioned {item}. What's the story there? The other one, ask a follow-up."
+            why = "Switch: something one of them mentioned earlier in this conversation."
+        else:
+            lead = "You two" if self.anonymous else f"{self.names[1]} and {self.names[2]}, you"
+            text = f"{lead} have this in common: {item}. Who got into it first, and how?"
+            why = "Switch: something they both mentioned earlier."
+        return self._crumb(plan, "callback" if "callback" in plan.formats else "question", text, "both", [], topic,
+                           1, why, convo)
 
     def _mock_overlap(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
         ov = self.overlaps.overlaps[plan.overlap_index or 0]
@@ -910,6 +1118,8 @@ class CrumbService:
 
     def _mock_outside(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
         n1, n2 = self.names[1], self.names[2]
+        if self.anonymous:
+            return self._mock_outside_anonymous(plan, convo, attempt)
         if plan.fact is not None and "fun_fact" in plan.formats and attempt == 0:
             text = f"{plan.fact.text} {n1}, did you know that? {n2}, what would you add?"
             why = "Outside: a grounded fun fact with a source, ending in a question."
@@ -930,6 +1140,22 @@ class CrumbService:
         text = template.format(n1=n1, n2=n2, place=short_place(self.location))
         why = "Switch: a fresh outside topic; with no verified fact, it is a question, not a claim."
         return self._crumb(plan, fmt, text, "both", [], f"outside: {key}", 1, why, convo)
+
+    def _mock_outside_anonymous(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
+        if plan.fact is not None and "fun_fact" in plan.formats and attempt == 0:
+            text = f"{plan.fact.text} Did either of you know that? Whoever guessed it, go first."
+            why = "Outside: a grounded fun fact with a source, ending in a question."
+            return self._crumb(plan, "fun_fact", text, "both", [], plan.topic_hint or "outside: fun fact", 1, why, convo)
+        if plan.kind == "steer" and plan.topic_hint:
+            topic = h.short(plan.topic_hint, 5)
+            text = f"Staying on {topic}: what's the most surprising thing either of you knows about it? Whoever's sure, go first."
+            why = "Steer: no verified fact was available, so an open question on the current topic."
+            return self._crumb(plan, "question", text, "both", [], plan.topic_hint, 1, why, convo)
+        fresh = [o for o in OUTSIDE_QUESTIONS_ANONYMOUS if f"outside: {o[0]}" not in self.used_topics] or OUTSIDE_QUESTIONS_ANONYMOUS
+        key, template = fresh[attempt % len(fresh)]
+        text = template.format(place=short_place(self.location))
+        why = "Switch: a fresh outside topic; with no verified fact, it is a question, not a claim."
+        return self._crumb(plan, "question", text, "both", [], f"outside: {key}", 1, why, convo)
 
     # -- helpers ---------------------------------------------------------------------------------------
 
@@ -979,6 +1205,9 @@ class CrumbService:
             return False
         if entry.crumb.id in self._delivered or set(entry.crumb.source_item_ids) & self.used_item_ids:
             return False
+        picked = self._memory_of.get(entry.crumb.id)
+        if picked is not None and picked[1].lower() in self.used_memory:
+            return False  # its thread was picked up by another crumb
         if entry.crumb.kind == "steer":
             # The steer stays on the current topic. One built on the latest lines follows those lines (the
             # STEER_STALE_TURNS rule in _usable; the topic label is derived from the same lines); one built

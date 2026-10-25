@@ -1,16 +1,13 @@
 // Express written consent (PRD F2, 15.2): typed name + required checkbox before any audio is captured.
 import { useId, useState } from "react";
 import type { FormEvent } from "react";
-import type { Mode } from "../lib/types";
 import { Button } from "./ui/Button";
 import { Card } from "./ui/Card";
 import { OrbDot } from "./ui/Crumbs";
 import { TextField } from "./ui/TextField";
-import { MODE_COPY } from "./ui/modes";
 import { ErrorNote } from "./phone/PhoneScreen";
 
 interface ConsentFormProps {
-  mode: Mode;
   partnerName: string | null;
   onSubmit: (typedName: string) => Promise<void>; // throws with a user-facing message on failure
 }
@@ -25,7 +22,7 @@ const PROMISES: { title: string; body: string }[] = [
   { title: "You approve everything", body: "Breadcrumbs only mentions what's on the profile you approve. You can remove anything." },
 ];
 
-export function ConsentForm({ mode, partnerName, onSubmit }: ConsentFormProps) {
+export function ConsentForm({ partnerName, onSubmit }: ConsentFormProps) {
   const [name, setName] = useState("");
   const [agreed, setAgreed] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -55,7 +52,7 @@ export function ConsentForm({ mode, partnerName, onSubmit }: ConsentFormProps) {
   return (
     <form onSubmit={handleSubmit} noValidate className="flex flex-col gap-6">
       <p className="text-[17px] leading-relaxed text-ink-muted">
-        You're joining {MODE_COPY[mode].joinLine}
+        You're joining a conversation
         {partnerName ? (
           <>
             {" "}
@@ -69,7 +66,7 @@ export function ConsentForm({ mode, partnerName, onSubmit }: ConsentFormProps) {
         <ul className="flex flex-col gap-5">
           {PROMISES.map((p) => (
             <li key={p.title} className="flex gap-3">
-              <OrbDot palette={MODE_COPY[mode].palette} size={14} className="mt-1" />
+              <OrbDot size={14} className="mt-1" />
               <span>
                 <span className="block text-[16px] font-medium text-ink">{p.title}</span>
                 <span className="block text-[15px] leading-snug text-ink-muted">{p.body}</span>

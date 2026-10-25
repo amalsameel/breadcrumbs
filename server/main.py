@@ -2,6 +2,10 @@
 
 Run from `server/`: `uvicorn main:app --port 8000`. Everything lives in memory (session_store.py); the
 live loop for each session is an engine/runner.py SessionRunner created when both seats are ready.
+
+Two setups (`setup` on create): "quick" ("Just talk", the default: no phones, both people consent on the
+Table with POST /start, the conversation goes live at once and the trail is shown on the Table) and
+"profiles" (phones, interview, profiles, calibration, overlap opener, opt-in trail on the phones).
 """
 from __future__ import annotations
 
@@ -31,6 +35,7 @@ from models import (
     OverlapSet,
     Profile,
     ProfilePatchBody,
+    StartBody,
     Trail,
     TrailOptInBody,
     TrailResponse,
@@ -53,6 +58,11 @@ CONTROL_ACTIONS = frozenset({"spark", "skip", "hold", "resume", "pause_listening
 OPEN_PHASES = ("lobby", "profiles")  # profile setup is still allowed
 SEAT_KEY_BYTES = 24
 NOT_YOUR_SEAT = "This seat is already in use on another phone. Scan the code for your own seat."
+NO_PHONES = "This table doesn't need phones: everything happens on the laptop."
+NAME_MAX_CHARS = 60
+# "Just talk": the Table shows its trail when the conversation ends; the session is wiped by its Done button
+# (DELETE), this long after the end, or the TTL, whichever comes first.
+QUICK_WIPE_AFTER_END_S = 600.0
 
 # The AI helpers fall back to their deterministic heuristics when the model fails, but a caller's
 # outer timeout can cancel them before they get there (slow model + retries). On a timeout we run the
@@ -165,6 +175,11 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         if session.phase not in OPEN_PHASES:
             raise HTTPException(409, "Profiles are locked once the conversation has started.")
 
+    def require_profiles(session: Session) -> None:
+        """Seat routes belong to the profiles setup; a "Just talk" table has no phones."""
+        if session.setup != "profiles":
+            raise HTTPException(409, NO_PHONES)
+
     def send_table_state(session: Session, conn: Connection | None = None) -> None:
         """The Table needs params and (once live) the latest engine snapshot right away."""
         events: list[dict] = [{"type": "params", "params": session.params.to_dict()}]
@@ -179,7 +194,8 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     async def start_live(session: Session) -> None:
         """Both seats ready: overlaps, Engine + CrumbService + runner, phase calibrating."""
         async with session.lock:
-            if session.runner is not None or session.phase not in OPEN_PHASES or not session.both("ready"):
+            if (session.setup != "profiles" or session.runner is not None or session.phase not in OPEN_PHASES
+                    or not session.both("ready")):
                 return
             p1, p2 = session.seat(1).profile, session.seat(2).profile
             if p1 is None or p2 is None:
@@ -204,6 +220,29 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         session.send_session()
         send_table_state(session)
 
+    async def start_quick(session: Session, names: dict[str, str] | None) -> None:
+        """"Just talk": both people agreed on the Table. Consent for both seats (source "table"), names,
+        ready, then the engine with no profiles; live as soon as the Table's audio arrives (no prompts)."""
+        async with session.lock:
+            if session.setup != "quick":
+                raise HTTPException(409, "This table uses phones: scan the codes to start.")
+            if session.runner is not None or session.phase != "lobby":
+                raise HTTPException(409, "This conversation has already started.")
+            at = time.time()
+            for seat in (1, 2):
+                st = session.seat(seat)
+                typed = " ".join(str((names or {}).get(str(seat)) or "").split())[:NAME_MAX_CHARS]
+                st.anonymous = not typed
+                st.consent = Consent(typed_name=typed or f"Person {seat}", agreed=True, at=at, source="table")
+                st.joined = st.ready = True
+            runner = SessionRunner(session, overlaps=OverlapSet(overlaps=[]), on_round_end=lambda: end_session(session))
+            session.runner = runner
+            session.phase = "calibrating"
+            runner.start()
+            log.info("quick session started (named=%d)", sum(1 for s in (1, 2) if not session.seat(s).anonymous))
+        session.send_session()
+        send_table_state(session)
+
     async def end_session(session: Session) -> None:
         if session.phase == "ended" or session.wiped:
             return
@@ -212,9 +251,44 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         if runner is not None:
             runner.end()
             session.transcript = runner.full_transcript()
+            if session.setup == "quick":
+                session.memory = runner.memory.to_dict()  # the runner drops it when it stops
             await runner.stop()
         session.send_session()
         log.info("session ended")
+        if session.setup == "quick" and not session.wiped:
+            session.trail_task = asyncio.create_task(build_table_trail(session), name="table-trail")
+            session.wipe_task = asyncio.create_task(wipe_later(session), name="quick-wipe")
+
+    async def build_table_trail(session: Session) -> None:
+        """"Just talk": threads to pick up, from the live memory and the transcript, shown on the Table."""
+        runner = session.runner
+        args = (session.mode, session.names, session.transcript, {})
+        kwargs = {
+            "memory": session.memory, "anonymous": session.anonymous, "table": True,
+            "safety_paused": bool(runner is not None and runner.engine.safety_paused),
+        }
+        trail = Trail(items=[])
+        try:
+            trail = await asyncio.wait_for(generate_trail(*args, **kwargs), timeout=TRAIL_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - fall back to the heuristic trail (PRD 9.7)
+            log.warning("table trail generation failed (%s); using heuristic trail", type(exc).__name__)
+            try:
+                trail = await generate_trail(*args, gemini=_HEURISTIC, **kwargs)
+            except Exception as exc2:  # noqa: BLE001 - the Table then shows no threads
+                log.warning("heuristic table trail failed (%s)", type(exc2).__name__)
+        if session.wiped:
+            return
+        session.trail = trail
+        session.trail_ready = True
+        session.transcript = ""  # no longer needed by anything
+        session.memory = None
+        session.broadcast({"type": "table_trail", "trail": trail.model_dump()}, roles=("table",))
+        log.info("table trail ready (items=%d)", len(trail.items))
+
+    async def wipe_later(session: Session) -> None:
+        await asyncio.sleep(QUICK_WIPE_AFTER_END_S)
+        await store.wipe(session.sid, "ended a while ago")
 
     async def build_trail(session: Session) -> None:
         both_share = all(session.seat(s).opted_in is True for s in (1, 2))
@@ -256,12 +330,13 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.post("/api/sessions")
     async def create_session(body: CreateSessionBody | None = None) -> dict:
         body = body or CreateSessionBody()
-        session = store.create(body.mode, body.quick)
+        quick_profile = body.quick and body.setup == "profiles"  # Quick profile only means something with phones
+        session = store.create(body.mode, quick_profile, body.setup)
         base = config.PUBLIC_BASE_URL
-        return {
-            "session_id": session.sid,
-            "join_urls": {"1": f"{base}/join/{session.sid}/1", "2": f"{base}/join/{session.sid}/2"},
+        join_urls = {} if body.setup == "quick" else {
+            "1": f"{base}/join/{session.sid}/1", "2": f"{base}/join/{session.sid}/2",
         }
+        return {"session_id": session.sid, "join_urls": join_urls, "setup": session.setup}
 
     @app.get("/api/sessions/{sid}")
     async def get_session(sid: str) -> dict:
@@ -273,10 +348,28 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         await store.wipe(sid, "deleted")
         return {"ok": True}
 
+    @app.post("/api/sessions/{sid}/start")
+    async def start(sid: str, body: StartBody | None = None) -> dict:
+        """"Just talk": both people agreed on the Table ("We're both in"); names are optional."""
+        session = await require_session(sid)
+        await start_quick(session, dict(body.names) if body and body.names else None)
+        return {"ok": True}
+
     @app.post("/api/sessions/{sid}/end")
     async def end(sid: str) -> dict:
         await end_session(await require_session(sid))
         return {"ok": True}
+
+    @app.get("/api/sessions/{sid}/trail")
+    async def get_table_trail(sid: str) -> dict:
+        """"Just talk": the Table's trail once the conversation ended (null while it is being written)."""
+        session = await require_session(sid)
+        if session.setup != "quick":
+            raise HTTPException(409, "This table's trail is shown on the phones.")
+        if session.phase != "ended":
+            raise HTTPException(409, "The conversation hasn't ended yet.")
+        trail = session.trail if session.trail_ready else None
+        return {"trail": trail.model_dump() if trail is not None else None}
 
     @app.patch("/api/sessions/{sid}/params")
     async def patch_params(sid: str, changes: dict = Body(...)) -> dict:
@@ -308,6 +401,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.post("/api/sessions/{sid}/seats/{seat}/consent")
     async def consent(sid: str, seat: int, body: ConsentBody, request: Request, response: Response) -> dict:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)
         require_open(session)
@@ -334,6 +428,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
         sid: str, seat: int, request: Request, question_id: str = Form(...), audio: UploadFile = File(...)
     ) -> dict:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)
         require_consent(st)
@@ -365,6 +460,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.post("/api/sessions/{sid}/seats/{seat}/profile")
     async def build_profile(sid: str, seat: int, request: Request) -> Profile:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)
         require_consent(st)
@@ -387,7 +483,9 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
 
     @app.get("/api/sessions/{sid}/seats/{seat}/profile")
     async def get_profile(sid: str, seat: int, request: Request) -> Profile:
-        st = require_seat(await require_session(sid), seat)
+        session = await require_session(sid)
+        require_profiles(session)
+        st = require_seat(session, seat)
         require_owner(request, st)  # off-limits and removed items are private to their seat
         if st.profile is None:
             raise HTTPException(404, "No profile yet.")
@@ -396,6 +494,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.patch("/api/sessions/{sid}/seats/{seat}/profile")
     async def patch_profile(sid: str, seat: int, body: ProfilePatchBody, request: Request) -> Profile:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)
         require_consent(st)
@@ -410,6 +509,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.post("/api/sessions/{sid}/seats/{seat}/ready")
     async def ready(sid: str, seat: int, request: Request) -> dict:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)
         require_consent(st)
@@ -428,6 +528,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.post("/api/sessions/{sid}/seats/{seat}/trail-optin")
     async def trail_optin(sid: str, seat: int, body: TrailOptInBody, request: Request) -> dict:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)  # only this seat's phone can answer (or change) its own yes/no
         if session.phase != "ended":
@@ -445,6 +546,7 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
     @app.get("/api/sessions/{sid}/seats/{seat}/trail")
     async def get_trail(sid: str, seat: int, request: Request) -> TrailResponse:
         session = await require_session(sid)
+        require_profiles(session)
         st = require_seat(session, seat)
         require_owner(request, st)  # fetching marks trail_fetched, which wipes the session
         if not session.trail_ready or session.trail is None:
@@ -482,7 +584,8 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
                 elif action in CONTROL_ACTIONS and live:
                     runner.on_control(action)
             elif kind == "vad" and live:
-                runner.on_vad(bool(evt.get("active")), float(evt.get("rms") or 0.0))
+                runner.on_vad(bool(evt.get("active")), float(evt.get("rms") or 0.0),
+                              _opt_float(evt.get("level_db")), _opt_int(evt.get("quiet_ms")))
             elif kind == "tts_state" and live:
                 runner.on_tts_state(str(evt.get("crumb_id") or ""), bool(evt.get("playing")))
             elif kind == "params" and isinstance(evt.get("changes"), dict):
@@ -519,6 +622,11 @@ def create_app(store: SessionStore | None = None) -> FastAPI:
             if role == "table":
                 conn.send_text(json.dumps({"type": "session", "session": session.summary()}))
                 send_table_state(session, conn)
+                if session.setup == "quick" and session.trail_ready and session.trail is not None:
+                    conn.send_text(json.dumps({"type": "table_trail", "trail": session.trail.model_dump()}))
+            elif session.setup != "profiles":
+                # A phone link of a "Just talk" table: it only needs the summary (setup) to say so.
+                conn.send_text(json.dumps({"type": "session", "session": session.summary()}))
             else:
                 st = session.seat(1 if role == "seat1" else 2)
                 if not st.joined:
@@ -614,6 +722,18 @@ async def _to_wav(data: bytes, filename: str) -> bytes:
                 "Ask the operator to run: brew install ffmpeg",
             ) from exc
         raise HTTPException(422, f"We couldn't read that recording ({exc}). Please record again.") from exc
+
+
+def _opt_float(value: object) -> float | None:
+    """An optional numeric field of a client event (older Tables omit it); anything else is None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value == value and abs(value) != float("inf") else None
+
+
+def _opt_int(value: object) -> int | None:
+    f = _opt_float(value)
+    return None if f is None else max(0, min(60_000, int(f)))
 
 
 app = create_app()

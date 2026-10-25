@@ -75,7 +75,7 @@ def of_type(kind: str, **fields) -> Callable[[dict], bool]:
 
 
 def create(client: TestClient, mode: str = "social", quick: bool = False) -> str:
-    r = client.post("/api/sessions", json={"mode": mode, "quick": quick})
+    r = client.post("/api/sessions", json={"setup": "profiles", "mode": mode, "quick": quick})
     assert r.status_code == 200
     return r.json()["session_id"]
 
@@ -150,11 +150,12 @@ def test_health_config_and_interview(client: TestClient) -> None:
 
 
 def test_create_session_join_urls(client: TestClient) -> None:
-    r = client.post("/api/sessions", json={"mode": "networking", "quick": True}).json()
+    r = client.post("/api/sessions", json={"setup": "profiles", "mode": "networking", "quick": True}).json()
     sid = r["session_id"]
     assert r["join_urls"] == {"1": f"{config.PUBLIC_BASE_URL}/join/{sid}/1", "2": f"{config.PUBLIC_BASE_URL}/join/{sid}/2"}
+    assert r["setup"] == "profiles"
     s = summary(client, sid)
-    assert (s["phase"], s["mode"], s["quick"]) == ("lobby", "networking", True)
+    assert (s["phase"], s["mode"], s["quick"], s["setup"]) == ("lobby", "networking", True, "profiles")
     assert s["seats"]["1"] == {
         "joined": False, "consented": False, "ready": False, "name": None,
         "has_profile": False, "answered": 0, "opted_in": None,

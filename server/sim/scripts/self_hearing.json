@@ -2,6 +2,14 @@
   "name": "self_hearing",
   "mode": "social",
   "description": "A Muse turn overlapping the crumb's own TTS playback is dropped as bot speech and never counts as a reply.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "duration": 69.9,
   "turns": [
     {

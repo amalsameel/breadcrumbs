@@ -8,11 +8,15 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
+from typing import Literal
+
+from pydantic import BaseModel
 
 import config
 from ai import heuristics as h
 from ai.gemini import Gemini, GeminiError, get_gemini
-from ai.prompts import ENERGY_SYSTEM, HOLD_SYSTEM
+from ai.memory import MemoryDelta, mock_memory
+from ai.prompts import ENERGY_SYSTEM, HOLD_SYSTEM, energy_memory_system
 from ai.safety import clean_text, truncate_words
 from models import EnergyTag, HoldDecision
 
@@ -20,6 +24,7 @@ log = logging.getLogger("breadcrumbs.ai.classifiers")
 
 HOLD_MAX_TOKENS = 160
 ENERGY_MAX_TOKENS = 160
+ENERGY_MEMORY_MAX_TOKENS = 450  # the tag plus up to 12 short memory items
 
 # Appendix A lexicon, mirrored for the mock classifier (the engine's own copy lives in engine/hold.py).
 _HOLD_PATTERNS: dict[str, list[re.Pattern[str]]] = {
@@ -74,6 +79,7 @@ async def classify_hold(context: str, gemini: Gemini | None = None) -> HoldDecis
                 payload=context,
                 schema=HoldDecision,
                 max_tokens=HOLD_MAX_TOKENS,
+                job="hold",
             )
             return normalize_hold(decision)
         except GeminiError as exc:
@@ -125,6 +131,53 @@ async def tag_energy(context: str, gemini: Gemini | None = None) -> EnergyTag:
         except GeminiError as exc:
             log.warning("energy tagger failed (%s); using heuristic", type(exc).__name__)
     return mock_energy(context)
+
+
+class EnergyMemoryDraft(BaseModel):
+    """The energy tag plus the new memory items, in one call (ai/memory.py)."""
+
+    topic: str
+    energy: Literal["high", "medium", "low"]
+    winding_down: bool
+    person1: list[str] = []
+    person2: list[str] = []
+    shared: list[str] = []
+    threads: list[str] = []
+
+
+async def tag_energy_memory(
+    context: str,
+    gemini: Gemini | None = None,
+    *,
+    names: dict[int, str],
+    known: dict[str, list[str]] | None = None,
+    off_limits: list[str] | None = None,
+) -> tuple[EnergyTag, MemoryDelta]:
+    """The energy/topic tag and what the latest turns say about each person, from ONE model call (the
+    periodic energy tag), so the live memory costs no extra call. Mock or failure: the lexical tag and
+    `mock_memory`. The caller merges the delta (ai.memory.Memory.merge filters it again)."""
+    g = gemini or get_gemini()
+    if not g.mock:
+        try:
+            draft = await g.json(
+                model=config.GEMINI_LITE_MODEL,
+                system=energy_memory_system(),
+                payload={
+                    "names": {str(s): n for s, n in names.items()},
+                    "known": known or {},
+                    "off_limits": list(off_limits or []),
+                    "turns": context,
+                },
+                schema=EnergyMemoryDraft,
+                max_tokens=ENERGY_MEMORY_MAX_TOKENS,
+            )
+            topic = _clean_topic(draft.topic) or mock_energy(context).topic
+            tag = EnergyTag(topic=topic, energy=draft.energy, winding_down=draft.winding_down)
+            return tag, MemoryDelta(person1=draft.person1, person2=draft.person2, shared=draft.shared,
+                                    threads=draft.threads)
+        except GeminiError as exc:
+            log.warning("energy tagger failed (%s); using heuristic", type(exc).__name__)
+    return mock_energy(context), mock_memory(context, names)
 
 
 def mock_energy(context: str) -> EnergyTag:

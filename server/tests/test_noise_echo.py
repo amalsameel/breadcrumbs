@@ -1,5 +1,6 @@
 """Round 2: self-hearing by text (Muse transcribing the bot's own voice) and background noise that keeps
-the local VAD on (VAD_UNCONFIRMED_S). Pure engine tests on a fake clock; no network, no AI."""
+the local VAD on (VAD_DEFER_S: an onset defers crumbs, it never restarts the pause). Pure engine tests on a
+fake clock; no network, no AI."""
 from __future__ import annotations
 
 import pytest
@@ -23,13 +24,34 @@ def playing(e: Engine, cid: str, at: float, text: str = LINE) -> None:
     e.on_tts_state(cid, True, at)
 
 
-def vad_frames(e: Engine, t0: float, t1: float, active: bool = True) -> list[dict]:
+def vad_frames(e: Engine, t0: float, t1: float, active: bool = True, level_db: float | None = None) -> list[dict]:
     """Local VAD at 10 Hz plus engine ticks, like the Table and the runner."""
     fx: list[dict] = []
     for k in range(round(t0 * 10), round(t1 * 10) + 1):
-        fx += e.on_vad(active, 0.05 if active else 0.002, k / 10)
+        fx += e.on_vad(active, 0.05 if active else 0.002, k / 10, level_db=level_db)
         fx += e.tick(k / 10)
     return fx
+
+
+def seated(level_db: float = -30.0) -> Engine:
+    """A live engine whose calibration turns were heard by the Table VAD at `level_db` (seated level known)."""
+    e = Engine("social", NAMES, Params())
+    e.start_calibration(0.0)
+    e.on_tts_state("sys_cal1", True, 0.0)
+    e.on_tts_state("sys_cal1", False, 2.0)
+    vad_frames(e, 2.8, 3.9, level_db=level_db)
+    speak(e, 1, "A", "Hi, I'm from Austin.", 3.0, 4.0)
+    vad_frames(e, 4.0, 4.4, active=False, level_db=-60.0)
+    e.on_tts_state("sys_cal2", True, 4.4)
+    e.on_tts_state("sys_cal2", False, 5.0)
+    vad_frames(e, 5.4, 6.4, level_db=level_db)
+    speak(e, 2, "B", "Hey, I'm from Houston.", 5.5, 6.5)
+    vad_frames(e, 6.5, 6.5, active=False, level_db=-60.0)
+    assert e.phase == "live" and e.snapshot(6.5)["seat_level_db"] is not None
+    e.crumb_dispatched(line_crumb("c_0", kind="opener"), 6.5, 120.0, True)
+    e.on_tts_state("c_0", True, 6.5)
+    e.on_tts_state("c_0", False, 9.5)
+    return e
 
 
 # --- echo_overlap --------------------------------------------------------------------------------------
@@ -157,20 +179,20 @@ def test_calibration_prompt_echo_is_not_mapped_as_a_seat() -> None:
     assert e.label_map == {"B": 1}
 
 
-# --- background noise (VAD_UNCONFIRMED_S) ---------------------------------------------------------------
+# --- background noise (VAD_DEFER_S: defer, never reset) -------------------------------------------------
 
 
-def test_unconfirmed_vad_stops_holding_the_pause_timer() -> None:
+def test_unconfirmed_vad_defers_but_never_holds_the_pause_timer() -> None:
     e, _ = calibrated()
     speak(e, 20, "A", "That trip sounded incredible honestly.", 40.0, 42.0)
-    window = e.params.VAD_UNCONFIRMED_S
-    vad_frames(e, 41.0, 42.0 + window - 0.2)
+    window = e.params.VAD_DEFER_S
+    vad_frames(e, 42.1, 42.0 + window - 0.2)
     snap = e.snapshot(42.0 + window - 0.2)
-    assert snap["silence_s"] == 0.0 and snap["vad_active"] and not snap["noise_suspected"]
+    assert snap["vad_active"] and not snap["noise_suspected"] and snap["defer"] == "vad"
     vad_frames(e, 42.0 + window - 0.1, 46.0)
     snap = e.snapshot(46.0)
-    assert snap["vad_active"] and snap["noise_suspected"]
-    assert snap["silence_s"] == pytest.approx(46.0 - (42.0 + window - 0.1), abs=0.11)
+    assert snap["vad_active"] and snap["noise_suspected"] and snap["defer"] is None
+    assert snap["silence_s"] == pytest.approx(46.0 - 42.0, abs=0.11)  # the anchor is still the turn's end
     assert not snap["turn_active"]
 
 
@@ -181,10 +203,12 @@ def test_steady_noise_never_freezes_crumbs() -> None:
     delivered = of_type(fx, "deliver")
     assert delivered, "noise must not hold the pause timer forever"
     first = next(d["decision"]["at_s"] for d in fx if d["type"] == "decision" and d["decision"]["action"] in ("steer", "switch"))
-    assert first >= 42.0 + e.params.VAD_UNCONFIRMED_S - 9.5  # at_s counts from live start (9.5)
+    # One human turn since the opener: the regular cooldown blocks the steer, so the exceptional switch fires
+    # T_EXC_S after the turn ended, as in a quiet room (at_s counts from live start, 6.5).
+    assert first == pytest.approx(42.0 + e.params.T_EXC_S - 6.5, abs=0.15)
 
 
-def test_new_onsets_in_a_noisy_room_wait_for_muse() -> None:
+def test_new_onsets_in_a_noisy_room_do_not_defer_and_a_seat_turn_resets() -> None:
     e, _ = calibrated()
     speak(e, 20, "A", "That trip sounded incredible honestly.", 40.0, 42.0)
     vad_frames(e, 42.0, 46.0)  # noise outlives the window: the room is marked noisy
@@ -192,12 +216,19 @@ def test_new_onsets_in_a_noisy_room_wait_for_muse() -> None:
     vad_frames(e, 46.1, 46.5, active=False)
     vad_frames(e, 46.6, 47.0)  # a fresh flicker of the same noise
     snap = e.snapshot(47.0)
-    assert snap["noise_suspected"] and snap["silence_s"] > 2.0  # the flicker did not restart the timer
-    # Muse hears a person: VAD counts again.
+    assert snap["noise_suspected"] and snap["defer"] is None
+    assert snap["silence_s"] == pytest.approx(5.0, abs=0.11)  # the flicker did not restart the timer
+    # Muse opens a turn the Table mic does not hear as near: it blocks crumbs while open, nothing else.
     e.on_muse_event({"type": "speechStart", "turnId": 21}, 47.1)
     vad_frames(e, 47.1, 47.5)
     snap = e.snapshot(47.5)
-    assert not snap["noise_suspected"] and snap["silence_s"] == 0.0
+    assert snap["turn_active"] and snap["defer"] == "turn" and snap["silence_s"] > 5.0
+    # It closes as a seat turn (seat 1's label): the pause restarts and the room is no longer noisy.
+    e.on_muse_event({"type": "transcript", "transcript": "Anyway what about you", "final": False}, 47.8)
+    e.on_muse_event({"type": "speaker", "label": "A"}, 47.9)
+    e.on_muse_event({"type": "speechEnd", "turnId": 21}, 48.0)
+    snap = e.snapshot(48.0)
+    assert snap["silence_s"] == 0.0 and not snap["noise_suspected"] and not snap["turn_active"]
 
 
 def test_noise_latch_clears_after_a_quiet_spell() -> None:
@@ -219,13 +250,37 @@ def test_noise_does_not_cancel_a_crumb_or_barge_in() -> None:
     assert e.pending_cancelled is False
 
 
-def test_vad_with_muse_confirmation_keeps_counting() -> None:
-    """A long monologue: Muse keeps confirming, so VAD keeps holding the timer past the window."""
+def test_a_monologue_at_the_table_keeps_the_pause_at_zero() -> None:
+    """A long monologue: the turn started with a near voice, so the pause reads 0 past every VAD window."""
     e, _ = calibrated()
+    e.on_vad(True, 0.05, 40.0)
     e.on_muse_event({"type": "speechStart", "turnId": 22}, 40.0)
-    vad_frames(e, 40.0, 46.0)
+    vad_frames(e, 40.1, 46.0)
     snap = e.snapshot(46.0)
-    assert snap["turn_active"] and not snap["noise_suspected"] and snap["silence_s"] == 0.0
+    assert snap["turn_active"] and snap["foreground_open"] and not snap["noise_suspected"] and snap["silence_s"] == 0.0
+
+
+def test_bystander_speech_start_over_far_noise_never_barges_in() -> None:
+    e = seated()
+    speak(e, 20, "A", "That trip sounded incredible honestly.", 40.0, 42.0)
+    vad_frames(e, 42.0, 43.0, active=False, level_db=-60.0)
+    playing(e, "c_1", 43.0)
+    fx = vad_frames(e, 43.1, 44.0, level_db=-42.0)  # far noise during the crumb
+    fx += e.on_muse_event({"type": "speechStart", "turnId": 30}, 44.0)  # a bystander behind the table
+    fx += vad_frames(e, 44.1, 45.0, level_db=-42.0)
+    assert of_type(fx, "barge_in") == []
+    assert e.metrics()["interrupted"] == 0
+
+
+def test_near_voice_over_far_noise_during_a_crumb_barges_in() -> None:
+    e = seated()
+    speak(e, 20, "A", "That trip sounded incredible honestly.", 40.0, 42.0)
+    vad_frames(e, 42.0, 43.0, active=False, level_db=-60.0)
+    playing(e, "c_1", 43.0)
+    fx = vad_frames(e, 43.1, 44.0, level_db=-42.0)
+    assert of_type(fx, "barge_in") == []
+    fx = vad_frames(e, 44.1, 44.6, level_db=-30.0)  # someone at the table cuts in over the fan
+    assert of_type(fx, "barge_in") == [{"type": "barge_in", "crumb_id": "c_1"}]
 
 
 # --- review fixes: an echo start merged with a reply, and bursty noise ---------------------------------
@@ -345,18 +400,21 @@ def test_bursty_noise_never_freezes_crumbs(on_s: float, off_s: float) -> None:
     assert not decisions(fx, "barge_in")
 
 
-def test_speech_after_noise_bursts_counts_once_muse_hears_it() -> None:
+def test_speech_after_noise_bursts_counts_once_a_seat_turn_closes() -> None:
     e, _ = calibrated()
     speak(e, 20, "A", "That trip sounded incredible honestly.", 40.0, 42.0)
     for t0 in (42.0, 44.6, 47.2):  # bursts of 2 s
         vad_frames(e, t0, t0 + 1.9)
         vad_frames(e, t0 + 2.0, t0 + 2.5, active=False)
-    assert e.snapshot(49.7)["silence_s"] > 2.0
+    assert e.snapshot(49.7)["silence_s"] == pytest.approx(7.7, abs=0.11)  # bursts never moved the anchor
     e.on_muse_event({"type": "speechStart", "turnId": 21}, 49.9)
     vad_frames(e, 49.9, 50.5)
-    snap = e.snapshot(50.5)
-    assert snap["silence_s"] == 0.0 and not snap["noise_suspected"]
+    assert e.snapshot(50.5)["defer"] == "turn"  # pending: blocks crumbs until speechEnd judges it
+    e.on_muse_event({"type": "transcript", "transcript": "So what are you up to this weekend", "final": False}, 50.5)
+    e.on_muse_event({"type": "speaker", "label": "B"}, 50.55)
     e.on_muse_event({"type": "speechEnd", "turnId": 21}, 50.6)
-    vad_frames(e, 50.6, 50.9, active=False)
-    vad_frames(e, 51.0, 51.8)  # their next phrase, Muse not caught up yet: confirmed recently, so it counts
-    assert e.snapshot(51.8)["silence_s"] == 0.0
+    assert e.snapshot(50.6)["silence_s"] == 0.0  # a seat turn: the pause restarts
+    vad_frames(e, 50.7, 50.9, active=False)
+    fx = vad_frames(e, 51.0, 51.8)  # their next phrase, Muse not caught up yet: a fresh window defers again
+    snap = e.snapshot(51.8)
+    assert snap["defer"] == "vad" and not snap["noise_suspected"] and of_type(fx, "deliver") == []

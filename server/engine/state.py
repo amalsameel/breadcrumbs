@@ -5,11 +5,16 @@ and the calibration label map. Pure and deterministic: every method takes `now` 
 """
 from __future__ import annotations
 
+import math
 import re
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from models import HoldKind, Turn
+
+if TYPE_CHECKING:
+    from config import Params
 
 STUCK_TURN_S = 30.0  # speechStart with no speechEnd for this long is force-closed
 COMPLETE_TIMEOUT_S = 5.0  # a closed turn with no speechComplete is committed with its best partial
@@ -20,6 +25,15 @@ SYS_PREFIX = "sys_"
 ECHO_WINDOW_S = 1.0  # a Muse turn starting during bot speech or this soon after may be the bot's own voice
 ECHO_MIN_WORDS = 2  # words needed before the echo check decides (the first partial is often one word)
 ECHO_REPLY_WORDS = 3  # new words at the end of an echo-marked turn that make it a person's reply (same Muse turn)
+# Foreground (who is at the table): the Table's VAD frames are kept for a minute so each Muse turn can be
+# judged at speechEnd against what the laptop mic heard during it (level and coverage).
+VADLOG_FRAMES = 600  # 60 s at 10 Hz
+VAD_FRAME_S = 0.1  # the Table sends one VAD frame every 100 ms
+VAD_EVIDENCE_FRAC = 0.7  # frames received / frames expected for the VAD to have a say about a span
+SEAT_LEVEL_ALPHA = 0.3  # EMA weight of a new seat-turn level
+SEAT_LEVEL_MIN_SAMPLES = 2  # turns before the seated level is trusted (the two calibration turns)
+SEAT_ACTIVE_MIN_FRAC = 0.5  # a seat turn feeds the seated level only when VAD covered at least this much
+LEVEL_PERCENTILE = 0.8
 
 QUESTION_WORDS = frozenset({
     "what", "why", "how", "when", "where", "who", "whom", "whose", "which",
@@ -154,6 +168,14 @@ class TurnRecord:
     echo: bool = False  # its words repeat the bot line being spoken: our own voice, never a human turn
     suspect_at_start: bool = False  # started inside bot speech or its tail (provisional before the echo check)
     reply_after_echo: bool = False  # echo-marked first, then a person's reply in the same Muse turn
+    # Foreground: every non-echo turn is "pending" while open and decided once at speechEnd (classify_turn).
+    fg: Literal["pending", "seat", "background"] = "pending"
+    fg_reason: str = ""
+    near_at_start: bool = False  # the Table mic heard a near voice when it started: acts at once, as before
+    dev: bool = False  # injected from the X-ray (no VAD): always a seat
+    dev_seat: int | None = None  # the seat a dev turn was typed as ("Just talk" maps its label to that seat)
+    upgradable: bool = False  # background on 0 words or a filler: re-judged on the final transcript
+    vad_stats: VadStats | None = None  # the VAD over the turn, kept for that re-judgement
 
     @property
     def best_text(self) -> str:
@@ -244,6 +266,162 @@ class TurnTracker:
 
     def turns(self) -> list[Turn]:
         return [self._records[k].turn for k in sorted(self._records)]
+
+
+# --- Foreground: VAD log, seated level, turn classification -----------------------------------------
+
+
+@dataclass(frozen=True)
+class VadFrame:
+    t: float
+    active: bool
+    level_db: float
+    quiet_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class VadStats:
+    """What the Table mic heard over a span (numbers only)."""
+
+    frames: int
+    expected: float
+    active_frac: float
+    level_db: float | None  # 80th percentile over the active frames (all frames when none is active)
+    last_active_t: float | None
+    voice_end_t: float | None  # end of the last voiced stretch (client quiet_ms), else its last active frame
+
+    @property
+    def evidence(self) -> bool:
+        """Enough frames arrived for the VAD to have a say (the Table holds back echo-level frames)."""
+        return self.frames > 0 and self.frames + 1e-9 >= VAD_EVIDENCE_FRAC * self.expected
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, min(len(ordered) - 1, math.ceil(q * len(ordered)) - 1))]
+
+
+class VadLog:
+    """The last VADLOG_FRAMES Table VAD frames: (t, active, level_db, quiet_ms)."""
+
+    def __init__(self, maxlen: int = VADLOG_FRAMES) -> None:
+        self._frames: deque[VadFrame] = deque(maxlen=maxlen)
+
+    def add(self, t: float, active: bool, level_db: float, quiet_ms: int | None = None) -> None:
+        self._frames.append(VadFrame(t, bool(active), float(level_db), quiet_ms))
+
+    def window(self, t0: float, t1: float) -> list[VadFrame]:
+        out: list[VadFrame] = []
+        for f in reversed(self._frames):
+            if f.t < t0 - 1e-9:
+                break
+            if f.t <= t1 + 1e-9:
+                out.append(f)
+        out.reverse()
+        return out
+
+    def stats(self, t0: float, t1: float) -> VadStats:
+        frames = self.window(t0, t1)
+        active = [f for f in frames if f.active]
+        level = _percentile([f.level_db for f in (active or frames)], LEVEL_PERCENTILE)
+        last_active_t = active[-1].t if active else None
+        voice_end_t = last_active_t
+        if active:
+            idx = len(frames) - 1 - next(i for i, f in enumerate(reversed(frames)) if f.active)
+            fall = next((f for f in frames[idx + 1:] if not f.active), None)
+            if fall is not None and fall.quiet_ms is not None:
+                voice_end_t = fall.t - fall.quiet_ms / 1000.0
+        return VadStats(
+            frames=len(frames),
+            expected=max(0.0, (t1 - t0) / VAD_FRAME_S),
+            active_frac=len(active) / len(frames) if frames else 0.0,
+            level_db=level,
+            last_active_t=last_active_t,
+            voice_end_t=voice_end_t,
+        )
+
+    def last_at_or_above(self, t0: float, t1: float, level_db: float) -> float | None:
+        """End of the last active frame at or above `level_db` in [t0, t1] (the seated voice under noise)."""
+        for f in reversed(self.window(t0, t1)):
+            if f.active and f.level_db + 1e-9 >= level_db:
+                return f.t + VAD_FRAME_S
+        return None
+
+
+@dataclass
+class SeatLevel:
+    """EMA of the speech-band level of seat-classified turns (dBFS), seeded by the calibration turns."""
+
+    db: float | None = None
+    count: int = 0
+
+    def observe(self, level_db: float) -> None:
+        self.db = level_db if self.db is None else self.db + SEAT_LEVEL_ALPHA * (level_db - self.db)
+        self.count += 1
+
+    @property
+    def known(self) -> bool:
+        return self.db is not None and self.count >= SEAT_LEVEL_MIN_SAMPLES
+
+
+def vad_near(stats: VadStats, seat: SeatLevel, params: Params) -> bool:
+    """The span sounds like someone at the table: enough coverage, and (once known) near the seated level."""
+    if not stats.evidence or stats.active_frac + 1e-9 < params.NEAR_ACTIVE_FRAC:
+        return False
+    if not seat.known or stats.level_db is None:
+        return True
+    return stats.level_db + 1e-9 >= seat.db - params.NEAR_MARGIN_DB  # type: ignore[operator]
+
+
+def vad_far(stats: VadStats, seat: SeatLevel, params: Params) -> bool:
+    """The span sounds like a voice away from the table: barely any VAD, or (once known) far below the seats."""
+    if not stats.evidence:
+        return False
+    if stats.active_frac < params.FAR_ACTIVE_FRAC:
+        return True
+    return seat.known and stats.level_db is not None and stats.level_db < seat.db - params.FAR_MARGIN_DB  # type: ignore[operator]
+
+
+def classify_turn(rec: TurnRecord, stats: VadStats, seat: SeatLevel, label_mapped: bool, calib_complete: bool,
+                  params: Params, *, ordering: bool = False) -> tuple[Literal["seat", "background"], str]:
+    """Seat or background for a closed (non-echo) Muse turn, from its label, words and the VAD over it.
+
+    `ordering`: "Just talk" maps labels to Person 1 / 2 by order of first appearance and has no say-hi
+    prompts, so a turn is never a seat just because the mapping is incomplete: a new label must sound like
+    someone at the table to take a free seat (a bystander must not become Person 2).
+
+    Reasons are short fixed strings (they go into the X-ray decision log; never transcript text)."""
+    if rec.dev:
+        return "seat", "dev"
+    if not params.BYSTANDER_GATING or (not calib_complete and not ordering):
+        return "seat", "ungated"
+    words = count_words(rec.best_text)
+    if words == 0:
+        return "background", "empty"
+    near = vad_near(stats, seat, params)
+    far = vad_far(stats, seat, params)
+    if ordering and not calib_complete and not label_mapped:
+        if far:
+            return "background", "far voice before mapping"
+        if near or (not stats.evidence and words >= 2):
+            return "seat", "new voice, mapped by order"
+        return "background", "new voice, not near"
+    if label_mapped:
+        if far:
+            return "background", "far voice on a seat label"
+        if words <= params.FILLER_MAX_WORDS and stats.evidence and not near:
+            return "background", "filler"
+        return "seat", "seat label"
+    if near and words >= params.DRIFT_MIN_WORDS and stats.active_frac + 1e-9 >= SEAT_ACTIVE_MIN_FRAC:
+        return "seat", "near voice, unmapped label"
+    if not stats.evidence and rec.turn.label is None and words >= 2:
+        return "seat", "no VAD evidence"
+    return "background", "unmapped label"
+
+
+UPGRADABLE_REASONS = frozenset({"empty", "filler"})
 
 
 # --- Bot speech (self-hearing guard, PRD 8.11) -------------------------------------------
@@ -341,8 +519,9 @@ class BotSpeech:
 
 @dataclass
 class PauseTimer:
-    """silence_s = now - anchor, where anchor is the latest reset point (human speech end, VAD activity,
-    bot speech end, crumb dispatch, hold timeout, resume). Frozen while listening is paused."""
+    """silence_s = now - anchor, where anchor is the latest reset point (the end of a seat-classified human
+    turn, bot speech end, crumb dispatch, hold timeout, resume). Local VAD never moves it. Frozen while
+    listening is paused."""
 
     anchor: float = 0.0
     frozen: float | None = None
@@ -367,12 +546,15 @@ class PauseTimer:
 
 # --- Calibration (PRD 6.5) -----------------------------------------------------------------
 
-CalibrationStep = Literal["idle", "seat1", "seat2", "done"]
+CalibrationStep = Literal["idle", "seat1", "seat2", "auto", "done"]
 
 
 @dataclass
 class Calibration:
-    """Maps Muse diarization labels to seats: seat 1 prompt, seat 2 prompt, 15 s order-of-appearance fallback."""
+    """Maps Muse diarization labels to seats: seat 1 prompt, seat 2 prompt, 15 s order-of-appearance fallback.
+
+    `auto` ("Just talk"): no prompts; each new label of a seat turn takes the next free seat, in order of
+    first appearance (a dev turn takes the seat it was typed as, when free)."""
 
     label_map: dict[str, int] = field(default_factory=dict)
     step: CalibrationStep = "idle"
@@ -381,10 +563,10 @@ class Calibration:
     resync: bool = False
     labels_seen: list[str] = field(default_factory=list)
 
-    def begin(self, now: float, resync: bool) -> None:
+    def begin(self, now: float, resync: bool, *, auto: bool = False) -> None:
         self.label_map = {}
         self.labels_seen = []
-        self.step = "seat1"
+        self.step = "auto" if auto else "seat1"
         self.started_at = now
         self.prompt_at = now
         self.resync = resync
@@ -394,13 +576,27 @@ class Calibration:
         return self.step in ("seat1", "seat2")
 
     @property
+    def ordering(self) -> bool:
+        """Labels are mapped by order of first appearance, with no prompts ("Just talk")."""
+        return self.step == "auto"
+
+    @property
     def complete(self) -> bool:
         return len(self.label_map) >= 2
 
-    def observe(self, label: str, turn_started_at: float) -> list[str]:
+    def observe(self, label: str, turn_started_at: float, seat: int | None = None) -> list[str]:
         """Feed the label of a human turn. Returns the steps completed ("seat1", "seat2")."""
         if label not in self.labels_seen:
             self.labels_seen.append(label)
+        if self.step == "auto":
+            if label in self.label_map:
+                return []
+            free = [s for s in (1, 2) if s not in self.label_map.values()]
+            target = seat if seat in free else free[0]
+            self.label_map[label] = target
+            if len(self.label_map) >= 2:
+                self.step = "done"
+            return [f"seat{target}"]
         if self.step == "seat1" and turn_started_at >= self.prompt_at:
             self.label_map[label] = 1
             self.step = "seat2"

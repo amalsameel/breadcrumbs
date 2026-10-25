@@ -1,0 +1,99 @@
+{
+  "name": "split_turn_settle",
+  "mode": "social",
+  "description": "A 'background' turn (label C, unheard by the Table VAD) closes 3.3 s into the pause, and seat 1's speechStart follows 0.3 s later (Muse split one speaker's turn). The 0.4 s settle after the background close keeps the steer from firing in between.",
+  "duration": 61.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.3
+    },
+    {
+      "seat": 2,
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 4.9,
+      "end": 9.2
+    },
+    {
+      "seat": 1,
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 10.3,
+      "end": 15.0
+    },
+    {
+      "seat": 2,
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 15.8,
+      "end": 20.5
+    },
+    {
+      "seat": 1,
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 21.9,
+      "end": 26.6
+    },
+    {
+      "seat": 2,
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 27.3,
+      "end": 31.6
+    },
+    {
+      "seat": 1,
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 32.5,
+      "end": 37.5
+    },
+    {
+      "seat": 2,
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 38.7,
+      "end": 43.4
+    },
+    {
+      "seat": 1,
+      "text": "Honestly both, but now I am training for my first half marathon in March.",
+      "start": 43.9,
+      "end": 48.6
+    },
+    {
+      "seat": 2,
+      "text": "That is so cool, what does your training look like on a normal week?",
+      "start": 49.2,
+      "end": 53.9
+    },
+    {
+      "seat": null,
+      "label": "C",
+      "text": "so anyway",
+      "start": 55.0,
+      "end": 57.2,
+      "vad": false
+    },
+    {
+      "seat": 1,
+      "text": "Anyway what I was going to say is that the gym near campus is really good.",
+      "start": 57.5,
+      "end": 61.0
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        53.9,
+        61.0
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        53.9,
+        61.0
+      ],
+      "action": "background_turn",
+      "count": 1
+    }
+  ]
+}

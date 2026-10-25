@@ -2,6 +2,14 @@
   "name": "stale_decay",
   "mode": "social",
   "description": "Lively baseline of 10 turns, then replies shrink to 1 to 3 words and gaps grow, then a 5.5 s pause: one switch at 5.0 s.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "turns": [
     {
       "seat": 1,

@@ -1,5 +1,8 @@
-// The Table screen (PRD 6.1, 6.2, 6.5 to 6.7, 14.3): lobby QR codes, calibration, the live orb,
-// controls, the crumb trail, the X-ray drawer and the end of the session.
+// The Table screen (PRD 6.1, 6.2, 6.5 to 6.7, 14.3). Two setups:
+// - "Just talk" (quick): one consent card on the laptop, then straight to the live orb, and the trail
+//   on the laptop at the end (QuickSetup.tsx). No phones, no calibration screen.
+// - "With profiles": lobby QR codes, calibration, the live orb and the phones' trail.
+// Both share the live stage, controls, the crumb trail dots and the X-ray drawer.
 import { AnimatePresence } from "framer-motion";
 import { useCallback, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
@@ -19,6 +22,8 @@ import { useShortcuts } from "../components/table/hooks";
 import LiveStage from "../components/table/LiveStage";
 import Lobby from "../components/table/Lobby";
 import { Backdrop, TableButton } from "../components/table/primitives";
+import { QuickConsent, QuickStarting, QuickTrail } from "../components/table/QuickSetup";
+import { isQuick } from "../components/table/tableState";
 import TopBar from "../components/table/TopBar";
 import { useTable } from "../lib/useTable";
 
@@ -29,6 +34,7 @@ export default function Table() {
   const names = useMemo(() => seatNames(view.session), [view.session]);
 
   const phase = view.session?.phase ?? null;
+  const quick = isQuick(view.session);
   const live = phase === "live" && !view.wiped;
   const xrayAvailable = (phase === "calibrating" || phase === "live") && !view.wiped;
   const toggleXray = useCallback(() => setXrayOpen((o) => !o), []);
@@ -46,6 +52,19 @@ export default function Table() {
     if (view.wiped) return <WipedScreen />;
     if (!view.session) {
       return view.load === "error" ? <UnreachableScreen message={view.loadError} /> : <LoadingScreen />;
+    }
+    if (quick) {
+      switch (view.session.phase) {
+        case "lobby":
+        case "profiles":
+          return <QuickConsent onStart={actions.startQuick} />;
+        case "calibrating":
+          return <QuickStarting view={view} onStartListening={actions.startListening} />;
+        case "live":
+          return <LiveStage view={view} names={names} onStartListening={actions.startListening} />;
+        case "ended":
+          return <QuickTrail trail={view.tableTrail} names={names} crumbCount={view.crumbs.length} onDone={actions.wipe} />;
+      }
     }
     switch (view.session.phase) {
       case "lobby":
@@ -71,7 +90,6 @@ export default function Table() {
         className={`flex min-h-dvh flex-1 flex-col transition-[padding] duration-300 ease-out ${showDrawer ? "xl:pr-[464px]" : ""}`}
       >
         <TopBar
-          mode={view.session?.mode ?? null}
           socket={view.socket}
           audioLink={view.audioLink}
           mic={view.mic}

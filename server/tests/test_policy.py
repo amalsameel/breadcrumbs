@@ -11,7 +11,18 @@ from config import Params
 from engine import core as core_mod
 from engine import policy as policy_mod
 from engine.core import Engine
-from engine.policy import CrumbLedger, CrumbRecord, Thresholds, TickInputs, band, evaluate, next_action, thresholds
+from engine.policy import (
+    CrumbLedger,
+    CrumbRecord,
+    Thresholds,
+    TickInputs,
+    band,
+    effective_thresholds,
+    evaluate,
+    next_action,
+    thresholds,
+    unanswered_switch_s,
+)
 from models import Crumb, EnergyTag, HoldDecision
 from sim.replay import check_expectations, run_script
 
@@ -43,8 +54,20 @@ def lively(start: float, n: int, *, first_seat: int = 1, dur: float = 2.5, gap: 
     return turns, turns[-1]["end"]
 
 
+# The inline scripts below were written for the pre-3 s thresholds (3.0 / 5.0 / 6.5 s); they keep that timing
+# math through script params, like the pinned sim scripts. The 3 s defaults have their own tests and scripts.
+LEGACY = {"T_NORMAL_S": 3.0, "T_LONG_S": 5.0, "T_EXC_S": 6.5, "UNANSWERED_SWITCH_S": 6.5,
+          "HOLD_CHECK_SILENCE_S": 1.0, "VAD_DEFER_S": 2.5}
+
+
+def legacy(**kw) -> Params:
+    p = Params()
+    p.update({**LEGACY, **kw})
+    return p
+
+
 def script(turns: list[dict], expect: list[dict], **extra) -> dict:
-    return {"name": "inline", "mode": "social", "turns": turns, "expect": expect, **extra}
+    return {"name": "inline", "mode": "social", "params": dict(LEGACY), "turns": turns, "expect": expect, **extra}
 
 
 def assert_script(s: dict, params: Params | None = None):
@@ -120,9 +143,26 @@ P = Params()
 
 def test_default_thresholds_and_bands() -> None:
     th = thresholds(P, "social")
-    assert (th.t_normal, th.t_long, th.t_exc) == (3.0, 5.0, 6.5)
-    assert [band(s, th) for s in (0.0, 2.9, 3.0, 4.9, 5.0, 6.4, 6.5, 30.0)] == [
+    assert (th.t_normal, th.t_long, th.t_exc) == (1.5, 3.0, 4.5)
+    assert [band(s, th) for s in (0.0, 1.4, 1.5, 2.9, 3.0, 4.4, 4.5, 30.0)] == [
         "normal", "normal", "warming", "warming", "long", "long", "exceptional", "exceptional"]
+    think = effective_thresholds(th, "think")
+    assert (think.t_normal, think.t_long, think.t_exc) == (1.5, 6.0, 9.0)
+
+
+def test_unanswered_follow_up_waits_for_the_unanswered_switch() -> None:
+    th = thresholds(P, "social")
+    assert unanswered_switch_s(th, P, None) == 6.0  # max(t_exc 4.5, 6.0)
+    assert unanswered_switch_s(effective_thresholds(th, "think"), P, "think") == 12.0
+    base = Thresholds(1.5, 3.0, 4.5)
+    assert evaluate(base_inputs(base=base, silence_s=5.9, crumbs_this_silence=1), P).action is None
+    assert evaluate(base_inputs(base=base, silence_s=6.0, crumbs_this_silence=1), P).action == "switch"
+
+
+def test_renamed_vad_param_still_tunes_its_replacement() -> None:
+    p = Params()
+    p.update({"VAD_UNCONFIRMED_S": 2.0})
+    assert p.VAD_DEFER_S == 2.0 and not hasattr(p, "VAD_UNCONFIRMED_S")
 
 
 @pytest.mark.parametrize(
@@ -135,16 +175,16 @@ def test_default_thresholds_and_bands() -> None:
     ],
 )
 def test_adaptive_threshold_clamping(g: float, expected: tuple) -> None:
-    p = Params(ADAPTIVE_THRESHOLDS=True)
+    p = legacy(ADAPTIVE_THRESHOLDS=True)
     th = thresholds(p, "social", g)
     assert (th.t_normal, th.t_long, th.t_exc) == pytest.approx(expected)
-    assert thresholds(Params(), "social", g) == Thresholds(3.0, 5.0, 6.5)  # off by default
+    assert thresholds(Params(), "social", g) == Thresholds(1.5, 3.0, 4.5)  # off by default
 
 
 def test_mode_multiplier(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(policy_mod.MODE_MULTIPLIER, "speed_dating", 0.8)
     th = thresholds(P, "speed_dating")
-    assert (th.t_normal, th.t_long, th.t_exc) == pytest.approx((2.4, 4.0, 5.2))
+    assert (th.t_normal, th.t_long, th.t_exc) == pytest.approx((1.2, 2.4, 3.6))
 
 
 def test_think_hold_doubles_long_and_exceptional() -> None:
@@ -188,12 +228,17 @@ def test_policy_gates_block_everything(kw: dict) -> None:
 
 
 def test_wildcard_gating_in_evaluate() -> None:
+    # The window is the last second under the long threshold: [max(t_normal, t_long - 1), t_long).
     on = Params(WILDCARD_ENABLED=True)
-    assert evaluate(base_inputs(silence_s=3.0, wildcard_ok=True), on).action == "wildcard"
-    assert evaluate(base_inputs(silence_s=2.9, wildcard_ok=True), on).action is None
-    assert evaluate(base_inputs(silence_s=3.0, wildcard_ok=False), on).action is None
-    assert evaluate(base_inputs(silence_s=3.0, wildcard_ok=True, regular_ok=False), on).action is None
-    assert evaluate(base_inputs(silence_s=3.0, wildcard_ok=True, crumbs_this_silence=1), on).action is None
+    base = Thresholds(1.5, 3.0, 4.5)
+    assert evaluate(base_inputs(base=base, silence_s=2.5, wildcard_ok=True), on).action == "wildcard"
+    assert evaluate(base_inputs(base=base, silence_s=2.0, wildcard_ok=True), on).action == "wildcard"
+    assert evaluate(base_inputs(base=base, silence_s=1.9, wildcard_ok=True), on).action is None
+    assert evaluate(base_inputs(base=base, silence_s=2.5, wildcard_ok=False), on).action is None
+    assert evaluate(base_inputs(base=base, silence_s=2.5, wildcard_ok=True, regular_ok=False), on).action is None
+    assert evaluate(base_inputs(base=base, silence_s=2.5, wildcard_ok=True, crumbs_this_silence=1), on).action is None
+    assert evaluate(base_inputs(silence_s=4.0, wildcard_ok=True), on).action == "wildcard"  # 3 / 5 / 6.5: [4, 5)
+    assert evaluate(base_inputs(silence_s=3.9, wildcard_ok=True), on).action is None
 
 
 def test_next_action() -> None:
@@ -255,7 +300,7 @@ def test_crumb_answered_rule() -> None:
 
 
 def test_max_crumbs_per_rolling_10_minutes() -> None:
-    params = Params(MAX_CRUMBS_PER_10_MIN=2, MIN_GAP_BETWEEN_CRUMBS_S=5)
+    params = legacy(MAX_CRUMBS_PER_10_MIN=2, MIN_GAP_BETWEEN_CRUMBS_S=5)
     turns, ends, t = [], [], 0.0
     for _ in range(3):
         block, end = lively(t, 4)
@@ -352,19 +397,20 @@ def test_thinking_hold_steers_at_doubled_threshold() -> None:
 
 
 def test_wildcard_gating_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On the 3 s defaults the wildcard window is 2.0 to 3.0 s of silence."""
     monkeypatch.setattr(core_mod, "WILDCARD_MIN_GAP_S", 40)
     turns, e1 = lively(0.0, 3)
-    block, e2 = lively(round(e1 + 3.5, 1), 4)
+    block, e2 = lively(round(e1 + 2.6, 1), 4)
     turns += block
-    block, e3 = lively(round(e2 + 3.5, 1), 10)
+    block, e3 = lively(round(e2 + 2.6, 1), 10)
     turns += block
-    turns += lively(round(e3 + 3.5, 1), 1)[0]
+    turns += lively(round(e3 + 2.6, 1), 1)[0]
     expect = [
-        {"between": [e1, e1 + 3.5], "action": "wildcard", "count": 1, "at": round(e1 + 3.0, 1)},
-        {"between": [e2, e2 + 3.5], "action": "none"},  # under 40 s since the last wildcard
-        {"between": [e3, e3 + 3.5], "action": "wildcard", "count": 1, "at": round(e3 + 3.0, 1)},
+        {"between": [e1, e1 + 2.6], "action": "wildcard", "count": 1, "at": round(e1 + 2.0, 1)},
+        {"between": [e2, e2 + 2.6], "action": "none"},  # under 40 s since the last wildcard
+        {"between": [e3, e3 + 2.6], "action": "wildcard", "count": 1, "at": round(e3 + 2.0, 1)},
     ]
-    s = script(turns, expect)
+    s = {**script(turns, expect), "params": {}}
     assert_script(s, Params(WILDCARD_ENABLED=True))
     off = run_script(s, Params())
     assert not [a for a in off.actions if a["action"] == "wildcard"]
@@ -605,7 +651,8 @@ def test_crumb_overtaken_by_speech_is_cancelled_at_playback_start() -> None:
     speak(e, 20, "A", "We should totally go back there.", 12.0, 14.0)
     fx = ticks(e, 14.1, 32.0)  # warm-up ends 29.5, by then the pause is past the exceptional threshold
     assert [f["kind"] for f in of_type(fx, "deliver")] == ["switch"]
-    e.on_muse_event({"type": "speechStart", "turnId": 21}, 32.1)  # starts talking while generating
+    e.on_vad(True, 0.05, 32.1)  # starts talking at the table while generating
+    e.on_muse_event({"type": "speechStart", "turnId": 21}, 32.1)
     e.crumb_dispatched(crumb("c_5", "switch"), 32.5, 900.0, False)
     fx = e.on_tts_state("c_5", True, 32.6)
     assert of_type(fx, "barge_in") == [{"type": "barge_in", "crumb_id": "c_5"}]

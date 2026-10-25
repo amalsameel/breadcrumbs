@@ -1,0 +1,16 @@
+{
+  "name": "quick_bystander_first",
+  "mode": "social",
+  "setup": "quick",
+  "skip_warmup": false,
+  "description": "Just talk: a voice behind the table (label C, the Table mic does not hear it) talks before either person. It is judged background, takes no seat and does not restart the pause, so the icebreaker still goes out at 3.0 s.",
+  "turns": [
+    {"seat": null, "label": "C", "vad": false, "text": "did anyone see where they put the extra chairs", "start": 0.5, "end": 2.4}
+  ],
+  "duration": 8.0,
+  "expect": [
+    {"between": [0.0, 2.9], "action": "none"},
+    {"between": [2.4, 2.5], "action": "background_turn", "count": 1},
+    {"between": [2.9, 3.2], "action": "opener", "count": 1, "at": 3.0, "tolerance": 0.15}
+  ]
+}

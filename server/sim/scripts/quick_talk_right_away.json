@@ -1,0 +1,20 @@
+{
+  "name": "quick_talk_right_away",
+  "mode": "social",
+  "setup": "quick",
+  "skip_warmup": false,
+  "description": "Just talk: they start talking 0.8 s after the Table starts listening, so no icebreaker ever goes out. The 20 s warm-up runs from go-live; the first pause after it gets a steer 3 s after the last turn.",
+  "turns": [
+    {"seat": 1, "text": "Hi, sorry, is this seat taken or can I sit here for a bit?", "start": 0.8, "end": 4.2},
+    {"seat": 2, "text": "Go for it, I'm just waiting for the talk to start in a few minutes.", "start": 4.8, "end": 8.6},
+    {"seat": 1, "text": "Oh nice, which one? I came for the one about city bike lanes.", "start": 9.2, "end": 12.9},
+    {"seat": 2, "text": "Same one, I bike to campus every day so I have a lot of opinions.", "start": 13.5, "end": 17.4},
+    {"seat": 1, "text": "Okay now I need to hear the opinions, what is the worst street for it?", "start": 18.1, "end": 22.0},
+    {"seat": 2, "text": "Guadalupe, easily, the bus lane ends and suddenly you are in traffic.", "start": 22.6, "end": 26.4}
+  ],
+  "expect": [
+    {"between": [0.0, 29.0], "action": "opener", "count": 0},
+    {"between": [0.0, 29.2], "action": "none"},
+    {"between": [29.2, 29.6], "action": "steer", "count": 1, "at": 29.4, "tolerance": 0.2}
+  ]
+}

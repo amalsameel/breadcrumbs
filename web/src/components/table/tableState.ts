@@ -1,6 +1,17 @@
 // Table state machine (pure): every server event and local playback/mic change folds into one
 // `TableState`. Kept free of I/O so it can be unit tested (see __tests__/tableState.test.mjs).
-import type { AppConfig, Crumb, Decision, EngineSnapshot, Seat, ServerEvent, SessionSummary, TurnEvent } from "../../lib/types";
+import type {
+  AppConfig,
+  Crumb,
+  Decision,
+  EngineSnapshot,
+  Memory,
+  Seat,
+  ServerEvent,
+  SessionSummary,
+  Trail,
+  TurnEvent,
+} from "../../lib/types";
 import type { SocketStatus } from "../../lib/ws";
 import { captionStage, estimateSpeechS, STUCK_PENDING_MS } from "./format";
 
@@ -61,6 +72,10 @@ export interface TableState {
   decisions: Decision[];
   params: Record<string, unknown>;
   muse: MuseStatus | null;
+  /** What the table learned from the conversation (X-ray; replaces profiles in a quick session). */
+  memory: Memory | null;
+  /** Quick setup: the trail shown on the laptop after End (null while it is being written). */
+  tableTrail: Trail | null;
   serverError: string | null;
   wiped: boolean;
   ending: boolean;
@@ -89,6 +104,8 @@ export const initialState: TableState = {
   decisions: [],
   params: {},
   muse: null,
+  memory: null,
+  tableTrail: null,
   serverError: null,
   wiped: false,
   ending: false,
@@ -199,6 +216,10 @@ function reduceServer(state: TableState, event: ServerEvent, at: number): TableS
       return wipedState(state);
     case "error":
       return { ...state, serverError: event.message };
+    case "memory":
+      return { ...state, memory: event.memory };
+    case "table_trail":
+      return { ...state, tableTrail: event.trail };
     case "trail_ready":
       return state;
   }
@@ -253,6 +274,36 @@ export function tableReducer(state: TableState, action: TableAction): TableState
       return { ...state, serverError: null };
     case "wiped":
       return wipedState(state);
+  }
+}
+
+// ---- Setup ("Just talk" vs "With profiles") ----------------------------------------------
+
+/** A quick session ("Just talk"): no phones, consent on the laptop, learns from the conversation. */
+export function isQuick(session: SessionSummary | null | undefined): boolean {
+  return session?.setup === "quick";
+}
+
+/**
+ * Where a quick table is: consent card, then "starting" (consented, waiting for the mic and the first
+ * audio; no calibration prompts), live, then the trail on the laptop ("trail_pending" while it is written).
+ */
+export type QuickStage = "loading" | "consent" | "starting" | "live" | "trail_pending" | "trail" | "wiped";
+
+export function quickStage(state: Pick<TableState, "session" | "wiped" | "tableTrail">): QuickStage {
+  if (state.wiped) return "wiped";
+  const phase = state.session?.phase;
+  if (!phase) return "loading";
+  switch (phase) {
+    case "lobby":
+    case "profiles":
+      return "consent";
+    case "calibrating":
+      return "starting";
+    case "live":
+      return "live";
+    case "ended":
+      return state.tableTrail ? "trail" : "trail_pending";
   }
 }
 

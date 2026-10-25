@@ -170,6 +170,9 @@ class _Pacer:
         self.sent_s += frame_s
 
 
+DROP_LOG_EVERY_S = 60.0  # diagnostics: frames dropped by the queue are logged at most once a minute
+
+
 class _ClientBase:
     """State and callback plumbing shared by the real and mock clients."""
 
@@ -238,6 +241,8 @@ class MuseRealtimeClient(_ClientBase):
         self.handshake_timeout = handshake_timeout
         self.reconnects = 0
         self._pacer = _Pacer(max_ahead_s)
+        self._drops_logged = 0
+        self._drops_logged_at = -DROP_LOG_EVERY_S
         self._ever_connected = False  # a reconnect after this means diarization labels were reset
         self._ws: ClientConnection | None = None
         self._session_done = asyncio.Event()
@@ -356,6 +361,7 @@ class MuseRealtimeClient(_ClientBase):
                     await asyncio.sleep(wait)
                 await ws.send(frame)
                 self._pacer.sent(frame_s)
+                self._log_drops()
         except ConnectionClosed:
             return
         except asyncio.CancelledError:
@@ -372,8 +378,20 @@ class MuseRealtimeClient(_ClientBase):
             if evt is None:
                 continue
             if evt.get("type") == "error":
-                log.warning("muse error event: %s", str(evt.get("message", ""))[:200])
+                # Numbers only beside the server's message: the send backlog when Muse complained.
+                log.warning("muse error event: %s (qsize=%d, dropped=%d, lead_s=%.2f)",
+                            str(evt.get("message", ""))[:200], self._queue.qsize(), self._queue.dropped,
+                            self._pacer.lead_s)
             await self._emit(evt)
+
+    def _log_drops(self) -> None:
+        """Frames the drop-oldest queue threw away (Muse slower than real time), once a minute at most."""
+        dropped = self._queue.dropped
+        now = time.monotonic()
+        if dropped > self._drops_logged and now - self._drops_logged_at >= DROP_LOG_EVERY_S:
+            log.info("muse audio frames dropped: %d in total (qsize=%d, lead_s=%.2f)", dropped, self._queue.qsize(),
+                     self._pacer.lead_s)
+            self._drops_logged, self._drops_logged_at = dropped, now
 
     async def close(self) -> None:
         """Send endStream, let Muse flush its final results, then stop. No reconnects afterwards."""

@@ -1,0 +1,24 @@
+{
+  "name": "quick_icebreaker",
+  "mode": "social",
+  "setup": "quick",
+  "skip_warmup": false,
+  "description": "Just talk: nobody speaks after the Table starts listening, so the icebreaker is decided at 3.0 s (one, never a second). Then a lively exchange; the 30 s cooldown after the icebreaker holds the first steer back until 36.0 s, and a later pause gets it 3 s after the last turn.",
+  "turns": [
+    {"seat": 1, "text": "Ha, okay, I guess I'm here because my roommate dragged me to this.", "start": 6.6, "end": 10.4},
+    {"seat": 2, "text": "Same honestly, my lab mate said the free food was worth it.", "start": 11.0, "end": 14.6},
+    {"seat": 1, "text": "Is it, though? I only saw those sad little sandwiches by the door.", "start": 15.3, "end": 19.1},
+    {"seat": 2, "text": "Okay fair, but the coffee is good, I already had two cups of it.", "start": 19.8, "end": 23.6},
+    {"seat": 1, "text": "Two cups at night is bold, are you planning to stay up coding or what?", "start": 24.4, "end": 28.4},
+    {"seat": 2, "text": "Kind of, I have a robotics demo on Friday and the arm still drifts left.", "start": 29.0, "end": 33.2},
+    {"seat": 1, "text": "Wait, a real robot arm? What is it supposed to do once it works?", "start": 33.9, "end": 37.6},
+    {"seat": 2, "text": "It sorts recycling, in theory, right now it mostly throws cans at people.", "start": 38.2, "end": 42.2}
+  ],
+  "expect": [
+    {"between": [0.0, 2.9], "action": "none"},
+    {"between": [2.9, 3.2], "action": "opener", "count": 1, "at": 3.0, "tolerance": 0.15},
+    {"between": [3.2, 45.0], "action": "opener", "count": 0},
+    {"between": [6.0, 42.2], "action": "steer", "count": 0},
+    {"between": [45.0, 45.4], "action": "steer", "count": 1, "at": 45.2, "tolerance": 0.2}
+  ]
+}

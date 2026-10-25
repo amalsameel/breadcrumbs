@@ -23,7 +23,7 @@ from fastapi import WebSocket
 
 import config
 from config import Params
-from models import Consent, Mode, OverlapSet, Phase, Profile, Trail
+from models import Consent, Mode, OverlapSet, Phase, Profile, Setup, Trail
 
 if TYPE_CHECKING:
     from engine.runner import SessionRunner
@@ -113,6 +113,7 @@ class SeatState:
     seat: int
     joined: bool = False
     consent: Consent | None = None
+    anonymous: bool = False  # "Just talk" without a typed name: shown as "Person N", never spoken
     answers: dict[str, str] = field(default_factory=dict)  # question id -> transcript (re-record replaces)
     profile: Profile | None = None
     ready: bool = False
@@ -146,6 +147,7 @@ class SeatState:
 
     def clear(self) -> None:
         self.consent = None
+        self.anonymous = False
         self.answers.clear()
         self.profile = None
         self.contact = None
@@ -159,6 +161,7 @@ class Session:
     mode: Mode
     quick: bool
     ttl_s: float
+    setup: Setup = "profiles"
     created_at: float = field(default_factory=time.time)  # unix seconds (for the UI)
     created_mono: float = field(default_factory=time.monotonic)
     phase: Phase = "lobby"
@@ -167,9 +170,11 @@ class Session:
     overlaps: OverlapSet | None = None
     runner: SessionRunner | None = None
     transcript: str = ""  # captured at End, only for the trail; wiped with the session
+    memory: dict[str, list[str]] | None = None  # "Just talk": the live memory captured at End, for the trail
     trail: Trail | None = None
     trail_ready: bool = False
     trail_task: asyncio.Task | None = None
+    wipe_task: asyncio.Task | None = None  # "Just talk": wipes the session a while after it ended
     wiped: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     connections: dict[str, set[Connection]] = field(default_factory=lambda: {r: set() for r in (*EVENT_ROLES, "audio")})
@@ -182,6 +187,11 @@ class Session:
     @property
     def names(self) -> dict[int, str]:
         return {s: (self.seats[s].name or f"Seat {s}") for s in SEATS}
+
+    @property
+    def anonymous(self) -> frozenset[int]:
+        """Seats whose name is only a placeholder ("Person 1"): never spoken or written in a thread."""
+        return frozenset(s for s in SEATS if self.seats[s].anonymous)
 
     @property
     def profiles(self) -> dict[int, Profile]:
@@ -203,6 +213,7 @@ class Session:
             "session_id": self.sid,
             "phase": self.phase,
             "mode": self.mode,
+            "setup": self.setup,
             "quick": self.quick,
             "seats": {str(s): self.seats[s].summary() for s in SEATS},
             "created_at": self.created_at,
@@ -244,8 +255,9 @@ class Session:
 
     async def shutdown(self) -> None:
         """Stop background work (runner loops, Muse, trail generation)."""
-        if self.trail_task is not None and not self.trail_task.done() and self.trail_task is not asyncio.current_task():
-            self.trail_task.cancel()
+        for task in (self.trail_task, self.wipe_task):
+            if task is not None and not task.done() and task is not asyncio.current_task():
+                task.cancel()
         if self.runner is not None:
             await self.runner.stop()
 
@@ -256,8 +268,10 @@ class Session:
         self.overlaps = None
         self.runner = None
         self.transcript = ""
+        self.memory = None
         self.trail = None
         self.trail_task = None
+        self.wipe_task = None
         for conns in self.connections.values():
             conns.clear()
 
@@ -284,13 +298,13 @@ class SessionStore:
     def __contains__(self, sid: object) -> bool:
         return sid in self._sessions
 
-    def create(self, mode: Mode, quick: bool) -> Session:
+    def create(self, mode: Mode, quick: bool, setup: Setup = "profiles") -> Session:
         sid = new_session_id()
         while sid in self._sessions:
             sid = new_session_id()
-        session = Session(sid=sid, mode=mode, quick=quick, ttl_s=self.ttl_s)
+        session = Session(sid=sid, mode=mode, quick=quick, ttl_s=self.ttl_s, setup=setup)
         self._sessions[sid] = session
-        log.info("session created (mode=%s, quick=%s, open=%d)", mode, quick, len(self._sessions))
+        log.info("session created (setup=%s, mode=%s, quick=%s, open=%d)", setup, mode, quick, len(self._sessions))
         return session
 
     def peek(self, sid: str) -> Session | None:

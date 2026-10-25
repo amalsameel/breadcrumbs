@@ -8,7 +8,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-Mode = Literal["social", "networking", "speed_dating"]
+Mode = Literal["social", "networking", "speed_dating"]  # kept internally; new sessions use "social"
+# "quick" ("Just talk"): no phones, consent on the Table, memory learned live. "profiles": phones, interview,
+# profiles, calibration and the overlap opener.
+Setup = Literal["quick", "profiles"]
 Seat = Literal[1, 2]
 Phase = Literal["lobby", "profiles", "calibrating", "live", "ended"]
 CrumbKind = Literal["opener", "steer", "switch", "manual", "wildcard"]
@@ -22,6 +25,7 @@ class Consent(BaseModel):
     typed_name: str
     agreed: bool
     at: float
+    source: Literal["phone", "table"] = "phone"  # "table": both people agreed on the laptop ("Just talk")
 
 
 class ProfileItem(BaseModel):
@@ -107,6 +111,7 @@ class Turn(BaseModel):
     ended_at: float = 0.0
     gap_before: float | None = None  # silence between previous turn end and this start
     dropped_as_bot: bool = False  # self-hearing guard (PRD 8.11)
+    background: bool = False  # a voice away from the table (bystander, far voice): not part of the conversation
 
     @property
     def is_short(self) -> bool:
@@ -114,8 +119,15 @@ class Turn(BaseModel):
 
 
 class CreateSessionBody(BaseModel):
+    setup: Setup = "quick"
     mode: Mode = "social"
-    quick: bool = False  # Quick profile: only Q1 (PRD 6.3 demo mode)
+    quick: bool = False  # profiles setup only: Quick profile, only Q1 (PRD 6.3 demo mode)
+
+
+class StartBody(BaseModel):
+    """POST /api/sessions/{sid}/start ("Just talk"): optional names, blank = "Person 1" / "Person 2"."""
+
+    names: dict[Literal["1", "2"], str] | None = None
 
 
 class ConsentBody(BaseModel):

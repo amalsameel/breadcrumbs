@@ -1,11 +1,12 @@
 // X-ray drawer (PRD 6.6, F18, 14.3): the engine's reasoning, live, in monospace readouts.
 import { motion } from "framer-motion";
 import { useEffect, useRef, type ReactNode } from "react";
-import type { EngineSnapshot, Seat } from "../lib/types";
+import type { EngineSnapshot, Memory, Seat } from "../lib/types";
 import type { TableActions, TableView } from "../lib/useTable";
 import Sparkline from "./Sparkline";
 import { Icon } from "./table/Icon";
 import { fmt, noiseSuspected, sourceCaption, staleThreshold } from "./table/format";
+import { isQuick } from "./table/tableState";
 import { TuningPanel } from "./table/TuningPanel";
 import { DevTurnBox } from "./table/DevTurnBox";
 
@@ -61,6 +62,7 @@ export default function XRay({ view, actions, names, onClose }: XRayProps) {
         ) : (
           <p className="text-ink-muted">Waiting for the engine. It starts once both seats are ready.</p>
         )}
+        <MemorySection memory={view.memory} names={names} quick={isQuick(view.session)} />
         <TranscriptSection view={view} names={names} />
         <DecisionSection view={view} />
         <LabelMapSection labelMap={view.labelMap} names={names} />
@@ -256,6 +258,11 @@ function StateSection({ engine }: { engine: EngineSnapshot }) {
           {[engine.turn_active && "turn", engine.vad_active && "vad", engine.tts_playing && "tts"].filter(Boolean).join(" ") || "quiet"}
         </Row>
         <Row k="background noise">{noiseSuspected(engine) ? "ignored (steady noise)" : "clear"}</Row>
+        <Row k="defer">{engine.defer ?? "none"}</Row>
+        <Row k="seated level">
+          {engine.seat_level_db === null || engine.seat_level_db === undefined ? "learning" : `${fmt(engine.seat_level_db)} dB`}
+          {engine.background_turns ? ` · ${engine.background_turns} away` : ""}
+        </Row>
         <Row k="flags">
           {[engine.listening_paused && "paused", engine.auto_paused && "safety", engine.quiet_hint && "quiet_hint"]
             .filter(Boolean)
@@ -294,7 +301,7 @@ function LastCrumbSection({ view, names }: { view: TableView; names: Record<Seat
         <Row k="kind / format">
           {c.kind} / {c.format}
         </Row>
-        <Row k="source">{sourceCaption(c, names)}</Row>
+        <Row k="source">{sourceCaption(c, names, isQuick(view.session))}</Row>
         <Row k="depth">{c.depth}</Row>
         <Row k="topic">{c.topic}</Row>
         <Row k="latency">
@@ -302,6 +309,46 @@ function LastCrumbSection({ view, names }: { view: TableView; names: Record<Seat
         </Row>
         <Row k="playback">{last.status}</Row>
       </dl>
+    </Section>
+  );
+}
+
+/** What the table learned from the conversation (WS `memory`). In a quick table it stands in for profiles. */
+function MemorySection({ memory, names, quick }: { memory: Memory | null; names: Record<Seat, string>; quick: boolean }) {
+  const groups: { key: keyof Memory; label: string }[] = [
+    { key: "1", label: names[1] },
+    { key: "2", label: names[2] },
+    { key: "shared", label: "shared" },
+    { key: "threads", label: "open threads" },
+  ];
+  const count = memory ? groups.reduce((n, g) => n + (memory[g.key]?.length ?? 0), 0) : 0;
+  return (
+    <Section title="Memory" aside={<span className="text-ink-muted">{count} items</span>}>
+      {!memory || count === 0 ? (
+        <p className="text-ink-muted">
+          {quick ? "Nothing learned yet. It fills in from the conversation." : "Nothing learned from the conversation yet."}
+        </p>
+      ) : (
+        <dl className="space-y-2.5">
+          {groups.map(({ key, label }) =>
+            memory[key]?.length ? (
+              <div key={key}>
+                <dt className="text-[10px] uppercase tracking-[0.16em] text-ink-muted">{label}</dt>
+                <dd className="mt-1 flex flex-wrap gap-1.5">
+                  {memory[key].map((item, i) => (
+                    <span
+                      key={`${i}-${item}`}
+                      className="rounded-full border border-line bg-bg px-2.5 py-0.5 font-sans text-[12px] leading-snug text-ink"
+                    >
+                      {item}
+                    </span>
+                  ))}
+                </dd>
+              </div>
+            ) : null,
+          )}
+        </dl>
+      )}
     </Section>
   );
 }
@@ -325,10 +372,16 @@ function TranscriptSection({ view, names }: { view: TableView; names: Record<Sea
       <div ref={boxRef} className="max-h-64 space-y-1.5 overflow-y-auto rounded-xl border border-line bg-bg p-3" aria-live="off">
         {turns.length === 0 && !partial && <p className="text-ink-muted">No turns yet.</p>}
         {turns.map((t) => (
-          <p key={t.turn_id} className={t.dropped_as_bot ? "text-ink-muted/70 line-through decoration-ink-muted/40" : ""}>
-            <span className={t.dropped_as_bot ? "" : "font-medium text-amber-ink"}>{who(t.seat, t.label)}</span>{" "}
-            <span className={`font-sans text-[13px] ${t.dropped_as_bot ? "" : "text-ink"}`}>{t.text}</span>
+          <p
+            key={t.turn_id}
+            className={
+              t.dropped_as_bot ? "text-ink-muted/70 line-through decoration-ink-muted/40" : t.background ? "text-ink-muted/70" : ""
+            }
+          >
+            <span className={t.dropped_as_bot || t.background ? "" : "font-medium text-amber-ink"}>{who(t.seat, t.label)}</span>{" "}
+            <span className={`font-sans text-[13px] ${t.dropped_as_bot || t.background ? "" : "text-ink"}`}>{t.text}</span>
             {t.dropped_as_bot && <Tag>bot</Tag>}
+            {t.background && <Tag>away</Tag>}
             {t.hold && <Tag>hold:{t.hold}</Tag>}
             {t.is_question && <Tag>?</Tag>}
           </p>
@@ -347,6 +400,14 @@ function Tag({ children }: { children: ReactNode }) {
   return <span className="ml-1.5 rounded border border-line px-1 text-[10px] not-italic text-ink-muted">{children}</span>;
 }
 
+/** The numbers behind a background_turn decision (for the live tuning of the near / far margins). */
+function backgroundNumbers(inputs: Record<string, unknown>): string {
+  const n = (k: string, unit = "") => (typeof inputs[k] === "number" ? `${k} ${inputs[k]}${unit}` : null);
+  return [n("words"), n("active_frac"), n("level_db", " dB"), n("seat_db", " dB"), n("duration_s", " s")]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 function DecisionSection({ view }: { view: TableView }) {
   const items = view.decisions.slice(0, 40);
   return (
@@ -359,7 +420,12 @@ function DecisionSection({ view }: { view: TableView }) {
             <li key={`${d.at_s}-${d.action}-${i}`} className="grid grid-cols-[52px_80px_1fr] gap-2">
               <span className="tabular-nums text-ink-muted">+{fmt(d.at_s)}</span>
               <span className="font-medium text-amber-ink">{d.action}</span>
-              <span className="font-sans text-[12px] text-ink-muted">{d.reason}</span>
+              <span className="font-sans text-[12px] text-ink-muted">
+                {d.reason}
+                {d.action === "background_turn" && d.inputs && (
+                  <span className="block font-mono text-[10px] text-ink-muted/80">{backgroundNumbers(d.inputs)}</span>
+                )}
+              </span>
             </li>
           ))}
         </ol>

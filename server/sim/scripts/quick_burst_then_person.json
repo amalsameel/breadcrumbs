@@ -1,0 +1,48 @@
+{
+  "name": "quick_burst_then_person",
+  "mode": "social",
+  "setup": "quick",
+  "skip_warmup": false,
+  "description": "Just talk: a 0.6 s cup clink (-42 dB) opens the shared defer window, so Person 1's onset 1.2 s later latches the room at its first frame. The floor is measured on the clink, not on that onset: Person 1 (Muse 0.9 s late) is near, defers the icebreaker and keeps their turn.",
+  "noise": [
+    {
+      "start": 0.4,
+      "end": 1.0,
+      "level_db": -42.0
+    }
+  ],
+  "duration": 16.0,
+  "turns": [
+    {
+      "seat": 1,
+      "text": "Hi, is this seat taken or can I sit here for a bit before the talk?",
+      "start": 2.2,
+      "end": 6.6,
+      "muse_lag_s": 0.9
+    },
+    {
+      "seat": 2,
+      "text": "Go for it, I am just waiting for the next session to start here.",
+      "start": 7.8,
+      "end": 11.5
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        0.0,
+        16.0
+      ],
+      "action": "opener",
+      "count": 0
+    },
+    {
+      "between": [
+        0.0,
+        16.0
+      ],
+      "action": "dropped_as_bot",
+      "count": 0
+    }
+  ]
+}

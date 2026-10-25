@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
-from config import MODE_MULTIPLIER, WILDCARD_MIN_SILENCE_S, Params
+from config import MODE_MULTIPLIER, Params
 from models import Band, CrumbKind, HoldKind, Mode
 from engine.staleness import clamp
 
@@ -50,6 +50,12 @@ def thresholds(params: Params, mode: Mode, gap_ref: float | None = None) -> Thre
 
 def effective_thresholds(base: Thresholds, hold: HoldKind | None) -> Thresholds:
     return base.doubled() if hold == "think" else base
+
+
+def unanswered_switch_s(th: Thresholds, params: Params, hold: HoldKind | None) -> float:
+    """Silence before the follow-up switch after a crumb nobody answered (doubled under a think hold, like
+    the thresholds): never earlier than the exceptional threshold."""
+    return max(th.t_exc, params.UNANSWERED_SWITCH_S * (2 if hold == "think" else 1))
 
 
 def band(silence_s: float, th: Thresholds) -> Band:
@@ -244,7 +250,7 @@ def evaluate(inp: TickInputs, params: Params) -> Outcome:
         return out(blocked="max automatic crumbs per 10 minutes")
 
     if inp.crumbs_this_silence >= 1:
-        if s + EPS >= th.t_exc:
+        if s + EPS >= unanswered_switch_s(th, params, inp.hold):
             return out("switch", "last crumb got no reply (exceptionally long pause)")
         return out(blocked="waiting for a reply")
 
@@ -256,8 +262,9 @@ def evaluate(inp: TickInputs, params: Params) -> Outcome:
         if inp.steer_unlanded:
             return out("switch", "unusually long pause, previous steer did not land (2 or fewer replies)")
         return out("steer", "unusually long pause, conversation still lively")
-    if inp.wildcard_ok and inp.regular_ok and s + EPS >= WILDCARD_MIN_SILENCE_S and s + EPS < th.t_long:
-        return out("wildcard", "natural pause of 3 s or more, wildcard drop")
+    # The wildcard window sits just under the long threshold (the last second of the warming band).
+    if inp.wildcard_ok and inp.regular_ok and s + EPS >= max(th.t_normal, th.t_long - 1.0) and s + EPS < th.t_long:
+        return out("wildcard", "natural pause, wildcard drop")
     if s + EPS >= th.t_long:
         return out(blocked="cooldown")
     return out()

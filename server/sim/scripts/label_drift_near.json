@@ -1,0 +1,83 @@
+{
+  "name": "label_drift_near",
+  "mode": "social",
+  "description": "After calibration, diarization drifts and seat 1 comes back as label C, still near (-30 dB) and in long turns with 1.2 s gaps. Near voices with 3+ words on an unmapped label are seats: no crumb during the exchange, and the steer only 3.0 s after the last turn.",
+  "duration": 48.4,
+  "turns": [
+    {
+      "seat": 1,
+      "label": "C",
+      "text": "So I just got back from a climbing trip in Colorado last weekend.",
+      "start": 0.0,
+      "end": 4.5
+    },
+    {
+      "seat": 2,
+      "label": "B",
+      "text": "No way, I have always wanted to go climbing out there. Which area?",
+      "start": 5.7,
+      "end": 10.2
+    },
+    {
+      "seat": 1,
+      "label": "C",
+      "text": "We were near Boulder, mostly the Flatirons, which honestly have the best views ever.",
+      "start": 11.4,
+      "end": 15.9
+    },
+    {
+      "seat": 2,
+      "label": "B",
+      "text": "That sounds amazing, I mostly climb indoors at the gym near campus right now.",
+      "start": 17.1,
+      "end": 21.6
+    },
+    {
+      "seat": 1,
+      "label": "C",
+      "text": "Indoor is great for training though, do you boulder or do top rope routes?",
+      "start": 22.8,
+      "end": 27.3
+    },
+    {
+      "seat": 2,
+      "label": "B",
+      "text": "Mostly bouldering, my friends dragged me there freshman year and I got hooked.",
+      "start": 28.5,
+      "end": 33.0
+    },
+    {
+      "seat": 1,
+      "label": "C",
+      "text": "Same thing happened to me with running, a friend signed me up for a race.",
+      "start": 34.2,
+      "end": 38.7
+    },
+    {
+      "seat": 2,
+      "label": "B",
+      "text": "Did you end up liking it or was it pure suffering the whole time?",
+      "start": 39.9,
+      "end": 44.4
+    }
+  ],
+  "expect": [
+    {
+      "between": [
+        0.0,
+        47.199999999999996
+      ],
+      "action": "none"
+    },
+    {
+      "between": [
+        47.199999999999996,
+        47.8
+      ],
+      "action": "steer",
+      "count": 1,
+      "at": 47.4,
+      "tolerance": 0.15
+    }
+  ]
+}

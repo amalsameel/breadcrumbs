@@ -21,7 +21,6 @@ import {
   trailForSeat,
   waitingLine,
 } from "./flow.ts";
-import { classifyGesture, keepsOrb, nearestPos, SLOT_REACH, wrapIndex } from "../ui/carousel.ts";
 
 function seatSummary(over = {}) {
   return {
@@ -229,45 +228,61 @@ function functionBody(text, name) {
   return text.slice(start, next < 0 ? undefined : next);
 }
 
-test("carousel: a rightward drag is 'previous' and swallows the click; a tap selects", () => {
-  // The reported case: drag from x 1040 to 1130 on the right neighbor must step back, not pick it.
-  assert.deepEqual(classifyGesture(90, 0), { kind: "swipe", delta: -1 });
-  assert.deepEqual(classifyGesture(-90, 4), { kind: "swipe", delta: 1 });
-  assert.deepEqual(classifyGesture(3, 2), { kind: "tap" });
-  // Moved too far for a tap but not a swipe (or mostly vertical): neither steps nor picks.
-  assert.deepEqual(classifyGesture(30, 0), { kind: "drag" });
-  assert.deepEqual(classifyGesture(60, 80), { kind: "drag" });
-});
+// ---- Home: one orb, two setups, no modes (round 4) -------------------------------------------
 
-test("carousel: Home swallows the post-gesture click in the capture phase, never a keyboard click", async () => {
+test("home: one central orb, no mode carousel, no side orbs, no mode cards", async () => {
   const home = await readSrc("pages/Home.tsx");
-  const carousel = functionBody(home, "OrbCarousel");
-  assert.match(carousel, /onClickCapture=\{onClickCapture\}/);
-  assert.match(carousel, /suppressClick\.current = gesture\.kind !== "tap"/);
-  assert.match(carousel, /e\.detail === 0/);
+  assert.equal(home.split("<CrumbOrb").length - 1, 1, "exactly one orb on Home");
+  for (const gone of ["OrbCarousel", "CarouselSlot", "carousel", "ChevronButton", "MODE_COPY", "MODES", "OrbDot"]) {
+    assert.ok(!home.includes(gone), `Home still mentions ${gone}`);
+  }
+  assert.match(home, /Start a conversation/);
 });
 
-test("carousel: nearestPos wraps both ways without jumping across the stage", () => {
-  assert.equal(nearestPos(0, 2, 3), -1); // Social -> Speed dating is one step back
-  assert.equal(nearestPos(0, 1, 3), 1);
-  assert.equal(nearestPos(5, 0, 3), 6); // 5 shows index 2; index 0 is the next one
-  assert.equal(wrapIndex(-4, 3), 2);
-});
-
-test("carousel: one persistent play button outside the keyed slots keeps focus across steps", async () => {
+test("home: a setup switch with one line each, Just talk first and default, profile length only for profiles", async () => {
   const home = await readSrc("pages/Home.tsx");
-  assert.equal(home.split("data-carousel-play").length - 1, 1, "exactly one play button");
-  assert.ok(!functionBody(home, "CarouselSlot").includes("<button"), "slots must not own a button");
-  const carousel = functionBody(home, "OrbCarousel");
-  assert.match(carousel, /onClick=\{\(\) => onStart\(current\)\}/);
-  assert.match(carousel, /aria-label=\{`Set the table for \$\{copy\.label\}`\}/);
+  assert.match(home, /useState<Setup>\("quick"\)/);
+  assert.ok(home.indexOf('label: "Just talk"') < home.indexOf('label: "With profiles"'));
+  assert.match(home, /describedBy="setup-line"/);
+  assert.match(home, /setup === "profiles" && \(/);
+  assert.match(home, /Quick profile/);
+  assert.match(home, /Full profile/);
+  // A quick table never sends the profile-length flag; neither setup sends a mode.
+  assert.match(home, /setup === "profiles" \? \{ setup, quick: profileLength === "quick" \} : \{ setup \}/);
+  assert.ok(!/mode:/.test(home.slice(home.indexOf("createSession"))), "Home must not pick a mode");
 });
 
-test("carousel: an orb leaving the visible range stays mounted while it slides out", async () => {
-  // Offset 2 is visible (opacity 0.4); one step later it is offset 3 and must still render its orb.
-  for (let d = 0; d <= SLOT_REACH; d++) assert.ok(keepsOrb(d), `orb at distance ${d} unmounted`);
-  const home = await readSrc("pages/Home.tsx");
-  assert.match(functionBody(home, "CarouselSlot"), /keepsOrb\(dist\) && <CrumbOrb/);
+test("no preset category labels anywhere in the UI", async () => {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const src = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const walk = async (dir) => {
+    const out = [];
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      if (e.name === "__tests__") continue;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) out.push(...(await walk(p)));
+      else if (/\.tsx$/.test(e.name)) out.push(p);
+    }
+    return out;
+  };
+  for (const f of await walk(src)) {
+    const text = await readFile(f, "utf8");
+    for (const label of ['"Speed dating"', '"Networking"', ">Speed dating<", ">Networking<", "MODE_LABEL", "MODE_PALETTE", "MODE_COPY"]) {
+      assert.ok(!text.includes(label), `${label} in ${f}`);
+    }
+  }
+});
+
+test("join: a quick table's phone link shows the no-phones note before any seat socket opens", async () => {
+  const join = await readSrc("pages/Join.tsx");
+  const gate = functionBody(join, "SetupGate");
+  assert.match(gate, /s\.setup === "quick"/);
+  assert.match(gate, /<NoPhonesStep \/>/);
+  assert.ok(!gate.includes("useSeatSession"), "the gate must not claim a seat");
+  const quiet = await readSrc("components/phone/QuietSteps.tsx");
+  assert.match(quiet, /This table doesn't need phones/);
 });
 
 test("narrow screens: segmented options and pills shrink and truncate instead of clipping", async () => {

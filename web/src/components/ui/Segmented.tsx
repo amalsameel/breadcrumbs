@@ -42,7 +42,7 @@ export function Segmented<T extends string>({
     refs.current[next]?.focus();
   }
 
-  // Large options step their padding and size down with the viewport so three mode names fit whole at
+  // Large options step their padding and size down with the viewport so long labels fit whole at
   // 320 px. As a last resort options shrink and their labels truncate instead of overflowing.
   const pad =
     size === "lg"

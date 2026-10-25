@@ -2,6 +2,14 @@
   "name": "exceptional_pause",
   "mode": "social",
   "description": "A 7 s pause starting 20 s after a previous crumb: the regular cooldown blocks the 5 s steer, so one switch at 6.5 s.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "prior_crumb_at": 21.5,
   "turns": [
     {

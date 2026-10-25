@@ -19,6 +19,17 @@ request leaves the process. Nothing prints transcript or crumb text: only counts
 Usage (from server/):
     .venv/bin/python -m sim.usage            # table on stdout
     .venv/bin/python -m sim.usage --json out.json
+    .venv/bin/python -m sim.usage --bystanders   # also: bystander fragments, gating on vs off
+    .venv/bin/python -m sim.usage --setup quick  # the "Just talk" setup (no phones, no names, live memory)
+    .venv/bin/python -m sim.usage --setup both   # both setups, then a side-by-side summary
+
+"Just talk" (`--setup quick`): no profiles, overlaps or calibration; nobody says a name; the Table starts
+listening and nobody speaks for a few seconds, so the icebreaker goes out first; the live memory rides on
+the energy tag calls; the session ends with the Table's own trail (memory + transcript).
+
+The Table VAD carries levels like the real one: the people at the table at -30 dB, venue noise at -42 dB.
+With --bystanders, a voice behind the table (Muse label C, never heard by the Table VAD) says a short
+fragment every few seconds whenever the two people are quiet.
 """
 from __future__ import annotations
 
@@ -53,10 +64,11 @@ import ai.elevenlabs as elevenlabs_mod  # noqa: E402
 import ai.gemini as gemini_mod  # noqa: E402
 import ai.tts as tts_mod  # noqa: E402
 from ai.claude import Claude  # noqa: E402
-from ai.classifiers import mock_energy, mock_hold  # noqa: E402
+from ai.classifiers import EnergyMemoryDraft, mock_energy, mock_hold  # noqa: E402
 from ai.crumbs import CrumbDraft  # noqa: E402
 from ai.elevenlabs import ElevenLabs  # noqa: E402
 from ai.gemini import Gemini  # noqa: E402
+from ai.memory import mock_memory  # noqa: E402
 from ai.profiles import (  # noqa: E402
     OverlapDraft,
     OverlapDraftSet,
@@ -70,7 +82,7 @@ from ai.profiles import (  # noqa: E402
 from ai.trail import TrailDraft, generate_trail, mock_trail  # noqa: E402
 from engine.hold import hold_vetoed, is_ambiguous_fragment, match_hold  # noqa: E402
 from engine.runner import SessionRunner  # noqa: E402
-from models import Consent, EnergyTag, HoldDecision  # noqa: E402
+from models import Consent, EnergyTag, HoldDecision, OverlapSet  # noqa: E402
 from session_store import Session  # noqa: E402
 
 # --- Latency model (virtual seconds) ------------------------------------------------------------------
@@ -79,6 +91,7 @@ CLAUDE_LATENCY_S = {
     "CrumbDraft": 3.7,
     "HoldDecision": 2.5,
     "EnergyTag": 2.5,
+    "EnergyMemoryDraft": 3.0,  # the energy tag plus up to 12 short memory items (a longer answer)
     "ProfileDraft": 7.5,
     "OverlapDraftSet": 8.0,
     "TrailDraft": 7.0,
@@ -96,6 +109,12 @@ BROWSER_VOICE_S_PER_WORD = 0.4
 SECONDS_PER_WORD = 0.36
 REPLY_AFTER_CRUMB_S = 1.0
 TARGET_HIT_S = 0.7  # PRD 8.10: threshold crossed to audio start on a cache hit
+TARGET_STEER_S = 3.0  # the automatic steer is decided 3 s into a pause (T_LONG_S)
+SEAT_DB, NOISE_DB, QUIET_DB = -30.0, -42.0, -60.0  # speech-band levels the Table VAD reports
+BYSTANDER_EVERY_S = 4.0
+BYSTANDER_LINES = ["yeah", "no way", "wait what did she say", "uh huh", "that is so funny", "okay"]
+BYSTANDER_TURN_S = 0.8
+BYSTANDER_ID_BASE = 500_000
 NAMES = {1: "Maya", 2: "Dev"}
 ANSWERS = {
     1: [
@@ -303,6 +322,9 @@ class Ledger:
     human_turns: int = 0
     live_at: float | None = None
     ended_at: float | None = None
+    # automatic steer/switch decisions: {"kind", "at", "silence"} plus "voice" once its words start playing
+    auto_crumbs: list[dict] = field(default_factory=list)
+    bystander_turns: int = 0
 
     def new_call(self, **kw: Any) -> Call:
         call = Call(path=PATH.get(), **kw)
@@ -357,6 +379,7 @@ class FakeAnthropic:
             "CrumbDraft": f"crumb {payload.get('kind', '?') if isinstance(payload, dict) else '?'}",
             "HoldDecision": "hold classifier",
             "EnergyTag": "energy tagger",
+            "EnergyMemoryDraft": "energy tagger",
             "ProfileDraft": "profile",
             "OverlapDraftSet": "overlaps",
             "TrailDraft": "trail",
@@ -393,6 +416,12 @@ class FakeAnthropic:
             return mock_hold(user)
         if name == "EnergyTag":
             return mock_energy(user)
+        if name == "EnergyMemoryDraft":
+            turns = payload.get("turns", "") if isinstance(payload, dict) else str(payload)
+            names = {int(k): v for k, v in (payload.get("names") or {}).items()} if isinstance(payload, dict) else {}
+            tag, delta = mock_energy(turns), mock_memory(turns, names)
+            return EnergyMemoryDraft(topic=tag.topic, energy=tag.energy, winding_down=tag.winding_down,
+                                     **delta.model_dump())
         if name == "ProfileDraft":
             return ProfileDraft(items=mock_profile_items(payload["mode"], payload["answers"]), vibe="warm, curious")
         if name == "OverlapDraftSet":
@@ -406,6 +435,8 @@ class FakeAnthropic:
     def _crumb(self, p: dict) -> CrumbDraft:
         """A valid ~24-word crumb for the plan in the payload (real crumbs are 20 to 28 words)."""
         n1, n2 = p["names"]["1"], p["names"]["2"]
+        if p.get("names_unknown"):  # "Just talk" with no names: the labels are never spoken
+            n1, n2 = "Okay", "Whoever"  # same word counts as the named crumbs (real crumbs are 20 to 28 words)
         kind, src = p.get("kind"), p.get("requested_source")
         ids = list(p.get("requested_item_ids") or [])
         fact = p.get("verified_fact")
@@ -497,6 +528,9 @@ class FakeTable:
         if kind == "crumb":
             crumb = evt["crumb"]
             self.crumbs_seen += 1
+            waiting = next((a for a in self.ledger.auto_crumbs if "crumb_id" not in a), None)
+            if waiting is not None and crumb["kind"] in ("steer", "switch"):
+                waiting["crumb_id"] = crumb["id"]
             self.ledger.played[crumb["id"]] = Played(
                 crumb_id=crumb["id"], kind=crumb["kind"], source=crumb["source"], at=loop.time(),
                 latency_ms=float(evt.get("latency_ms") or 0.0), cache_hit=bool(evt.get("cache_hit")),
@@ -507,7 +541,11 @@ class FakeTable:
             self.ledger.system_lines.append(evt["id"])
             self._spawn(self._play(evt["id"], evt.get("audio_b64") or "", len(evt["text"].split()), False))
         elif kind == "decision":
-            self.ledger.decisions[evt["decision"].get("action", "?")] += 1
+            d = evt["decision"]
+            self.ledger.decisions[d.get("action", "?")] += 1
+            silence = (d.get("inputs") or {}).get("silence_s")
+            if d.get("action") in ("steer", "switch") and silence is not None:  # an automatic decision
+                self.ledger.auto_crumbs.append({"kind": d["action"], "at": loop.time(), "silence": float(silence)})
         elif kind == "crumb_interrupted":
             self.interrupted.add(evt["crumb_id"])
             if evt["crumb_id"] in self.ledger.played:
@@ -523,6 +561,9 @@ class FakeTable:
         await asyncio.sleep(TABLE_NET_S)
         self.current = line_id  # a newer line supersedes the old one (it ends at its next step)
         self.runner.on_tts_state(line_id, True)
+        for auto in self.ledger.auto_crumbs:
+            if auto.get("crumb_id") == line_id and "voice" not in auto:  # the words start after the chime
+                auto["voice"] = auto["silence"] + asyncio.get_running_loop().time() + CHIME_S - auto["at"]
         if audio_b64:
             seconds = max(0.0, (len(base64.b64decode(audio_b64)) - 44) / 48_000)
         else:
@@ -728,19 +769,48 @@ def instrument(runner: SessionRunner, ledger: Ledger, gateway: Gemini) -> None:
 class Driver:
     """Plays the two people: Muse-shaped turns (runner.dev_turn), local VAD at 10 Hz, controls."""
 
-    def __init__(self, runner: SessionRunner, table: FakeTable, ledger: Ledger) -> None:
+    def __init__(self, runner: SessionRunner, table: FakeTable, ledger: Ledger, *, bystanders: bool = False,
+                 setup: str = "profiles") -> None:
         self.runner = runner
+        self.setup = setup
         self.table = table
         self.ledger = ledger
         self.speaking = False
         self.noise = False
+        self.bystanders = bystanders
         self.loop = asyncio.get_running_loop()
+        self._voice_end: float | None = None
 
     async def vad_loop(self) -> None:
         while True:
+            now = self.loop.time()
+            if self.speaking:
+                level, quiet = SEAT_DB, 0
+                self._voice_end = now
+            else:
+                level = NOISE_DB if self.noise else QUIET_DB
+                quiet = 0 if self._voice_end is None else min(60_000, round((now - self._voice_end) * 1000))
             active = self.speaking or self.noise
-            self.runner.on_vad(active, 0.08 if active else 0.002)
+            self.runner.on_vad(active, 10 ** (level / 20), level, quiet)
             await asyncio.sleep(0.1)
+
+    async def bystander_loop(self) -> None:
+        """A voice behind the table: Muse hears a short fragment (label C), the Table VAD does not."""
+        n = 0
+        while True:
+            await asyncio.sleep(BYSTANDER_EVERY_S)
+            if self.speaking or self.runner.engine.phase != "live":
+                continue
+            n += 1
+            self.ledger.bystander_turns += 1
+            turn_id, text = BYSTANDER_ID_BASE + n, BYSTANDER_LINES[n % len(BYSTANDER_LINES)]
+            self.runner._feed({"type": "speechStart", "turnId": turn_id})
+            await asyncio.sleep(BYSTANDER_TURN_S)
+            self.runner._feed({"type": "transcript", "transcript": text, "final": False})
+            self.runner._feed({"type": "speaker", "label": "C"})
+            self.runner._feed({"type": "speechEnd", "turnId": turn_id})
+            await asyncio.sleep(0.2)
+            self.runner._feed({"type": "speechComplete", "turnId": turn_id, "transcript": text})
 
     async def until(self, cond: Any, timeout: float) -> bool:
         end = self.loop.time() + timeout
@@ -766,6 +836,13 @@ class Driver:
 
     async def calibrate(self) -> None:
         self.runner.ensure_calibration()
+        if self.setup == "quick":
+            # "Just talk": live at once. Nobody speaks yet, so the icebreaker goes out at T_LONG_S; they answer it.
+            await self.until(lambda: self.runner.engine.phase == "live", 5.0)
+            self.ledger.live_at = self.loop.time()
+            await self.until(lambda: self.table.crumbs_seen >= 1, 15.0)
+            await self.answer_after_crumb()
+            return
         await self.until(lambda: "sys_cal1" in self.table.finished, 20.0)
         await asyncio.sleep(0.6)
         await self.say(1, "Hi Dev, I'm Maya and I'm from Austin, born and raised.")
@@ -831,7 +908,8 @@ class Driver:
 # --- Session ---------------------------------------------------------------------------------------------------
 
 
-async def run_session() -> tuple[Ledger, dict]:
+async def run_session(*, bystanders: bool = False, params: dict | None = None,
+                      setup: str = "profiles") -> tuple[Ledger, dict]:
     ledger = Ledger()
     loop = asyncio.get_running_loop()
     counter = _LogCounter(ledger)
@@ -841,14 +919,15 @@ async def run_session() -> tuple[Ledger, dict]:
     root.setLevel(logging.INFO)
     root.propagate = False
     try:
-        return await _run_session(ledger, loop)
+        return await _run_session(ledger, loop, bystanders=bystanders, params=params, setup=setup)
     finally:
         root.removeHandler(counter)
         root.setLevel(saved[0])
         root.propagate = saved[1]
 
 
-async def _run_session(ledger: Ledger, loop: asyncio.AbstractEventLoop) -> tuple[Ledger, dict]:
+async def _run_session(ledger: Ledger, loop: asyncio.AbstractEventLoop, *, bystanders: bool = False,
+                       params: dict | None = None, setup: str = "profiles") -> tuple[Ledger, dict]:
 
     fake_claude = FakeAnthropic(ledger)
     gateway = Gemini(mock=False, api_key="", meta_api_key="",
@@ -857,20 +936,29 @@ async def _run_session(ledger: Ledger, loop: asyncio.AbstractEventLoop) -> tuple
     gemini_mod._singleton = gateway
     elevenlabs_mod._singleton = voice
 
-    session = Session(sid="usage-sim", mode="social", quick=False, ttl_s=7200)
+    quick = setup == "quick"
+    session = Session(sid="usage-sim", mode="social", quick=False, ttl_s=7200, setup="quick" if quick else "profiles")
+    session.params.update(params or {})
     for seat, name in NAMES.items():
-        session.seats[seat].consent = Consent(typed_name=name, agreed=True, at=0.0)
+        if quick:  # "We're both in" on the Table, with no names typed (the common case)
+            session.seats[seat].consent = Consent(typed_name=f"Person {seat}", agreed=True, at=0.0, source="table")
+            session.seats[seat].anonymous = True
+        else:
+            session.seats[seat].consent = Consent(typed_name=name, agreed=True, at=0.0)
         session.seats[seat].ready = True
 
-    # Setup (before the Table goes live): two profiles and the overlap finder.
-    PATH.set("setup")
-    for seat in (1, 2):
-        session.seats[seat].profile = await extract_profile(seat, "social", NAMES[seat], ANSWERS[seat], gemini=gateway)
-    p1, p2 = session.seats[1].profile, session.seats[2].profile
-    assert p1 is not None and p2 is not None
-    fake_claude.overlap_source = lambda: mock_overlaps(allowed_items(p1), allowed_items(p2), dict(NAMES),
-                                                       {1: p1, 2: p2})
-    overlaps = await find_overlaps(p1, p2, "social", gemini=gateway)
+    if quick:
+        overlaps = OverlapSet(overlaps=[])  # no profiles, no overlap finder
+    else:
+        # Setup (before the Table goes live): two profiles and the overlap finder.
+        PATH.set("setup")
+        for seat in (1, 2):
+            session.seats[seat].profile = await extract_profile(seat, "social", NAMES[seat], ANSWERS[seat], gemini=gateway)
+        p1, p2 = session.seats[1].profile, session.seats[2].profile
+        assert p1 is not None and p2 is not None
+        fake_claude.overlap_source = lambda: mock_overlaps(allowed_items(p1), allowed_items(p2), dict(NAMES),
+                                                           {1: p1, 2: p2})
+        overlaps = await find_overlaps(p1, p2, "social", gemini=gateway)
 
     table = FakeTable(ledger)
     session.register(table)  # type: ignore[arg-type]
@@ -884,23 +972,32 @@ async def _run_session(ledger: Ledger, loop: asyncio.AbstractEventLoop) -> tuple
     instrument(runner, ledger, gateway)
     PATH.set("other")
     runner.start()
-    driver = Driver(runner, table, ledger)
-    vad = loop.create_task(driver.vad_loop())
+    driver = Driver(runner, table, ledger, bystanders=bystanders, setup=setup)
+    background = [loop.create_task(driver.vad_loop())]
+    if bystanders:
+        background.append(loop.create_task(driver.bystander_loop()))
     try:
         await driver.run()
     finally:
-        vad.cancel()
+        for task in background:
+            task.cancel()
     ledger.ended_at = loop.time()
     runner.end()
     transcript = runner.full_transcript()
+    memory = runner.memory.to_dict()
     await runner.stop()
     for task in list(table._tasks):
         task.cancel()
 
     PATH.set("end")
-    trail = await generate_trail("social", session.names, transcript, session.profiles, gemini=gateway)
+    if quick:  # the Table's own trail, from the live memory and the transcript
+        trail = await generate_trail("social", session.names, transcript, {}, gemini=gateway, memory=memory,
+                                     anonymous=session.anonymous, table=True)
+    else:
+        trail = await generate_trail("social", session.names, transcript, session.profiles, gemini=gateway)
     metrics = runner.engine.metrics()
-    return ledger, {"metrics": metrics, "trail_items": len(trail.items), "overlaps": len(overlaps.overlaps)}
+    return ledger, {"metrics": metrics, "trail_items": len(trail.items), "overlaps": len(overlaps.overlaps),
+                    "setup": setup, "memory_items": sum(len(v) for v in memory.values())}
 
 
 # --- Report ---------------------------------------------------------------------------------------------------
@@ -974,6 +1071,8 @@ def build_report(ledger: Ledger, extra: dict) -> dict:
 
     report = {
         "session": {
+            "setup": extra.get("setup", "profiles"),
+            "memory_items_at_end": extra.get("memory_items"),
             "live_minutes": round(((ledger.ended_at or 0) - live_at) / 60.0, 2),
             "human_turns": ledger.human_turns,
             "beat_starts_live_s": ledger.beat_times,
@@ -997,7 +1096,8 @@ def build_report(ledger: Ledger, extra: dict) -> dict:
             "sessions_per_free_month": round(FREE_TIER_CREDITS / total_credits, 1) if total_credits else None,
         },
         "gemini_tts": {"invocations": len(gem)},
-        "muse": {"rest_transcriptions": sum(len(a) for a in ANSWERS.values()), "realtime_minutes":
+        "muse": {"rest_transcriptions": 0 if extra.get("setup") == "quick" else sum(len(a) for a in ANSWERS.values()),
+                 "realtime_minutes":
                  round(((ledger.ended_at or 0) - live_at) / 60.0 + 0.3, 1)},
         "crumbs_delivered": [
             {"t_live_s": round(p.at - live_at, 1), "kind": p.kind, "source": p.source, "cache_hit": p.cache_hit,
@@ -1033,16 +1133,37 @@ def build_report(ledger: Ledger, extra: dict) -> dict:
             "energy_nothing_changed": sum(1 for tc, ec in ledger.energy_outcomes if not tc and not ec),
         },
         "system_lines": {"count": len(ledger.system_lines), "ids": sorted(set(ledger.system_lines))},
+        "auto_crumb_timing": _auto_timing(ledger),
+        "bystander_turns": ledger.bystander_turns,
         "log_events": dict(sorted(ledger.log_events.items())),
     }
     return report
 
 
+def _auto_timing(ledger: Ledger) -> dict:
+    """Silence (s) when each automatic crumb was decided, and when its words started playing."""
+    def stat(values: list[float]) -> dict:
+        return {"p50": round(statistics.median(values), 2) if values else None,
+                "max": round(max(values), 2) if values else None, "n": len(values)}
+
+    autos = ledger.auto_crumbs
+    steers = [a for a in autos if a["kind"] == "steer"]
+    return {
+        "decision_s": stat([a["silence"] for a in autos]),
+        "voice_s": stat([a["voice"] for a in autos if "voice" in a]),
+        "steer_decision_s": stat([a["silence"] for a in steers]),
+        "steer_voice_s": stat([a["voice"] for a in steers if "voice" in a]),
+        "target_steer_s": TARGET_STEER_S,
+    }
+
+
 def print_report(r: dict) -> None:
     out = sys.stdout.write
     s = r["session"]
-    out(f"\nBreadcrumbs usage, scripted social session: {s['live_minutes']} live minutes, "
-        f"{s['human_turns']} human turns (calibration included)\n")
+    setup = "Just talk" if s.get("setup") == "quick" else "with profiles"
+    out(f"\nBreadcrumbs usage, scripted social session ({setup}): {s['live_minutes']} live minutes, "
+        f"{s['human_turns']} human turns (calibration included); memory items at the end: "
+        f"{s.get('memory_items_at_end')}, trail items: {s.get('trail_items')}\n")
     out("  beats (live s): " + ", ".join(f"{n}@{t}" for n, t in s["beat_starts_live_s"]) + "\n")
     out(f"  engine decisions: {s['decisions']}\n")
 
@@ -1091,12 +1212,22 @@ def print_report(r: dict) -> None:
     out(f"  energy tags {c['energy_tags']} (topic changed {c['energy_topic_changed']}, nothing changed "
         f"{c['energy_nothing_changed']})\n")
     out(f"  system lines voiced {r['system_lines']['count']} {r['system_lines']['ids']}\n")
+    a = r["auto_crumb_timing"]
+    out("\nAutomatic crumb timing (silence in s; target: steer decided at "
+        f"{a['target_steer_s']} s)\n")
+    out(f"  silence at decision per automatic crumb  p50 {a['decision_s']['p50']}  max {a['decision_s']['max']}"
+        f"  (n={a['decision_s']['n']}); steers p50 {a['steer_decision_s']['p50']} max {a['steer_decision_s']['max']}\n")
+    out(f"  silence at voice start per automatic crumb  p50 {a['voice_s']['p50']}  max {a['voice_s']['max']}"
+        f"  (n={a['voice_s']['n']}); steers p50 {a['steer_voice_s']['p50']} max {a['steer_voice_s']['max']}\n")
+    if r.get("bystander_turns"):
+        out(f"  bystander fragments injected: {r['bystander_turns']}\n")
     out("\nLog events (template counts)\n")
     for k, v in r["log_events"].items():
         out(f"  {v:>4}  {k}\n")
 
 
-def measure(*, repeat_session: bool = False) -> dict:
+def measure(*, repeat_session: bool = False, bystanders: bool = False, params: dict | None = None,
+            setup: str = "profiles") -> dict:
     """Run the scripted session on a fresh virtual-time loop and return the report dict.
 
     The process-wide system line cache starts empty (a first session after a restart). With
@@ -1106,7 +1237,7 @@ def measure(*, repeat_session: bool = False) -> dict:
     loop = VirtualClockLoop()
     previous_singletons = (gemini_mod._singleton, elevenlabs_mod._singleton)
     try:
-        ledger, extra = loop.run_until_complete(run_session())
+        ledger, extra = loop.run_until_complete(run_session(bystanders=bystanders, params=params, setup=setup))
     finally:
         loop.close()
         gemini_mod._singleton, elevenlabs_mod._singleton = previous_singletons
@@ -1118,11 +1249,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", help="also write the full report as JSON to this path")
     parser.add_argument("--repeat", action="store_true",
                         help="run a second session in the same process too (static system lines cached)")
+    parser.add_argument("--bystanders", action="store_true",
+                        help="also run the session with bystander fragments, with gating on and off")
+    parser.add_argument("--setup", choices=("profiles", "quick", "both"), default="profiles",
+                        help='"profiles" (phones, interview, opener; default), "quick" ("Just talk"), or both')
     args = parser.parse_args(argv)
-    report = measure()
+    setup = "quick" if args.setup == "quick" else "profiles"
+    report = measure(setup=setup)
     print_report(report)
+    if args.setup == "both":
+        quick = measure(setup="quick")
+        print_report(quick)
+        sys.stdout.write("\nBoth setups (one scripted 10-minute session each)\n")
+        for label, r in (("with profiles", report), ("Just talk", quick)):
+            sys.stdout.write(f"  {label:<14} Claude calls {r['claude_total']['calls']:>3} "
+                             f"(~{r['claude_total']['est_input_tokens']} input tokens), ElevenLabs "
+                             f"{r['elevenlabs_total']['calls']} calls / {r['elevenlabs_total']['credits']} credits, "
+                             f"steer decided p50 {r['auto_crumb_timing']['steer_decision_s']['p50']} s\n")
+        report = {"profiles": report, "quick": quick}
+    if args.bystanders:
+        rows = {}
+        for label, gating in (("gating on", True), ("gating off", False)):
+            r = measure(bystanders=True, params={"BYSTANDER_GATING": gating}, setup=setup)
+            rows[label] = {
+                "turn_committed_prefetches": r["generation"]["prefetch_triggers"].get("turn committed", 0),
+                "claude_calls": r["claude_total"]["calls"],
+                "elevenlabs_credits": r["elevenlabs_total"]["credits"],
+                "auto_crumbs": r["auto_crumb_timing"]["decision_s"]["n"],
+                "steer_decision_p50_s": r["auto_crumb_timing"]["steer_decision_s"]["p50"],
+                "bystander_turns": r["bystander_turns"],
+            }
+        sys.stdout.write("\nWith bystander fragments (label C every ~4 s of quiet, unheard by the Table VAD)\n")
+        for label, v in rows.items():
+            sys.stdout.write(f"  {label:<10}  'turn committed' prefetches {v['turn_committed_prefetches']:>3}, "
+                             f"Claude calls {v['claude_calls']:>3}, ElevenLabs {v['elevenlabs_credits']} credits, "
+                             f"automatic crumbs {v['auto_crumbs']} (steer decided p50 {v['steer_decision_p50_s']} s), "
+                             f"fragments {v['bystander_turns']}\n")
+        report["bystanders"] = rows
     if args.repeat:
-        second = measure(repeat_session=True)
+        second = measure(repeat_session=True, setup=setup)
         e = second["elevenlabs_total"]
         sys.stdout.write(f"\nSecond session in the same process: ElevenLabs {e['calls']} calls, {e['credits']} credits; "
                          f"system lines voiced {second['system_lines']}\n")

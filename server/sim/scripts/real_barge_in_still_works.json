@@ -2,6 +2,14 @@
   "name": "real_barge_in_still_works",
   "mode": "social",
   "description": "A person talks over the crumb with different words (local VAD + Muse): the crumb is faded at the VAD onset and the turn counts as human, even though it started during the bot line.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "crumb_text": "So what is something you both love doing on the weekends?",
   "turns": [
     {

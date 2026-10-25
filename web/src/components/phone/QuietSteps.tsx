@@ -78,3 +78,19 @@ export function GoneStep({ reason }: { reason: "gone" | "bad_link" }) {
     </section>
   );
 }
+
+/** A phone opened the link of a "Just talk" table: everything happens on the laptop. */
+export function NoPhonesStep() {
+  return (
+    <section aria-labelledby="step-title" className="flex flex-1 flex-col items-center justify-center text-center">
+      <OrbFigure size={180} mode="listening" />
+      <div className="mt-10">
+        <StepHeading
+          id="step-title"
+          title="This table doesn't need phones"
+          lead="It runs on the laptop. Put your phone away and just talk."
+        />
+      </div>
+    </section>
+  );
+}

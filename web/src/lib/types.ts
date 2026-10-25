@@ -1,7 +1,10 @@
 // Mirrors server/models.py and the WebSocket protocol (PRD Section 12 + docs/CONTRACTS.md).
 // Keep in sync with the server. JSON object keys for seats are strings ("1", "2").
 
+// Mode stays in the protocol for compatibility; the UI never shows it and new sessions are "social".
 export type Mode = "social" | "networking" | "speed_dating";
+/** How a table runs: "quick" = just talk (no phones, learns from the conversation), "profiles" = phones + interviews. */
+export type Setup = "quick" | "profiles";
 export type Seat = 1 | 2;
 export type SeatKey = "1" | "2";
 export type Phase = "lobby" | "profiles" | "calibrating" | "live" | "ended";
@@ -57,6 +60,22 @@ export interface TrailResponse {
   trail: TrailItem[];
 }
 
+/** A trail of threads to pick up (server `Trail`). In a quick session the Table shows it on the laptop. */
+export interface Trail {
+  items: TrailItem[];
+}
+
+/**
+ * What the table learned from the live conversation (short items, wiped with the session). "1" and "2"
+ * are per person, "shared" is common ground, "threads" are open questions worth a follow-up.
+ */
+export interface Memory {
+  "1": string[];
+  "2": string[];
+  shared: string[];
+  threads: string[];
+}
+
 export interface InterviewQuestion {
   id: string;
   text: string;
@@ -64,9 +83,21 @@ export interface InterviewQuestion {
 
 // ---- REST ----------------------------------------------------------------
 
+export interface CreateSessionBody {
+  setup?: Setup; // default "quick"
+  mode?: Mode; // default "social"
+  quick?: boolean; // profiles only: one interview question instead of three
+}
+
 export interface CreateSessionResponse {
   session_id: string;
-  join_urls: Record<SeatKey, string>;
+  join_urls: Partial<Record<SeatKey, string>>; // {} for a quick session
+  setup: Setup;
+}
+
+/** POST /api/sessions/{sid}/start (quick only): both people consent from the laptop. Blank names become "Person 1/2". */
+export interface StartSessionBody {
+  names?: Partial<Record<SeatKey, string>>;
 }
 
 export interface AppConfig {
@@ -90,6 +121,8 @@ export interface SeatSummary {
 export interface SessionSummary {
   session_id: string;
   phase: Phase;
+  /** Older servers omit it: treat a missing value as "profiles" (today's flow). */
+  setup?: Setup;
   mode: Mode;
   quick: boolean;
   seats: Record<SeatKey, SeatSummary>;
@@ -119,8 +152,16 @@ export interface EngineSnapshot {
   auto_paused: boolean; // safety pause (PRD 15.3)
   turn_active: boolean;
   vad_active: boolean;
-  /** Local VAD is active but Muse has not confirmed speech within VAD_UNCONFIRMED_S: likely background noise. */
+  /** Local VAD is active but no longer defers a crumb (VAD_DEFER_S passed, not a near voice): likely background noise. */
   noise_suspected: boolean;
+  /** Why a crumb would wait right now: an open Muse turn, a VAD onset, or the settle after a background turn. */
+  defer: "turn" | "vad" | "settle" | null;
+  /** A Muse turn is open that started with a near voice at the table. */
+  foreground_open: boolean;
+  /** Seated speech level (dBFS) once two seat turns were heard; null until then. */
+  seat_level_db: number | null;
+  /** Turns judged as voices away from the table this session. */
+  background_turns: number;
   tts_playing: boolean;
   pending_delivery: boolean;
   crumbs_this_silence: number;
@@ -137,7 +178,7 @@ export interface EngineSnapshot {
 
 export interface Decision {
   at_s: number; // seconds since live start
-  action: "steer" | "switch" | "opener" | "manual" | "wildcard" | "hold" | "release" | "barge_in" | "skip" | "quiet" | "safety_pause" | "dropped_bot_turn" | "calibration";
+  action: "steer" | "switch" | "opener" | "manual" | "wildcard" | "hold" | "release" | "barge_in" | "skip" | "quiet" | "safety_pause" | "dropped_bot_turn" | "calibration" | "background_turn" | "dispatch_blocked";
   reason: string;
   inputs?: Record<string, unknown>;
 }
@@ -150,6 +191,9 @@ export interface EngineMetrics {
   false_interruptions: number;
   latency_ms_p50: number | null;
   latency_ms_p95: number | null;
+  /** How far the pause start was backdated from Muse's speechEnd to the end of voice, ms. */
+  endpoint_lag_ms_p50: number | null;
+  endpoint_lag_ms_p95: number | null;
 }
 
 export interface TurnEvent {
@@ -162,6 +206,8 @@ export interface TurnEvent {
   is_question: boolean;
   is_backchannel: boolean;
   hold: HoldKind | null;
+  /** A voice away from the table (bystander, far voice): not part of the conversation. */
+  background?: boolean;
 }
 
 export type ServerEvent =
@@ -177,6 +223,8 @@ export type ServerEvent =
   | { type: "params"; params: Record<string, unknown> }
   | { type: "muse_status"; status: "connecting" | "connected" | "reconnecting" | "resyncing" | "closed" | "error" | "mock"; detail?: string }
   | { type: "trail_ready" }
+  | { type: "memory"; memory: Memory }
+  | { type: "table_trail"; trail: Trail }
   | { type: "wiped" }
   | { type: "error"; message: string };
 
@@ -185,8 +233,17 @@ export type ServerEvent =
 export type ControlAction =
   | "spark" | "skip" | "hold" | "resume" | "pause_listening" | "resume_listening" | "end" | "xray";
 
+/** Table VAD frame (10 Hz). `level_db` and `quiet_ms` are optional: older Tables send only `active` and `rms`. */
+export interface VadMessage {
+  type: "vad";
+  active: boolean;
+  rms: number;
+  level_db?: number; // speech-band level, dBFS, rounded to 0.1 (VadReading.levelDb)
+  quiet_ms?: number; // integer ms since the last voiced or sustain frame, capped at 60000; 0 while sustaining
+}
+
 export type ClientEvent =
-  | { type: "vad"; active: boolean; rms: number }
+  | VadMessage
   | { type: "control"; action: ControlAction }
   | { type: "tts_state"; crumb_id: string; playing: boolean }
   | { type: "params"; changes: Record<string, unknown> }

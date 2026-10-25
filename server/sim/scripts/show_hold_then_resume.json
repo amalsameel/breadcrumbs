@@ -2,6 +2,14 @@
   "name": "show_hold_then_resume",
   "mode": "social",
   "description": "PRD 16.1 example: 'let me show you' + 25 s silence: no crumb during the hold.",
+  "params": {
+    "T_NORMAL_S": 3.0,
+    "T_LONG_S": 5.0,
+    "T_EXC_S": 6.5,
+    "UNANSWERED_SWITCH_S": 6.5,
+    "HOLD_CHECK_SILENCE_S": 1.0,
+    "VAD_DEFER_S": 2.5
+  },
   "turns": [
     {
       "seat": 1,
