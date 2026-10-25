@@ -373,10 +373,19 @@ async def test_cache_invalid_when_old(g: Gemini):
 
 
 async def test_cache_invalid_when_topic_changes(g: Gemini):
+    """A steer built on the topic label is invalid after a real change of subject (no shared word stem), not
+    after a reworded label. A steer built on the latest lines follows the lines instead, and a switch (a
+    change of subject itself) survives a topic change that is not its own subject."""
     svc = _service(g)
-    await svc.prefetch(_ctx(TRANSCRIPT, "running"), now=0.0)
-    d = await svc.get("switch", _ctx(TRANSCRIPT, "ramen"), now=5.0)
-    assert not d.cache_hit
+    await svc.prefetch(_ctx("", "running"), now=0.0)  # no transcript: a steer built on the topic label
+    assert svc._cache["steer"].crumb.source != "conversation"
+    assert (await svc.get("steer", _ctx("", "long runs"), now=5.0)).cache_hit  # same stem: still valid
+    await svc.prefetch(_ctx("", "running"), now=6.0)
+    assert not (await svc.get("steer", _ctx("", "ramen"), now=7.0)).cache_hit
+    assert (await svc.get("switch", _ctx("", "ramen"), now=8.0)).cache_hit
+    await svc.prefetch(_ctx(TRANSCRIPT, "running"), now=9.0)
+    assert svc._cache["steer"].crumb.source == "conversation"
+    assert (await svc.get("steer", _ctx(TRANSCRIPT, "ramen"), now=10.0)).cache_hit
 
 
 async def test_cache_invalid_when_its_item_is_used(g: Gemini):
@@ -494,8 +503,9 @@ async def test_outside_fun_fact_is_grounded_and_cited():
     fake = _FakeGemini([_fact_draft()], ("Austin has a huge bat colony.", "https://example.org/bats", "Bats of Austin"))
     svc = _service(fake, overlaps=OverlapSet(overlaps=[]))
     svc._last_alt = "profile"  # next switch source is outside
-    d = await svc.get("switch", _ctx(), now=0.0)
-    assert d.crumb.source == "outside" and d.crumb.format == "fun_fact"
+    await svc.voice("switch", _ctx(), now=0.0, lead_s=5.0)  # generates the switch; the search runs off the live path
+    d = await svc.get("switch", _ctx(), now=1.0)
+    assert d.cache_hit and d.crumb.source == "outside" and d.crumb.format == "fun_fact"
     assert d.crumb.citation_url == "https://example.org/bats" and d.crumb.citation_title == "Bats of Austin"
     assert fake.payloads[0]["verified_fact"] == {"text": "Austin has a huge bat colony.", "url": "https://example.org/bats"}
 

@@ -3,7 +3,9 @@
 The Engine is pure; this runner is its async shell. It owns:
 - a 10 Hz tick task (`engine.tick(time.monotonic())`) and a 4 Hz `engine` snapshot broadcast,
 - the effect executor (every effect type in CONTRACTS section 1),
-- the prefetch schedule (1.5 s debounce after a turn, 30 s periodic refresh while live),
+- the prefetch schedule: text only, and only for slots that need it (a turn that opens a pause a steer could
+  fill refreshes at once, other turns after a 1.5 s debounce, a 30 s check while live), plus lazy voicing
+  of the one crumb the pause will get when it enters the warming band,
 - the Muse realtime client, bound to the Table's `/ws/audio` socket.
 
 Every AI call runs as a background task with a timeout, so the tick loop never waits on the network.
@@ -25,7 +27,7 @@ from ai.classifiers import classify_hold, tag_energy
 from ai.crumbs import ConvoCtx, CrumbService, Delivery
 from ai.profiles import allowed_items
 from ai.elevenlabs import get_elevenlabs
-from ai.tts import synthesize
+from ai.tts import SESSION_LINE_CACHE_ITEMS, SYSTEM_LINES, AudioCache, synthesize_cached
 from engine.core import Effect, Engine
 from models import Crumb, CrumbKind, EnergyTag, HoldDecision, OverlapSet
 from muse.realtime import MockMuseRealtime, MuseRealtimeClient, make_realtime_client
@@ -122,7 +124,9 @@ class SessionRunner:
 
         self._prefetch_due: float | None = None
         self._last_prefetch_at: float | None = None
-        self._prefetch_task: asyncio.Task | None = None
+        self._prefetch_fresh = False  # the due prefetch follows a turn that opened a pause a steer could fill
+        self._energy_busy = False  # one energy tag at a time
+        self._lines = AudioCache(SESSION_LINE_CACHE_ITEMS)  # system lines with a name in them (this session only)
 
         self._dev_labels: dict[int, str] = {}
         self._dev_turn_seq = 0
@@ -157,6 +161,10 @@ class SessionRunner:
         await self._close_muse()
         self._tasks.clear()
         self._loops = []
+        close = getattr(self.crumbs, "close", None)  # cancels background generation, drops cached audio
+        if close is not None:
+            close()
+        self._lines.clear()
 
     def end(self) -> None:
         """Session End: freeze the engine and send one last snapshot to the Table."""
@@ -410,14 +418,22 @@ class SessionRunner:
         elif kind == "classify_hold":
             self._spawn(self._classify(int(effect["turn_id"]), str(effect.get("context", ""))))
         elif kind == "tag_energy":
-            self._spawn(self._tag_energy(str(effect.get("context", ""))))
+            if not self._energy_busy:  # the previous tag is still out: this one would say the same thing
+                self._spawn(self._tag_energy(str(effect.get("context", ""))))
         elif kind == "prefetch":
-            # PRD 8.10 debounces turn-driven refreshes; warming-band and topic-change refreshes are urgent.
             now = self.clock()
-            if effect.get("reason") == "turn committed":
-                self._prefetch_due = now + config.PREFETCH_DEBOUNCE_S
-            else:
+            voice = effect.get("voice")
+            if voice in ("steer", "switch"):
+                self._spawn(self._voice(voice, float(effect.get("due_in_s") or 0.0), now))
+            # PRD 8.10 debounces turn-driven refreshes. A turn that opens a pause a steer could fill is urgent
+            # too: a steer started 1.5 s late (plus ~3.7 s of generation) misses the 5 s threshold.
+            steer_pause = effect.get("reason") == "turn committed" and self.engine.steer_wanted(now)
+            if steer_pause:
+                self._prefetch_fresh = True  # F14: that steer must follow this turn
+            if effect.get("reason") != "turn committed" or steer_pause:
                 self._prefetch_due = now if self._prefetch_due is None else min(self._prefetch_due, now)
+            else:
+                self._prefetch_due = now + config.PREFETCH_DEBOUNCE_S
         elif kind == "live":
             if session.phase == "calibrating":
                 session.phase = "live"
@@ -504,10 +520,19 @@ class SessionRunner:
         except Exception as exc:  # noqa: BLE001 - warming is best effort
             log.info("voice warm-up failed (%s)", type(exc).__name__)
 
+    def _personal(self, text: str) -> bool:
+        """The line names a participant: its audio is kept for this session only."""
+        for name in self.names.values():
+            for part in (name or "").split():
+                if re.search(rf"(?<!\w){re.escape(part)}(?!\w)", text, re.IGNORECASE):
+                    return True
+        return False
+
     async def _say(self, speech_id: str, text: str) -> None:
         audio: bytes | None = None
+        cache = self._lines if self._personal(text) else SYSTEM_LINES  # "Seat 2, your turn." is voiced once
         try:
-            audio = await asyncio.wait_for(synthesize(text, budget_s=SAY_TIMEOUT_S), timeout=SAY_TIMEOUT_S)
+            audio = await asyncio.wait_for(synthesize_cached(text, cache, budget_s=SAY_TIMEOUT_S), timeout=SAY_TIMEOUT_S)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the Table falls back to speechSynthesis
@@ -522,11 +547,13 @@ class SessionRunner:
             raise
         except Exception as exc:  # noqa: BLE001 - the lexical hold stays in effect
             log.warning("hold classifier failed (%s)", type(exc).__name__)
+            self.engine.hold_check_failed(turn_id)  # automatic crumbs stop waiting for this answer
             return
         if not self._stopped:
             self._apply(self.engine.apply_hold_decision(turn_id, decision, self.clock()))
 
     async def _tag_energy(self, context: str) -> None:
+        self._energy_busy = True
         try:
             tag: EnergyTag = await asyncio.wait_for(tag_energy(context), timeout=ENERGY_TIMEOUT_S)
         except asyncio.CancelledError:
@@ -534,33 +561,53 @@ class SessionRunner:
         except Exception as exc:  # noqa: BLE001
             log.warning("energy tagger failed (%s)", type(exc).__name__)
             return
+        finally:
+            self._energy_busy = False
         if not self._stopped:
             self._apply(self.engine.apply_energy_tag(tag, self.clock()))
 
     # ------------------------------------------------------------------ prefetch (PRD 8.10)
 
     def _maybe_prefetch(self, now: float) -> None:
-        if self.engine.phase != "live":
-            return
-        if self._prefetch_task is not None and not self._prefetch_task.done():
+        """Run a prefetch when one is due (or every PREFETCH_REFRESH_S as a check), and only when a slot
+        actually needs text: the check itself makes no model call. CrumbService never generates the same
+        slot twice at once, so overlapping runs are safe."""
+        if self.engine.phase != "live" or self.engine.round_over or self._stopped:
             return
         debounced = self._prefetch_due is not None and now >= self._prefetch_due
         periodic = self._last_prefetch_at is None or now - self._last_prefetch_at >= config.PREFETCH_REFRESH_S
         if not (debounced or periodic):
             return
-        self._prefetch_due = None
+        fresh = False
+        if debounced:
+            self._prefetch_due = None
+            fresh, self._prefetch_fresh = self._prefetch_fresh, False
         self._last_prefetch_at = now
-        if self._stopped:
+        steer = self.engine.steer_wanted(now)  # a steer nobody can use before it goes stale is not made
+        round_left = self.engine.round_left_s(now)
+        # No steer can fire once fewer than T_LONG_S of the round are left; the switch slot still serves a
+        # Drop a crumb (F14 resumes in the next round).
+        slots = ("switch",) if round_left is not None and round_left < self.session.params.T_LONG_S else ("steer", "switch")
+        if not self.crumbs.slots_to_refresh(self._convo(now), now, steer=steer, fresh=fresh, slots=slots):
             return
-        task = asyncio.create_task(self._prefetch(now), name="prefetch")
-        self._prefetch_task = task
+        task = asyncio.create_task(self._prefetch(now, steer, fresh, slots), name="prefetch")
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
 
-    async def _prefetch(self, now: float) -> None:
+    async def _prefetch(self, now: float, steer: bool, fresh: bool, slots: tuple[str, ...] = ("steer", "switch")) -> None:
         try:
-            await asyncio.wait_for(self.crumbs.prefetch(self._convo(now), now), timeout=PREFETCH_TIMEOUT_S)
+            await asyncio.wait_for(self.crumbs.prefetch(self._convo(now), now, steer=steer, fresh=fresh, slots=slots),
+                                   timeout=PREFETCH_TIMEOUT_S)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a miss falls back to live generation
             log.warning("prefetch failed (%s)", type(exc).__name__)
+
+    async def _voice(self, kind: CrumbKind, due_in_s: float, now: float) -> None:
+        """Lazy voicing: the pause entered the warming band and `kind` fires in `due_in_s` if nobody speaks."""
+        try:
+            await asyncio.wait_for(self.crumbs.voice(kind, self._convo(now), now, due_in_s), timeout=PREFETCH_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the crumb is voiced with the fast model when it fires
+            log.warning("voicing failed (%s)", type(exc).__name__)

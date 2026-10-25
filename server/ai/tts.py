@@ -16,6 +16,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import OrderedDict
 
 from ai.elevenlabs import ElevenLabs, get_elevenlabs
 from ai.gemini import Gemini, get_gemini
@@ -69,7 +70,9 @@ async def synthesize(
     budget = (DEFAULT_FAST_BUDGET_S if fast else DEFAULT_NATURAL_BUDGET_S) if budget_s is None else budget_s
     deadline = time.monotonic() + max(0.0, budget - DEADLINE_MARGIN_S)
     g = gemini or get_gemini()
-    gemini_usable = not g.mock
+    # Gemini only counts when it can actually speak: a gateway paused after a 401/402 (or with no Gemini
+    # key) would otherwise keep 30% of every budget back for a call that is never made.
+    gemini_usable = not g.mock and getattr(g, "gemini_available", True)
     voice = elevenlabs or get_elevenlabs()
     if voice.available:
         reserve = budget * GEMINI_RESERVE_SHARE if gemini_usable and budget >= GEMINI_MIN_BUDGET_S else 0.0
@@ -90,3 +93,65 @@ async def synthesize(
     except Exception as exc:  # noqa: BLE001 - voice is optional; never break delivery (incl. TimeoutError)
         log.warning("tts failed (%s)", type(exc).__name__)
         return None
+
+
+# --- System line cache (usage) -------------------------------------------------------------------------
+# Calibration and re-sync prompts are the same words every session. A line with no personal data is
+# voiced once per process (SYSTEM_LINES); a line with a name in it is voiced once per session (the
+# runner's own AudioCache, dropped when the session ends or is wiped). Keys are the spoken text plus the
+# path, never logged.
+
+SYSTEM_LINE_CACHE_ITEMS = 32
+SESSION_LINE_CACHE_ITEMS = 8
+
+
+class AudioCache:
+    """A small LRU of voiced lines: (spoken text, fast) -> WAV bytes."""
+
+    def __init__(self, max_items: int) -> None:
+        self.max_items = max_items
+        self._items: OrderedDict[tuple[str, bool], bytes] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def get(self, key: tuple[str, bool]) -> bytes | None:
+        wav = self._items.get(key)
+        if wav is not None:
+            self._items.move_to_end(key)
+        return wav
+
+    def put(self, key: tuple[str, bool], wav: bytes) -> None:
+        self._items[key] = wav
+        self._items.move_to_end(key)
+        while len(self._items) > self.max_items:
+            self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
+SYSTEM_LINES = AudioCache(SYSTEM_LINE_CACHE_ITEMS)
+
+
+async def synthesize_cached(
+    text: str,
+    cache: AudioCache,
+    gemini: Gemini | None = None,
+    *,
+    fast: bool = True,
+    elevenlabs: ElevenLabs | None = None,
+    budget_s: float | None = None,
+) -> bytes | None:
+    """`synthesize`, but a line already voiced into `cache` is served from it (no provider call).
+    Only real audio is kept: a failed line is tried again next time."""
+    key = (speech_text(text), fast)
+    if not key[0]:
+        return None
+    wav = cache.get(key)
+    if wav is not None:
+        return wav
+    wav = await synthesize(text, gemini, fast=fast, elevenlabs=elevenlabs, budget_s=budget_s)
+    if wav:
+        cache.put(key, wav)
+    return wav

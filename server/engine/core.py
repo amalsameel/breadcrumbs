@@ -7,7 +7,7 @@ numeric inputs only, never transcript text.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from config import (
@@ -34,6 +34,7 @@ from engine.hold import (
 )
 from engine.policy import (
     EPS,
+    RATE_WINDOW_S,
     CrumbLedger,
     CrumbRecord,
     TickInputs,
@@ -75,6 +76,10 @@ ROUND_WARNING_GAP_S = 5.0  # the 1-minute warning leaves room to answer the prev
 ROUND_WARNING_REASON = "One minute left in the round: time check crumb"
 NOISE_LATCH_CLEAR_S = 4.0  # VAD quiet this long: the next onset gets its own confirmation window again
 BOT_LINES_KEPT = 8  # texts of the latest bot lines, for the echo check
+# Usage: the energy tagger is skipped while automatic crumbs stay blocked for at least this long (safety
+# pause, or the 10-minute rate cap): its topic and energy only steer automatic crumbs. A skipped tag is not
+# lost: the first committed turn once the block is shorter tags again, before the next automatic crumb.
+ENERGY_SKIP_BLOCKED_S = 60.0
 
 
 @dataclass
@@ -149,6 +154,10 @@ class Engine:
         self._warmup_ref: float | None = None
         self._last_wildcard_at: float | None = None
         self._warming_prefetch_anchor: float | None = None
+        self._hold_check: int | None = None  # turn id whose hold classifier call waits for silence (PRD 8.6)
+        self._hold_asked: int | None = None  # turn id of that deferred call while its answer is out
+        self._tagged_turns = 0  # live turns, and their words, when the energy tagger last ran
+        self._tagged_words = 0
         self._round_warned = False
         self._round_ended = False
         self._false_interruptions = 0
@@ -159,6 +168,15 @@ class Engine:
     @property
     def phase(self) -> EnginePhase:
         return self._phase
+
+    @property
+    def round_over(self) -> bool:
+        """The round timer ran out (PRD 15.3): no crumb follows, so nothing is worth preparing."""
+        return self._round_ended
+
+    def round_left_s(self, now: float) -> float | None:
+        """Seconds left in the round (None: the mode has no round timer or the session is not live)."""
+        return self._round_remaining(now)
 
     @property
     def turns(self) -> list[Turn]:
@@ -455,10 +473,20 @@ class Engine:
         effects = [self._turn_effect(rec)] + effects + hold_effects
         if counted:
             effects.append({"type": "prefetch", "reason": "turn committed"})
-            n = self.params.ENERGY_EVERY_N_TURNS
-            if n > 0 and len(self._live_turns) % n == 0:
-                effects.append({"type": "tag_energy", "context": self._context(ENERGY_CONTEXT_TURNS)})
+            effects += self._maybe_tag_energy(now)
         return effects
+
+    def _maybe_tag_energy(self, now: float) -> list[Effect]:
+        """Every ENERGY_EVERY_N_TURNS live turns, but only with new words since the last tag and while
+        an automatic crumb could still use the answer."""
+        n = self.params.ENERGY_EVERY_N_TURNS
+        if n <= 0 or len(self._live_turns) - self._tagged_turns < n:
+            return []
+        words = sum(t.words for t in self._live_turns)
+        if words <= self._tagged_words or self.auto_blocked_for(now) >= ENERGY_SKIP_BLOCKED_S:
+            return []
+        self._tagged_turns, self._tagged_words = len(self._live_turns), words
+        return [{"type": "tag_energy", "context": self._context(ENERGY_CONTEXT_TURNS)}]
 
     def _is_live_turn(self, turn: Turn) -> bool:
         return self._phase == "live" and self._live_at is not None and turn.started_at >= self._live_at
@@ -501,15 +529,60 @@ class Engine:
         elif kind is None and mine is not None and mine.source == "lexical":
             effects += self._release_hold(now, "Final transcript has no hold phrase")
             rec.hold_kind = None
-        vetoed = kind is None and hold_vetoed(text, self.params.HOLD_TAIL_WORDS)
-        if (kind is not None or vetoed or is_ambiguous_fragment(text)) and not rec.classified:
+        if rec.classified:
+            return effects
+        if kind is not None:
+            # PRD 8.6: every lexical hit is checked at once (the lexical hold is already in effect).
             rec.classified = True
             effects.append({"type": "classify_hold", "turn_id": rec.turn.turn_id, "context": self._context(HOLD_CONTEXT_TURNS)})
+        elif not rec.turn.is_backchannel and (hold_vetoed(text, self.params.HOLD_TAIL_WORDS) or is_ambiguous_fragment(text)):
+            # An ambiguous fragment (or a vetoed phrase) only matters if silence follows it: the classifier
+            # is asked once that silence reaches HOLD_CHECK_SILENCE_S (see _deferred_hold_check), not while
+            # the conversation is still moving. Backchannels ("yeah", "oh nice") never pause anything.
+            self._hold_check = rec.turn.turn_id
         return effects
+
+    def _deferred_hold_check(self, now: float) -> list[Effect]:
+        turn_id = self._hold_check
+        if turn_id is None:
+            return []
+        rec = self._tracker.by_id(turn_id)
+        if rec is None or rec.classified or self._phase != "live" or not self._silence_followed(rec):
+            self._hold_check = None  # someone spoke: the fragment was not followed by silence
+            return []
+        if self._hold is not None and self._hold.source == "manual":
+            return []
+        if self.silence_s(now) + EPS < self.params.HOLD_CHECK_SILENCE_S:
+            return []
+        self._hold_check = None
+        self._hold_asked = turn_id
+        rec.classified = True
+        return [{"type": "classify_hold", "turn_id": turn_id, "context": self._context(HOLD_CONTEXT_TURNS)}]
+
+    def _hold_answer_pending(self) -> bool:
+        """A deferred hold check was asked and its answer is still out, with nobody speaking since.
+
+        Asking HOLD_CHECK_SILENCE_S late must not shrink the classifier's window: while the answer is
+        out, automatic crumbs wait for it (until HOLD_CHECK_SILENCE_S past the long threshold, so the
+        window is the same as asking at the commit), and the next crumb is not voiced yet."""
+        turn_id = self._hold_asked
+        if turn_id is None:
+            return False
+        rec = self._tracker.by_id(turn_id)
+        if rec is None or self._phase != "live" or not self._silence_followed(rec):
+            self._hold_asked = None
+            return False
+        return True
+
+    def hold_check_failed(self, turn_id: int) -> None:
+        """The classifier call for `turn_id` failed or timed out: automatic crumbs stop waiting for it."""
+        if self._hold_asked == turn_id:
+            self._hold_asked = None
 
     def apply_hold_decision(self, turn_id: int, d: HoldDecision, now: float) -> list[Effect]:
         """Classifier result: confirm, upgrade or cancel, but only if nobody has spoken since that turn."""
         self._touch(now)
+        self.hold_check_failed(turn_id)  # answered: nothing waits for it any more
         rec = self._tracker.by_id(turn_id)
         if rec is None or rec.open or self._phase != "live":
             return []
@@ -845,6 +918,7 @@ class Engine:
         effects += self._close_stuck_turns(now)
         effects += self._expire_bot_speech(now)
         effects += self._expire_hold(now)
+        effects += self._deferred_hold_check(now)
         effects += self._calibration_fallback(now)
         effects += self._round_timer(now)
         effects += self._barge_in_check(now)
@@ -955,12 +1029,75 @@ class Engine:
             effects.append(self._decision(
                 "quiet", "2 crumbs in a row got no reply: going quiet until someone speaks", now, **self._inputs(now, inp),
             ))
-        if out.action is not None:
+        answer_pending = self._hold_answer_pending()
+        if out.action is not None and answer_pending and inp.silence_s + EPS < out.thresholds.t_long + self.params.HOLD_CHECK_SILENCE_S:
+            pass  # the hold classifier has not answered yet: this pause may be an intentional one
+        elif out.action is not None:
             effects += self._deliver(out.action, out.reason, now, auto=True, inputs=self._inputs(now, inp))
-        elif self._phase == "live" and out.band == "warming" and out.blocked is None and self._warming_prefetch_anchor != self._timer.anchor:
+        elif (self._phase == "live" and out.band == "warming" and not answer_pending
+              and self._warming_prefetch_anchor != self._timer.anchor):
             self._warming_prefetch_anchor = self._timer.anchor
-            effects.append({"type": "prefetch", "reason": "pause entered the warming band"})
+            upcoming = self.next_auto_crumb(now)
+            if upcoming is not None:
+                # Voice exactly the crumb this pause will get, about 2 s before it is due (lazy voicing).
+                kind, due_in = upcoming
+                effects.append({"type": "prefetch", "reason": "pause entered the warming band", "voice": kind,
+                                "due_in_s": round(due_in, 2)})
         return effects
+
+    # ------------------------------------------------------------------ outlook (usage: what is worth preparing)
+
+    def next_auto_crumb(self, now: float) -> tuple[CrumbKind, float] | None:
+        """The automatic crumb the current pause gets if nobody speaks, and the seconds until it fires.
+
+        The policy is evaluated at the long and the exceptional threshold with the cooldowns, rate cap and
+        warm-up as they will be then. None when no automatic crumb can fire in this pause."""
+        if self._phase != "live":
+            return None
+        inp = self._tick_inputs(now)
+        th = effective_thresholds(inp.base, inp.hold)
+        round_left = self._round_remaining(now)
+        for silence in (th.t_long, th.t_exc):
+            wait = max(0.0, silence - inp.silence_s)
+            if round_left is not None and wait + EPS >= round_left:
+                break  # the round is over by then: no automatic crumb
+            out = evaluate(self._inputs_after(now, inp, wait, max(silence, inp.silence_s)), self.params)
+            if out.action in ("steer", "switch"):
+                return out.action, wait  # type: ignore[return-value]
+        return None
+
+    def steer_wanted(self, now: float) -> bool:
+        """A steer could fire in the pause that starts now: worth keeping a fresh steer text for. False
+        while someone is already talking again (the pause has not started) or a steer is blocked."""
+        if self._human_turn_open():
+            return False
+        upcoming = self.next_auto_crumb(now)
+        return upcoming is not None and upcoming[0] == "steer"
+
+    def auto_blocked_for(self, now: float) -> float:
+        """Seconds automatic crumbs stay blocked whatever happens: the 10-minute rate cap (inf: safety pause)."""
+        cap = self.params.MAX_CRUMBS_PER_10_MIN
+        if self._auto_paused or cap <= 0:
+            return math.inf
+        recent = sorted(t for t in self._ledger.auto_decisions if now - t < RATE_WINDOW_S)
+        if len(recent) < cap:
+            return 0.0
+        return max(0.0, recent[len(recent) - cap] + RATE_WINDOW_S - now)
+
+    def _inputs_after(self, now: float, inp: TickInputs, wait: float, silence: float) -> TickInputs:
+        later = now + wait
+        return replace(
+            inp,
+            turn_active=False,
+            vad_active=False,
+            tts_playing=False,
+            pending_delivery=False,
+            silence_s=silence,
+            in_warmup=self._warmup_remaining(later) > 0,
+            rate_ok=self._ledger.auto_count(later) < self.params.MAX_CRUMBS_PER_10_MIN,
+            exceptional_ok=self._ledger.exceptional_cooldown_ok(later, self.params),
+            regular_ok=self._ledger.regular_cooldown_ok(later, self.params),
+        )
 
     def _tick_inputs(self, now: float) -> TickInputs:
         hold = self._active_hold(now)

@@ -333,19 +333,24 @@ async def test_trail_drops_sensitive_model_threads_and_respects_the_safety_pause
 # --- 10. The cached steer follows the latest turn (PRD 8.10, F14) -------------------------------------------
 
 
-async def test_cached_steer_is_rebuilt_after_a_new_turn():
+async def test_cached_steer_is_rebuilt_once_the_talk_moved_on():
+    """The steer follows the latest turns: it stays usable for STEER_STALE_TURNS - 1 new lines (no model call
+    per turn), then a cache miss builds a fresh one and the next prefetch rebuilds the slot."""
     svc = _svc(Gemini(mock=True), mode="social")
     t1 = "Maya: I ran ten miles on Sunday.\nDev: Ten miles, wow."
     t2 = t1 + "\nMaya: Next I want to try a trail race in the hills."
+    t3 = t2 + "\nDev: Hills sound brutal.\nMaya: They are, but the views are worth it."
+    assert crumbs_mod.STEER_STALE_TURNS == 3
     await svc.prefetch(_ctx(t1, "running", 2), now=0.0)
     first = svc._cache["steer"].crumb.text
     assert "Ten miles, wow" in first or "wow" in first.lower()
-    stale = await svc.get("steer", _ctx(t2, "running", 2), now=1.0)
-    assert not stale.cache_hit and "Next I want" in stale.crumb.text
+    assert svc.slots_to_refresh(_ctx(t2, "running", 2), 1.0) == []  # one new line: still fresh, no call
+    stale = await svc.get("steer", _ctx(t3, "running", 2), now=1.0)  # three new lines: stale
+    assert not stale.cache_hit and "views are" in stale.crumb.text
     await svc.prefetch(_ctx(t1, "running", 2), now=2.0)
-    await svc.prefetch(_ctx(t2, "running", 2), now=3.0)  # a committed turn refreshes the steer
-    assert "Next I want" in svc._cache["steer"].crumb.text
-    hit = await svc.get("steer", _ctx(t2, "running", 2), now=4.0)
+    await svc.prefetch(_ctx(t3, "running", 2), now=3.0)  # the talk moved on: the steer is rebuilt
+    assert "views are" in svc._cache["steer"].crumb.text
+    hit = await svc.get("steer", _ctx(t3, "running", 2), now=4.0)
     assert hit.cache_hit
 
 

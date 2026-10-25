@@ -595,3 +595,133 @@ Results (all with MODEL_API_KEY= GEMINI_API_KEY= ANTHROPIC_API_KEY= ELEVENLABS_A
 - ✅ Visual check in Chrome (localhost): Home matches the reference layout (nav, two-column hero, black/white pills, segmented mode tabs with orb dots, orb carousel with a white play button, bottom pill row + black CTA, "How it works" cards). Orbs render via WebGL with grain, color clouds and a **white specular tip** on every palette. The Table lobby has two white seat QR cards, the orb, and a step track. The phone consent screen fits 400 px with no horizontal scroll.
 - ⛔ **ElevenLabs key has a key-level credit quota of 0:** `401 quota_exceeded: "This request exceeds your API key (breadcrumbs) quota of 0. You have 0 credits remaining"`. The key is restricted (no `user_read` either). Fix in the ElevenLabs dashboard: Developers → API keys → "breadcrumbs" → set a credit limit (or unlimited) with Text to Speech access. Until then the chain falls back to the browser voice. After a 401 the provider pauses for 10 min, so restart the server after fixing the key.
 - Commits: `bed7d38` ElevenLabs voice · `9bceb73` echo-aware barge-in + noise-robust VAD · `98b32bc` UI revamp + WebGL orb · `56a20a5` docs/log. Live server restarted on this code (same tunnel).
+
+### 2026-10-24 · lead · ElevenLabs live + usage-cut workflow launched
+- ✅ ElevenLabs key fixed by the user (credit limit raised, Text to Speech + Models + User access). Account: **free tier, 10,000 credits/month**. 3 direct test lines: Flash v2.5 491 ms (4.5 s audio), v4 via text-to-dialogue 1,443 ms (5.2 s), multilingual v2 849 ms (4.3 s).
+- ✅ Live server restarted (clears the earlier 401 pause). End-to-end through the server: calibration prompts voiced by ElevenLabs Flash in 366 ms and 154 ms, Claude opener voiced in 445 ms (8.9 s audio), calibration `{A:1, B:2}`: PASS.
+- 🟡 User asked to "cut usage wherever there are unnecessary calls". Workflow `breadcrumbs-cut-usage` (run `wf_bd1e693d-82e`): measure a scripted 10-minute session with counting fake providers (new dev tool `server/sim/usage.py`) → implement (voice only the next crumb at warming, static line cache, regenerate crumb text only when invalid or stale, gate ambiguous-fragment classification on real silence, skip idle energy tags) → skeptical re-measure + regression hunt → fixes.
+
+### 2026-10-24 · usage:implement · Cut unnecessary billed calls (lazy voicing, gated prefetch, classifier gating)
+
+Measured with `server/sim/usage.py` (one scripted 10-minute social session, real runner/engine/CrumbService/ElevenLabs
+code over counting fakes, virtual time, no real calls, no transcript text printed). Same scenario before and after.
+
+| per 10-min session | before | after |
+|---|---|---|
+| Claude calls (abandoned) | 125 (5) | 54 (0) |
+| Claude input chars (~tokens) | 381,038 (~95k) | 141,912 (~35k) |
+| steer text: prefetch / live miss | 62 / 4 | 21 / 0 |
+| switch text (prefetch) | 22 | 8 |
+| grounded fact searches | 9 | 2 |
+| hold classifier | 7 (4 ambiguous fragments) | 3 (lexical hits only) |
+| energy tagger | 17 | 16 |
+| profiles + overlaps + trail | 4 | 4 |
+| ElevenLabs calls | 90 | 10 |
+| ElevenLabs credits (wasted) | 11,058.5 (10,430) | 1,027.5 (395) |
+| eleven_v4 renders / credits | 83 / 10,807 | 7 / 905 |
+| Flash renders / credits | 7 / 251.5 | 3 / 122.5 |
+| repeat session in the same process | 11,058.5 | 1,018.5 (static line cached) |
+| free tier (10,000 credits) covers | 0.9 sessions | 9.7 sessions |
+| crumbs played: cache hits / misses | 3 / 5 | 7 / 1 (the opener, 450 ms) |
+| steer latency (threshold to send) | 2,450 ms, canned fallback | 0 ms, generated steer |
+| hits over the 0.7 s target | 0 | 0 |
+| prefetch runs | 75 | 26 |
+
+What changed (server only):
+- ai/crumbs.py: prefetch keeps steer + switch TEXT only. A slot is generated only when missing, invalid or (steer)
+  stale (3 or more participant lines after the one it was written on), never twice at once (per-slot task). A miss
+  joins a running generation of its slot instead of a second call. `voice(kind, convo, now, lead_s)` voices exactly
+  one crumb (natural model with 1.8 s or more of lead, else Flash); at delivery the voiced take is used, a Flash take
+  in flight is awaited, and a late natural take is cancelled for Flash on the spot. Audio is kept by (text, model),
+  so a line is never voiced twice; a natural take that ran late raises the lead it needs (no double billing when v4
+  is slow). Topic: a conversation steer follows its lines, a topic-built steer is invalid only on a real change of
+  subject (no shared stem), a switch survives topic changes. Facts are cached per topic for the session (a timed-out
+  search finishes in the background), and the live path never searches. A live generation is skipped when the
+  recent median generation time is over its 2 s budget (fallback goes out at once instead of after an abandoned call).
+- engine/core.py: `next_auto_crumb(now)` / `steer_wanted(now)` evaluate the policy at T_LONG and T_EXC with the
+  cooldowns, cap and warm-up as they will be then. The warming-band prefetch effect now carries `voice` and
+  `due_in_s` and is emitted only when a crumb can fire in that pause. Ambiguous fragments and vetoed phrases go to the
+  hold classifier only after HOLD_CHECK_SILENCE_S (2.0 s) of silence, never for backchannels; lexical hits still go
+  at once (PRD 8.6). The energy tagger skips turns with no new words and runs while automatic crumbs could use it
+  (skipped under the safety pause or a rate cap lasting 60 s or more; the next turn after tags again).
+- engine/runner.py: a turn that opens a pause a steer could fill prefetches at once (the 1.5 s debounce plus 3.7 s
+  of Claude made every steer late); other turns keep the debounce; the 30 s refresh only runs when a slot needs text.
+  Stale steers are rebuilt only when `steer_wanted`; an empty steer slot is still filled (F14). System lines without
+  a participant name are voiced once per process (`ai.tts.SYSTEM_LINES`), named ones once per session (cleared on
+  stop/wipe, as is the crumb audio). One energy tag in flight at a time.
+- ai/tts.py: no 30% Gemini reserve when the gateway has no usable Gemini (no key or paused after a 402).
+  `AudioCache` + `synthesize_cached`. config.py: Params.HOLD_CHECK_SILENCE_S = 2.0 (addition only).
+- sim/usage.py: text-only prefetch, voicing attribution, `--repeat` (second session in the same process).
+
+Latency sweep (harness, Claude 1.2 to 5.5 s, v4 1.45 to 2.5 s, Flash 0.45 to 0.8 s): 0 abandoned calls in every run;
+steers 0 ms except the first one at Claude 5.5 s (joined its prefetch, 700 ms) and the inherent Flash time when Flash
+itself is slow.
+
+Results (keys blanked: MODEL_API_KEY= GEMINI_API_KEY= ANTHROPIC_API_KEY= ELEVENLABS_API_KEY=):
+- cd server && .venv/bin/pytest -q -> 585 passed (20 new in tests/test_usage_cuts.py; updated: topic invalidation,
+  steer staleness, fun fact via the prefetch path, vetoed/ambiguous classifier timing)
+- .venv/bin/python -m sim.replay -> 18/18 PASS
+- mock uvicorn on 127.0.0.1:8131 + python -m sim.smoke_e2e -> SMOKE PASS 25/25 in 53.8 s, 0 errors in the log; stopped.
+  Port 8000 untouched. No commits.
+
+Open: docs/CONTRACTS.md still describes the old prefetch (text + audio) and lacks `voice`, `due_in_s`,
+`CrumbService.voice/slots_to_refresh/close` and `prefetch(..., steer=)`. Remaining spend is mostly speculative
+steer text (17 of 21 unused: a steer must start at the commit to be on time) and v4 takes for 3.4 to 3.7 s pauses
+that end before 5 s (3 of 7). The energy tagger is unchanged in count (could ride on the crumb call, needs a prompt
+change). Prompt caching for the crumb system prompt is not set up (ai/claude.py).
+
+### 2026-10-25 · usage:fix · Usage cuts: no crumb later than before, full hold window, steers follow the latest turn
+
+Fixes for the review of `usage:implement`, each with regression tests (tests/test_usage_fixes.py, 16 new).
+Measured with `server/sim/usage.py` (same scripted session; counting fakes, virtual time, no real calls).
+
+| per 10-min session | baseline | usage:implement | usage:fix |
+|---|---|---|---|
+| Claude calls (abandoned) | 125 (5) | 54 (0) | 77 (0) |
+| steer text generations | 66 | 21 | 43 |
+| delivered steers built on the turn that opened the pause | n/a | 1 of 4 | 4 of 4 |
+| hold classifier calls | 7 | 3 | 4 |
+| ElevenLabs credits (wasted) | 11,058.5 (10,430) | 1,027.5 (395) | 829.5 (263) |
+| free tier covers | 0.9 sessions | 9.7 sessions | 12.1 sessions |
+| crumbs from the cache / over the 0.7 s target | 3 / 0 | 7 / 0 | 7 / 0 |
+
+What changed:
+- Misses that join a running refill (ai/crumbs.py `get`): the join and the live call now share one MISS_BUDGET_S
+  (2 s). The join waits at most MISS_JOIN_S (0.5 s) and always leaves the live call its recent median plus 0.2 s;
+  when the live call would be skipped (median over budget) the join gets the whole budget; under 0.3 s left the miss
+  goes straight to the overlap/canned fallback. The stale steer fallback is capped at STEER_STALE_TURNS lines.
+  Measured (verify/drop_join.py, drop_fact.py): Drop early in a session with Claude 3.7 s 4.47 s -> 2.46 s; steer
+  4.46 s -> 2.45 s; Drop with Claude 1.2 s while the refill searches 3.67 s -> 2.16 s. All inside F8 (3 s).
+- Hold window (engine/core.py): HOLD_CHECK_SILENCE_S 2.0 -> 1.0 s, and while a deferred classifier answer is out the
+  automatic crumbs wait for it, up to T_LONG + HOLD_CHECK_SILENCE_S, so the classifier has the same window as when
+  it was asked at the commit. The warming-band voicing waits for that answer too (no steer audio for a held pause).
+  A failed or timed-out call calls `Engine.hold_check_failed` (runner) and releases the wait. hold_margin.py: holds
+  at classifier latency 2.5, 2.9, 3.1, 4.0 and 4.5 s (was: steer at 5.0 s for 3.1 and 4.0 s); a quick "no" leaves
+  the steer at 5.0 s.
+- Fresh steers (F14): a committed turn that opens a pause a steer could fill marks its prefetch `fresh`; then a
+  steer not built on that line is rebuilt. If a steer for an earlier line is still being written, the fresh one is
+  queued behind it (never two at once; the running one stays the fallback). `voice()` waits for a fresher steer
+  that is on its way (keeping 1 s for Flash) instead of voicing the older text. Cost: +22 steer generations per
+  session against usage:implement (still 23 fewer than baseline); 3 steers are now voiced with Flash after waiting.
+- Round end: `next_auto_crumb` ignores a pause that outlasts the round, and the runner prepares no steer when fewer
+  than T_LONG of the round are left (speed dating). Prefetch stops once the round is over.
+- Test fix: the "late natural voice is not chosen again" test now runs the real cancel path end to end (natural take
+  gated past its lead, crumb fires, next voicing picks Flash), no hand-written samples.
+- docs/CONTRACTS.md: prefetch effect fields (`voice`, `due_in_s`, urgent vs debounced), classify_hold timing,
+  CrumbService (`get` join budget, `prefetch(steer, fresh, slots)`, `slots_to_refresh`, `voice`, `close`), Engine
+  (`next_auto_crumb`, `steer_wanted`, `auto_blocked_for`, `hold_check_failed`, `round_over`, `round_left_s`).
+
+Results (keys blanked: MODEL_API_KEY= GEMINI_API_KEY= ANTHROPIC_API_KEY= ELEVENLABS_API_KEY=):
+- cd server && .venv/bin/pytest -q -> 601 passed (16 new; updated: vetoed-phrase and fragment classifier timing for 1 s)
+- .venv/bin/python -m sim.replay -> 18/18 PASS
+- mock uvicorn on 127.0.0.1:8132 + python -m sim.smoke_e2e -> SMOKE PASS 25/25 in 53.8 s, 0 errors in the log; stopped.
+- Latency sweep (Claude 1.2 to 7.5 s, v4 1.45 / 2.2 s, classifier 2.5 / 3.7 s): every crumb 0 ms except the opener
+  (450 ms); credits 763.5 to 1,027.5. At Claude 5.5 s and 7.5 s one steer generation is still in flight when the
+  scripted session is stopped (cancelled at close; a harness artifact of a social session with no round timer).
+  Port 8000 untouched. No commits.
+
+### 2026-10-25 · lead · Usage cuts verified, committed, live
+- ✅ Workflow `wf_bd1e693d-82e` done (measure → implement → verify → fix). Verifier confirmed 5 issues (manual Drop/steer miss could exceed F8's 3 s while a slot refill ran; LLM-started hold window shrank to ~3 s; delivered steers built 1 to 2 turns back; a tautological test; stale CONTRACTS.md), all fixed with 16 regression tests.
+- **Per scripted 10-minute session (`python -m sim.usage`):** ElevenLabs **11,058.5 → 829.5 credits** (wasted 10,430 → 263), 90 → 10 calls; free tier **0.9 → 12.1 sessions/month**. Claude **125 → 77 calls** (0 abandoned, was 5), input ~95k → ~55k tokens. Crumbs: 7 of 8 from cache at 0 ms (was 3 of 8; steers were canned fallbacks at 2,450 ms), 0 over the 0.7 s target. Drop/steer misses ≤ ~2.5 s (F8).
+- How: crumb text is prefetched without audio; only the crumb that would fire next is voiced, when the pause enters warming (v4 if there is time, else Flash), once per text. Static calibration lines are cached per process, named lines per session (wiped with it). Crumb text is regenerated only when invalid or stale (stem-based topic change), not on a timer. Ambiguous fragments are classified only after 1 s of real silence (lexical holds unchanged). Idle energy tags are skipped.
+- Re-ran with keys blanked: `pytest -q` → **601 passed**; `sim.replay` → **18/18**; `sim.usage` → 829.5 credits; `npm run build` OK.

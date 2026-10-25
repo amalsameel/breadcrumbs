@@ -50,6 +50,13 @@ class Engine:
     def depth_max(self, now: float) -> int        # min(MAX_DEPTH[mode], 1 + floor(minutes_live / RAMP_MINUTES[mode]))
     def minutes_live(self, now: float) -> float
     @property phase -> Literal["calibrating", "live", "ended"]
+    @property round_over -> bool                  # the round timer ran out: nothing is worth preparing
+    def round_left_s(self, now: float) -> float | None   # None: no round timer for this mode
+    # usage: what is worth preparing (no I/O)
+    def next_auto_crumb(self, now: float) -> tuple[CrumbKind, float] | None   # (kind, seconds until it fires) if nobody speaks
+    def steer_wanted(self, now: float) -> bool    # a steer could fire in the pause that starts now
+    def auto_blocked_for(self, now: float) -> float   # seconds automatic crumbs stay blocked (inf: safety pause)
+    def hold_check_failed(self, turn_id: int) -> None # the deferred classifier call failed: crumbs stop waiting for it
     @property turns -> list[Turn]
     def metrics(self) -> dict                     # EngineMetrics
 ```
@@ -65,9 +72,9 @@ class Engine:
 | `deliver` | `kind` (`opener`/`steer`/`switch`/`manual`/`wildcard`), `reason` | get a crumb from CrumbService, send `crumb`, then call `crumb_dispatched` (or `crumb_failed`) |
 | `barge_in` | `crumb_id` | broadcast `crumb_interrupted` (Table fades out within 250 ms) |
 | `skip` | `crumb_id` or None | broadcast `crumb_interrupted` for the current crumb; engine also emits a `deliver` switch |
-| `classify_hold` | `turn_id`, `context` | call `classify_hold(context)` then `apply_hold_decision` |
+| `classify_hold` | `turn_id`, `context` | call `classify_hold(context)` then `apply_hold_decision` (on failure or timeout: `hold_check_failed`). A lexical hit is asked at once; an ambiguous fragment or vetoed phrase only after `HOLD_CHECK_SILENCE_S` (1 s) of silence, and automatic crumbs then wait for the answer up to `T_LONG + HOLD_CHECK_SILENCE_S` |
 | `tag_energy` | `context` | call `tag_energy(context)` then `apply_energy_tag` |
-| `prefetch` | `reason` | debounce 1.5 s, then refresh the CrumbService cache |
+| `prefetch` | `reason`, optional `voice` (`steer`/`switch`), `due_in_s` | refresh the TEXT slots that need it (`slots_to_refresh`): at once for a dispatch, topic change, warming band, or a committed turn that opens a pause a steer could fill (`steer_wanted`; that steer must follow this turn, `fresh=True`); other committed turns debounce 1.5 s; a 30 s check runs only when a slot needs text. With `voice`, also call `CrumbService.voice(kind, convo, now, due_in_s)`: the pause entered the warming band and that one crumb fires in `due_in_s` |
 | `decision` | `decision` (Decision dict) | broadcast `decision` (X-ray log) |
 | `round_warning` | | deliver a 1-minute-left crumb (speed dating, F21) |
 | `round_end` | | end the session (as if End was pressed) |
@@ -112,8 +119,8 @@ async def get_fact(topic: str | None, location: str) -> Fact | None  # None if n
 # ai/tts.py  (round 2: ElevenLabs, then Gemini TTS, then None so the Table uses the browser voice)
 async def synthesize(text: str, gemini: Gemini | None = None, *, fast: bool = True,
                      elevenlabs: ElevenLabs | None = None, budget_s: float | None = None) -> bytes | None   # WAV bytes or None
-# fast=True: live lines (misses, opener, calibration) on eleven_flash_v2_5; fast=False: prefetch (eleven_v4, then
-# multilingual_v2, then flash). budget_s is the caller's whole time budget; the chain splits it across routes.
+# fast=True: live lines (misses, opener, calibration) on eleven_flash_v2_5; fast=False: lazy voicing of the next
+# crumb with at least 1.8 s of lead (eleven_v4, then multilingual_v2, then flash). budget_s is the caller's whole time budget; the chain splits it across routes.
 # ai/elevenlabs.py
 def get_elevenlabs() -> ElevenLabs   # process-wide; keyless (unavailable) under pytest unless BREADCRUMBS_ELEVENLABS_LIVE_TESTS=1
 class ElevenLabs: available: bool; async synthesize(text, *, fast, budget_s=None) -> bytes | None; async warm() -> bool
@@ -145,8 +152,16 @@ class CrumbService:     # one per session; owns crumb history and the prefetch c
     used_topics: list[str]; used_item_ids: set[str]; featured_count: dict[int, int]; history: list[Crumb]
     async def opener(self, convo: ConvoCtx) -> Delivery                       # best overlap opener (F11)
     async def get(self, kind: CrumbKind, convo: ConvoCtx, now: float) -> Delivery   # steer/switch/manual/wildcard; uses cache when valid
-    async def prefetch(self, convo: ConvoCtx, now: float) -> None             # keep ready_steer + ready_switch (text + audio) fresh
+        # a miss whose slot is being prefetched joins it, inside the same 2 s miss budget as the live call (F8)
+    async def prefetch(self, convo: ConvoCtx, now: float, *, steer: bool = True, fresh: bool = False,
+                       slots: tuple[str, ...] = ("steer", "switch")) -> None   # keep ready_steer + ready_switch TEXT fresh (F14)
+        # only missing/invalid/stale slots, never one slot twice at once; steer=False keeps a stale steer;
+        # fresh=True rebuilds a steer not built on the latest line (queued behind a running one, never parallel)
+    def slots_to_refresh(self, convo, now, *, steer=True, fresh=False, slots=...) -> list[str]   # what prefetch would make (no call)
+    async def voice(self, kind: CrumbKind, convo: ConvoCtx, now: float, lead_s: float) -> None
+        # voice the next crumb once: eleven_v4 with enough lead, else Flash; a late natural take is cancelled for Flash
     def invalidate(self, reason: str) -> None
+    def close(self) -> None                                                   # session over: cancel work, drop cached text and audio
     def cached_summary(self, now: float) -> dict                              # {"steer": text | None, "switch": text | None}
     def mark_delivered(self, crumb: Crumb) -> None                            # used topics/items, featured_count, overlap usage, source rotation
 ```

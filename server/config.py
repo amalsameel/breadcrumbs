@@ -137,6 +137,12 @@ class Params:
     # Self-hearing by text: a Muse turn during or just after bot speech whose words overlap the line being
     # spoken by at least this fraction is the bot's own echo (no barge-in, never a human turn).
     ECHO_TEXT_OVERLAP: float = 0.5
+    # Usage: an ambiguous fragment (or a vetoed hold phrase) goes to the hold classifier only once the
+    # silence after it reaches this many seconds (PRD 8.6: "followed by silence"); a reply within it
+    # makes the call pointless. While that answer is out, automatic crumbs wait for it up to this many
+    # seconds past the long threshold, so the classifier keeps the same window as when it was asked at
+    # the commit. A lexical hold hit is classified at once, as before.
+    HOLD_CHECK_SILENCE_S: float = 1.0
     HOLD_MAX_S: dict = field(default_factory=lambda: dict(HOLD_MAX_S))
     STALENESS_WEIGHTS: dict = field(default_factory=lambda: dict(STALENESS_WEIGHTS))
 

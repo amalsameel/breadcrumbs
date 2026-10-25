@@ -1,15 +1,24 @@
 """Crumb generation, validation, source rotation and the prefetch cache (PRD 8.9, 8.10, 9.4, 9.5).
 
 One CrumbService per session. It owns the crumb history, which items/topics/overlaps were used,
-who has been featured, and the ready_steer / ready_switch cache (text + pre-synthesized audio).
+who has been featured, and the ready_steer / ready_switch cache.
+
+Usage (each call is billed): prefetch keeps the steer and switch TEXT ready and regenerates a slot only
+when it is missing, invalid or (steer) stale, never twice at once. Audio is made for one crumb only, the
+one the engine will deliver next, when the pause enters the warming band (`voice`); a crumb whose voice
+is not ready when it fires is voiced with the fast model on the spot. Audio is kept by (text, model), so
+the same line is never voiced twice. Grounded facts are kept per topic for the session.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import statistics
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Literal
+from functools import partial
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -43,6 +52,29 @@ MISS_TTS_BUDGET_S = 1.0  # past this the Table speaks with speechSynthesis
 PREFETCH_TTS_BUDGET_S = 12.0
 OPENER_TTS_BUDGET_S = 5.0
 FACT_BUDGET_S = 8.0
+# A cached steer builds on what was just said: it is rebuilt once this many participant lines followed
+# the line it was written after (and only when a steer could fire, see the runner).
+STEER_STALE_TURNS = 3
+# Lazy voicing: the natural model (eleven_v4, measured 1.44 s) only when the crumb is due at least this
+# far ahead; otherwise the fast model (Flash, about 0.5 s). Flash pre-voicing gets VOICE_FAST_BUDGET_S.
+NATURAL_VOICE_MIN_LEAD_S = 1.8
+NATURAL_VOICE_MARGIN_S = 0.3  # over the recent natural latency (which can only raise the lead needed)
+VOICE_FAST_BUDGET_S = 4.0
+VOICE_FRESH_RESERVE_S = 1.0  # lead kept for the fast voice when waiting for a fresher steer text
+AUDIO_CACHE_ITEMS = 8  # voiced lines kept per session, by (text, fast)
+FACT_CACHE_ITEMS = 16  # grounded facts kept per session, by topic stems
+# A live (cache miss) generation is skipped when the recent generations took longer than its budget:
+# the call would be abandoned (and still billed) and the canned fallback would go out late anyway.
+LIVE_DRAFT_SAMPLES = 5
+LIVE_DRAFT_MIN_SAMPLES = 2
+# A miss whose slot is still being prefetched waits for that generation, but inside the same MISS_BUDGET_S
+# as the live call (F8: 3 s or less). While a live call can still make it, the wait is at most MISS_JOIN_S
+# and always leaves room for the live call (its recent median plus MISS_JOIN_MARGIN_S); when the live call
+# would be skipped anyway, the running prefetch gets the whole budget. Below MISS_LIVE_MIN_S left, the miss
+# goes straight to the overlap or canned fallback instead of starting a call it would abandon.
+MISS_JOIN_S = 0.5
+MISS_JOIN_MARGIN_S = 0.2
+MISS_LIVE_MIN_S = 0.3
 # The round warning (F21) always says the time out loud, whatever crumb carries it.
 ROUND_WARNING_LEAD = "One minute left."
 TOPIC_MAX_CHARS = 80
@@ -153,12 +185,12 @@ class _Plan:
     fact: Fact | None = None
     fact_budget_s: float = FACT_BUDGET_S
     max_words: int = config.CRUMB_MAX_WORDS
+    live: bool = False  # a cache miss on the live path: no web search (it never fits MISS_FACT_BUDGET_S)
 
 
 @dataclass
 class _CacheEntry:
     crumb: Crumb
-    audio: bytes | None
     created_at: float
     topic: str | None
     gen_ms: float
@@ -196,7 +228,15 @@ class CrumbService:
         self._counter = 0
         self._cache: dict[str, _CacheEntry] = {}
         self._epoch = 0
-        self._prefetch_lock = asyncio.Lock()
+        self._gen_tasks: dict[str, asyncio.Task] = {}  # slot -> text generation in flight (one per slot)
+        self._gen_lines: dict[str, int | None] = {}  # slot -> the latest line its generation was built on
+        self._steer_next: tuple[ConvoCtx, float] | None = None  # a fresh steer to start once the running one ends
+        self._voice_tasks: dict[str, tuple[asyncio.Task, bool]] = {}  # crumb text -> (voicing in flight, fast)
+        self._audio: OrderedDict[tuple[str, bool], bytes] = OrderedDict()  # (text, fast) -> WAV
+        self._facts: OrderedDict[str, Fact | None] = OrderedDict()  # topic key -> fact (None: nothing usable)
+        self._fact_tasks: dict[str, asyncio.Task] = {}
+        self._draft_ms: deque[float] = deque(maxlen=LIVE_DRAFT_SAMPLES)  # recent model generation times
+        self._natural_s: deque[float] = deque(maxlen=LIVE_DRAFT_SAMPLES)  # recent natural voice times (or lower bounds)
 
     # -- public API -----------------------------------------------------------------------------
 
@@ -207,67 +247,168 @@ class CrumbService:
         if crumb is None:
             plan = self._plan("switch", convo, as_kind="opener")
             plan.fact_budget_s = MISS_FACT_BUDGET_S
-            crumb = await self._build_within(plan, convo, MISS_BUDGET_S)
+            plan.live = True
+            crumb = await self._build_live(plan, convo, MISS_BUDGET_S)
         self.mark_delivered(crumb)
-        audio = await self._synth(crumb.text, OPENER_TTS_BUDGET_S)
+        audio = await self._synth(crumb.text, OPENER_TTS_BUDGET_S, fast=True)
         return Delivery(crumb=crumb, audio_wav=audio, cache_hit=False, gen_ms=_ms_since(started))
 
     async def get(self, kind: CrumbKind, convo: ConvoCtx, now: float) -> Delivery:
-        """A crumb for `kind`: the cached one when still valid (instant), otherwise generated now."""
+        """A crumb for `kind`: the cached one when still valid (instant), otherwise generated now.
+
+        A miss whose prefetch is still running joins it instead of paying for a second generation of the
+        same slot. The join and the live call share one MISS_BUDGET_S (see MISS_JOIN_S), so a miss is
+        never slower than a plain live call plus the fast voice (F8).
+        """
         started = time.perf_counter()
         if kind == "opener":
             return await self.opener(convo)
         key = _cache_key(kind)
-        entry = self._cache.get(key) if key else None
-        if entry is not None and not self._entry_valid(entry, now, convo.current_topic, convo):
-            self._cache.pop(key, None)  # stale: drop it
-            entry = None
+        entry = self._usable(key, now, convo) if key else None
+        joined = False
+        if entry is None and key in self._gen_tasks:
+            joined = True
+            await _wait_task(self._gen_tasks[key], self._join_budget_s())
+            entry = self._usable(key, now, convo)
+        left_s = MISS_BUDGET_S - (time.perf_counter() - started)
+        live_ok = left_s >= MISS_LIVE_MIN_S and self._live_call_fits(left_s)
+        if entry is None and key == "steer" and not live_ok:
+            entry = self._stale_steer(now, convo)  # a slightly older steer beats a late canned line
         if entry is not None:
-            crumb = entry.crumb.model_copy(update={"kind": kind})
-            audio = entry.audio
+            crumb: Crumb | None = entry.crumb.model_copy(update={"kind": kind})
             if convo.instruction:
-                lead = self._with_instruction(crumb, convo)
-                if lead is not None and lead.text != crumb.text:
-                    audio = await self._synth(lead.text, MISS_TTS_BUDGET_S)  # cached audio lacks the lead-in
-                crumb = lead
+                crumb = self._with_instruction(crumb, convo)  # type: ignore[arg-type]
             if crumb is not None:
-                self._cache.pop(key, None)
-                log.info("crumb cache hit (%s)", key)
-                return Delivery(crumb=crumb, audio_wav=audio, cache_hit=True, gen_ms=_ms_since(started))
+                self._cache.pop(key, None)  # type: ignore[arg-type]
+                log.info("crumb cache %s (%s)", "joined its prefetch" if joined else "hit", key)
+                audio = await self._audio_for(crumb.text)  # a lead-in makes a new text: voiced fresh
+                return Delivery(crumb=crumb, audio_wav=audio, cache_hit=not joined, gen_ms=_ms_since(started))
             # The cached crumb is too long to carry the instruction: keep it for later, generate one now.
         plan = self._plan(kind, convo)
         plan.fact_budget_s = MISS_FACT_BUDGET_S
+        plan.live = True
         if convo.instruction:
             plan.max_words = max(10, config.CRUMB_MAX_WORDS - _lead_words(convo.instruction))
-        crumb = await self._build_within(plan, convo, MISS_BUDGET_S)
+        if live_ok:
+            crumb = await self._build_live(plan, convo, left_s)
+        else:  # the join used the budget (or the live call would be abandoned): fall back at once
+            log.info("live crumb generation skipped (%.1f s of the miss budget left); using fallback", max(0.0, left_s))
+            crumb = self._fallback(kind, convo)
         if convo.instruction:
             crumb = self._with_instruction(crumb, convo) or self._with_instruction(self._canned(kind, convo), convo) or crumb
-        audio = await self._synth(crumb.text, MISS_TTS_BUDGET_S)
+        audio = await self._synth(crumb.text, MISS_TTS_BUDGET_S, fast=True)
         return Delivery(crumb=crumb, audio_wav=audio, cache_hit=False, gen_ms=_ms_since(started))
 
-    async def prefetch(self, convo: ConvoCtx, now: float) -> None:
-        """Keep ready_steer and ready_switch (text + audio) fresh. Concurrent calls are skipped."""
-        if self._prefetch_lock.locked():
+    async def prefetch(self, convo: ConvoCtx, now: float, *, steer: bool = True, fresh: bool = False,
+                       slots: tuple[str, ...] = ("steer", "switch")) -> None:
+        """Keep ready_steer and ready_switch TEXT fresh (audio comes later, from `voice`).
+
+        Only a slot that is missing, invalid or (steer) stale is regenerated, and a slot already being
+        generated is never started again. `steer=False` (the runner passes it when no steer could fire in
+        the coming pause) still fills an empty steer slot (F14) but does not rebuild a merely stale one:
+        it would go stale again before it could be used. `fresh=True` (a turn just opened a pause that a
+        steer could fill) rebuilds a steer that is not built on that turn (F14: regenerated after each turn).
+        `slots` limits the slots looked at (the runner drops the steer when the round ends before one could fire).
+        """
+        keys = self.slots_to_refresh(convo, now, steer=steer, fresh=fresh, slots=slots)
+        tasks = []
+        for key in keys:
+            if key in self._gen_tasks:  # a steer for an earlier turn is still being written: follow it up
+                self._steer_next = (convo, now)
+            else:
+                tasks.append(self._start_generation(key, convo, now))
+        if tasks:
+            await asyncio.wait(tasks)
+
+    def slots_to_refresh(self, convo: ConvoCtx, now: float, *, steer: bool = True, fresh: bool = False,
+                         slots: tuple[str, ...] = ("steer", "switch")) -> list[str]:
+        """Slots a prefetch would generate right now (no model call; the runner checks this first)."""
+        out: list[str] = []
+        line = self._line_key(convo)
+        for key in slots:
+            if key in self._gen_tasks:
+                # One generation per slot at a time. A fresh steer for a newer turn than the running one is
+                # started when that one ends (never in parallel); the running one stays the fallback.
+                queued = self._steer_next is not None and self._line_key(self._steer_next[0]) == line
+                if key == "steer" and steer and fresh and self._gen_lines.get(key) != line and not queued:
+                    out.append(key)
+                continue
+            ready = self._usable(key, now, convo) if steer or key != "steer" else self._valid(key, now, convo)
+            if ready is not None and key == "steer" and steer and fresh and self._lines_since(ready, convo) > 0:
+                ready = None  # the pause that opens now is the one this steer would fill: follow its turn
+            if ready is None:
+                out.append(key)
+        return out
+
+    async def voice(self, kind: CrumbKind, convo: ConvoCtx, now: float, lead_s: float) -> None:
+        """Voice the one crumb the engine will deliver next, `lead_s` seconds from `now`.
+
+        Called when the pause enters the warming band. Waits for the slot's text if it is still being
+        generated (up to `lead_s`), then voices it once: the natural model when at least
+        NATURAL_VOICE_MIN_LEAD_S is left, else the fast one. A line already voiced, or being voiced, is
+        never sent again. A steer for the turn that opened this pause that is still being written is
+        waited for (leaving VOICE_FRESH_RESERVE_S for the fast voice) rather than voicing the older one.
+        """
+        key = _cache_key(kind)
+        if key is None:
             return
-        async with self._prefetch_lock:
-            epoch = self._epoch
-            missing = [k for k in ("steer", "switch") if not self._key_valid(k, now, convo)]
-            for key in missing:
-                self._cache.pop(key, None)
-            results = await asyncio.gather(*(self._prefetch_one(k, convo) for k in missing), return_exceptions=True)
-            for key, result in zip(missing, results):
-                if isinstance(result, BaseException):
-                    log.warning("prefetch %s failed (%s)", key, type(result).__name__)
-                    continue
-                if self._epoch != epoch:
-                    continue  # invalidated while generating
-                crumb, audio, gen_ms = result
-                self._cache[key] = _CacheEntry(crumb, audio, now, convo.current_topic, gen_ms, self._line_key(convo))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + lead_s - VOICE_FRESH_RESERVE_S
+        while key == "steer" and self._fresher_steer_coming(convo) and loop.time() < deadline:
+            await _wait_task(self._gen_tasks["steer"], deadline - loop.time())
+        if self._usable(key, now, convo) is None:
+            # No fresh text yet: join its generation (or start it: this crumb is about to be needed).
+            await _wait_task(self._start_generation(key, convo, now), max(0.0, lead_s))
+        entry = self._usable(key, now, convo)
+        if entry is None:
+            return
+        text = entry.crumb.text
+        if self._cached_audio(text) is not None or text in self._voice_tasks:
+            return
+        left = lead_s - (loop.time() - started)
+        await _wait_task(self._start_voicing(text, fast=left < self._natural_lead_s()), None)
+
+    def _fresher_steer_coming(self, convo: ConvoCtx) -> bool:
+        """A steer built on the latest line is being written (or queued behind the running one) and the
+        cached steer is older."""
+        if "steer" not in self._gen_tasks:
+            return False
+        line = self._line_key(convo)
+        entry = self._cache.get("steer")
+        if entry is not None and entry.line_key == line:
+            return False
+        queued = self._steer_next is not None and self._line_key(self._steer_next[0]) == line
+        return self._gen_lines.get("steer") == line or queued
+
+    def _natural_lead_s(self) -> float:
+        """Lead needed for the natural model: NATURAL_VOICE_MIN_LEAD_S, or more once it ran slower here (a
+        take that was late is recorded as at least that slow), so a slow model stops paying twice."""
+        if not self._natural_s:
+            return NATURAL_VOICE_MIN_LEAD_S
+        return max(NATURAL_VOICE_MIN_LEAD_S, statistics.median(self._natural_s) + NATURAL_VOICE_MARGIN_S)
 
     def invalidate(self, reason: str) -> None:
         self._cache.clear()
         self._epoch += 1
+        for task in self._gen_tasks.values():
+            task.cancel()
+        self._gen_tasks.clear()
+        self._gen_lines.clear()
+        self._steer_next = None
         log.info("crumb cache invalidated (%s)", reason)
+
+    def close(self) -> None:
+        """Session over (stop or wipe): cancel background generation and drop cached text and audio."""
+        self.invalidate("session closed")
+        for task, _ in self._voice_tasks.values():
+            task.cancel()
+        for task in self._fact_tasks.values():
+            task.cancel()
+        self._voice_tasks.clear()
+        self._fact_tasks.clear()
+        self._audio.clear()
+        self._facts.clear()
 
     def cached_summary(self, now: float) -> dict:
         def text(key: str) -> str | None:
@@ -282,6 +423,11 @@ class CrumbService:
             return
         self._delivered.add(crumb.id)
         self.history.append(crumb)
+        for model_fast in (False, True):
+            self._audio.pop((crumb.text, model_fast), None)  # its audio lived as long as the crumb
+        if crumb.citation_url:  # a fact is told once; the next crumb on this topic looks for a new one
+            for fact_key in [k for k, f in self._facts.items() if f is not None and f.url == crumb.citation_url]:
+                del self._facts[fact_key]
         topic = crumb.topic.strip().lower()
         if topic and topic not in self.used_topics:
             self.used_topics.append(topic)
@@ -456,23 +602,71 @@ class CrumbService:
 
     # -- generation and the fallback chain (PRD 9.4) ---------------------------------------------
 
-    async def _prefetch_one(self, key: str, convo: ConvoCtx) -> tuple[Crumb, bytes | None, float]:
+    def _start_generation(self, key: str, convo: ConvoCtx, now: float) -> asyncio.Task:
+        task = self._gen_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._generate(key, convo, now, self._epoch))
+            self._gen_tasks[key] = task
+            self._gen_lines[key] = self._line_key(convo)
+            task.add_done_callback(partial(self._generation_done, key))
+        return task
+
+    def _generation_done(self, key: str, task: asyncio.Task) -> None:
+        built_on = self._gen_lines.get(key)
+        if self._gen_tasks.get(key) is task:
+            del self._gen_tasks[key]
+            self._gen_lines.pop(key, None)
+        if not task.cancelled() and task.exception() is not None:
+            log.warning("prefetch %s failed (%s)", key, type(task.exception()).__name__)
+        nxt, self._steer_next = (self._steer_next, None) if key == "steer" else (None, self._steer_next)
+        if nxt is not None and not task.cancelled() and self._line_key(nxt[0]) != built_on and key not in self._gen_tasks:
+            self._start_generation(key, nxt[0], nxt[1])  # the turn that opened the pause came in meanwhile
+
+    async def _generate(self, key: str, convo: ConvoCtx, now: float, epoch: int) -> Crumb:
+        crumb, gen_ms = await self._prefetch_one(key, convo)
+        if self._epoch == epoch:  # else invalidated while generating
+            self._cache[key] = _CacheEntry(crumb, now, convo.current_topic, gen_ms, self._line_key(convo))
+        return crumb
+
+    async def _prefetch_one(self, key: str, convo: ConvoCtx) -> tuple[Crumb, float]:
+        """Text only: the audio is made later, for the one crumb about to be delivered (`voice`)."""
         started = time.perf_counter()
         crumb = await self._build_within(self._plan(key, convo), convo, PREFETCH_BUDGET_S)  # type: ignore[arg-type]
-        audio = await self._synth(crumb.text, PREFETCH_TTS_BUDGET_S)
-        return crumb, audio, _ms_since(started)
+        return crumb, _ms_since(started)
+
+    async def _build_live(self, plan: _Plan, convo: ConvoCtx, budget_s: float) -> Crumb:
+        if not self._live_call_fits(budget_s):
+            log.info("live crumb generation skipped (recent generations took over %.1f s); using fallback", budget_s)
+            return self._fallback(plan.kind, convo)
+        return await self._build_within(plan, convo, budget_s)
+
+    def _join_budget_s(self) -> float:
+        """How long a miss waits for its slot's running prefetch (see MISS_JOIN_S)."""
+        if not self._live_call_fits(MISS_BUDGET_S):
+            return MISS_BUDGET_S  # the live call would be skipped: the running generation is the only real crumb
+        if self.gemini.mock or len(self._draft_ms) < LIVE_DRAFT_MIN_SAMPLES:
+            return MISS_JOIN_S
+        live_s = statistics.median(self._draft_ms) / 1000.0
+        return max(0.0, min(MISS_JOIN_S, MISS_BUDGET_S - live_s - MISS_JOIN_MARGIN_S))
+
+    def _live_call_fits(self, budget_s: float) -> bool:
+        if self.gemini.mock or len(self._draft_ms) < LIVE_DRAFT_MIN_SAMPLES:
+            return True
+        return statistics.median(self._draft_ms) <= budget_s * 1000.0
 
     async def _build_within(self, plan: _Plan, convo: ConvoCtx, budget_s: float) -> Crumb:
         try:
             return await asyncio.wait_for(self._build(plan, convo), timeout=budget_s)
         except asyncio.TimeoutError:
             log.warning("crumb generation over budget (%.1f s); using fallback", budget_s)
+            if not self.gemini.mock:
+                self._draft_ms.append(budget_s * 1000.0)  # at least this slow
             return self._fallback(plan.kind, convo)
 
     async def _build(self, plan: _Plan, convo: ConvoCtx) -> Crumb:
         """Generate, validate, regenerate once, then overlap opener, then canned (Appendix B)."""
         if plan.source == "outside" and "fun_fact" in plan.formats:
-            plan.fact = await self._fact(plan.topic_hint, plan.fact_budget_s)
+            plan.fact = await self._fact(plan.topic_hint, plan.fact_budget_s, live=plan.live)
             if plan.fact is None:
                 plan.formats = [f for f in plan.formats if f != "fun_fact"] or ["question"]
                 if plan.kind == "steer":
@@ -490,16 +684,46 @@ class CrumbService:
             log.info("crumb rejected on attempt %d: %s", attempt + 1, "; ".join(e.split(":")[0] for e in errors))
         return self._fallback(plan.kind, convo)
 
-    async def _fact(self, topic: str | None, budget_s: float = FACT_BUDGET_S) -> Fact | None:
-        try:
-            return await asyncio.wait_for(get_fact(topic, self.location, gemini=self.gemini), budget_s)
-        except Exception as exc:  # noqa: BLE001 - no fact simply means "ask a question instead"
-            log.warning("fact lookup failed (%s)", type(exc).__name__)
+    async def _fact(self, topic: str | None, budget_s: float = FACT_BUDGET_S, *, live: bool = False) -> Fact | None:
+        """A grounded fact for `topic`, searched once per topic per session.
+
+        A lookup that runs over `budget_s` keeps going in the background and its answer is kept for the
+        next crumb on that topic. The live path never searches (a web search does not fit
+        MISS_FACT_BUDGET_S), it only uses a fact already found.
+        """
+        key = _fact_key(topic)
+        if key in self._facts:
+            self._facts.move_to_end(key)
+            return self._facts[key]
+        if live:
             return None
+        task = self._fact_tasks.get(key)
+        if task is None:
+            task = asyncio.ensure_future(get_fact(topic, self.location, gemini=self.gemini))
+            self._fact_tasks[key] = task
+            task.add_done_callback(partial(self._fact_done, key))
+        fact = await _wait_task(task, budget_s)
+        if not task.done():
+            log.warning("fact lookup over budget (%.1f s); kept for the next crumb on this topic", budget_s)
+        return fact
+
+    def _fact_done(self, key: str, task: asyncio.Task) -> None:
+        if self._fact_tasks.get(key) is task:
+            del self._fact_tasks[key]
+        if task.cancelled():
+            return
+        if task.exception() is not None:  # no fact simply means "ask a question instead"
+            log.warning("fact lookup failed (%s)", type(task.exception()).__name__)
+            return
+        self._facts[key] = task.result()
+        while len(self._facts) > FACT_CACHE_ITEMS:
+            self._facts.popitem(last=False)
 
     async def _draft(self, plan: _Plan, convo: ConvoCtx, attempt: int) -> Crumb:
         if self.gemini.mock:
             return self._mock_crumb(plan, convo, attempt)
+        loop = asyncio.get_running_loop()
+        started = loop.time()  # the loop clock: the same one the budgets (asyncio.wait_for) run on
         draft = await self.gemini.json(
             model=config.GEMINI_MODEL,
             system=crumb_system(self.mode),
@@ -507,6 +731,7 @@ class CrumbService:
             schema=CrumbDraft,
             max_tokens=400,
         )
+        self._draft_ms.append((loop.time() - started) * 1000.0)
         return self._from_draft(draft, plan, convo)
 
     def _from_draft(self, draft: CrumbDraft, plan: _Plan, convo: ConvoCtx) -> Crumb:
@@ -724,34 +949,138 @@ class CrumbService:
                 return seat
         return None
 
+    def _participant_lines(self, convo: ConvoCtx) -> list[tuple[int, str]]:
+        out: list[tuple[int, str]] = []
+        for speaker, text in h.transcript_lines(convo.recent_transcript):
+            seat = self._seat_of(speaker)
+            if seat is not None:
+                out.append((seat, text))
+        return out
+
     def _line_key(self, convo: ConvoCtx) -> int | None:
         """Identity of the latest participant line (a hash, so no transcript text is kept)."""
         latest = self._latest_line(convo)
         return hash(latest) if latest is not None else None
 
-    def _entry_valid(self, entry: _CacheEntry, now: float, topic: str | None, convo: ConvoCtx | None = None) -> bool:
+    def _lines_since(self, entry: _CacheEntry, convo: ConvoCtx) -> int:
+        """Participant lines spoken after the one the entry was built on (a large number once it scrolled
+        out of the recent transcript)."""
+        lines = self._participant_lines(convo)
+        if entry.line_key is None:
+            return len(lines)
+        for back, line in enumerate(reversed(lines)):
+            if hash(line) == entry.line_key:
+                return back
+        return 1_000_000
+
+    def _entry_valid(self, entry: _CacheEntry, now: float, topic: str | None) -> bool:
+        """Hard validity (PRD 8.10): age, the topic, its items or topic used, already delivered."""
         if now - entry.created_at > config.CACHE_MAX_AGE_S:
             return False
-        if (entry.topic or None) != (topic or None):
+        if entry.crumb.id in self._delivered or set(entry.crumb.source_item_ids) & self.used_item_ids:
             return False
-        if set(entry.crumb.source_item_ids) & self.used_item_ids:
+        if entry.crumb.kind == "steer":
+            # The steer stays on the current topic. One built on the latest lines follows those lines (the
+            # STEER_STALE_TURNS rule in _usable; the topic label is derived from the same lines); one built
+            # on the topic label is invalid after a real change of subject (no shared word stem), not after
+            # a reworded label.
+            return entry.crumb.source == "conversation" or not _topics_differ(entry.topic, topic)
+        if entry.crumb.topic.strip().lower() in self.used_topics:
             return False
-        if entry.crumb.kind != "steer" and entry.crumb.topic.strip().lower() in self.used_topics:
-            return False
-        # PRD 8.10 / F14: the steer builds on what was just said, so a new turn makes it stale.
-        if convo is not None and entry.crumb.kind == "steer" and entry.line_key != self._line_key(convo):
-            return False
-        return True
+        # A switch moves away from the current topic, so a new topic leaves it valid unless the talk has
+        # already moved onto the switch's own subject.
+        return not _topics_overlap(entry.crumb.topic, topic)
 
-    def _key_valid(self, key: str, now: float, convo: ConvoCtx) -> bool:
-        entry = self._cache.get(key)
-        return entry is not None and self._entry_valid(entry, now, convo.current_topic, convo)
+    def _valid(self, key: str | None, now: float, convo: ConvoCtx) -> _CacheEntry | None:
+        """The slot's entry if it is still valid; an invalid one is dropped."""
+        entry = self._cache.get(key) if key else None
+        if entry is not None and not self._entry_valid(entry, now, convo.current_topic):
+            self._cache.pop(key, None)  # type: ignore[arg-type]
+            return None
+        return entry
 
-    async def _synth(self, text: str, budget_s: float) -> bytes | None:
-        # Only prefetch has a budget long enough for the most natural voice model; misses, Drop a crumb
-        # and the opener are on the live path and use the fast one. The budget is passed down too, so a
-        # slow model leaves time for the next one (and for Gemini) instead of using it all up.
-        fast = budget_s < PREFETCH_TTS_BUDGET_S
+    def _stale_steer(self, now: float, convo: ConvoCtx) -> _CacheEntry | None:
+        """The cached steer when no fresh one can be had in time: still valid and at most STEER_STALE_TURNS
+        lines old, so its "X just said" is never far off."""
+        entry = self._valid("steer", now, convo)
+        if entry is None or self._lines_since(entry, convo) > STEER_STALE_TURNS:
+            return None
+        return entry
+
+    def _usable(self, key: str | None, now: float, convo: ConvoCtx) -> _CacheEntry | None:
+        """A valid entry that is also fresh: a steer must follow the latest turns (F14). A stale steer stays
+        in the slot (an older steer is still a better fallback than a canned line) until it is rebuilt."""
+        entry = self._valid(key, now, convo)
+        if entry is not None and key == "steer" and self._lines_since(entry, convo) >= STEER_STALE_TURNS:
+            return None
+        return entry
+
+    # -- voice (lazy, one line at a time) ----------------------------------------------------------------
+
+    def _cached_audio(self, text: str) -> bytes | None:
+        for fast in (False, True):  # the natural take first
+            wav = self._audio.get((text, fast))
+            if wav is not None:
+                self._audio.move_to_end((text, fast))
+                return wav
+        return None
+
+    def _remember_audio(self, text: str, fast: bool, wav: bytes) -> None:
+        self._audio[(text, fast)] = wav
+        self._audio.move_to_end((text, fast))
+        while len(self._audio) > AUDIO_CACHE_ITEMS:
+            self._audio.popitem(last=False)
+
+    def _start_voicing(self, text: str, *, fast: bool) -> asyncio.Task:
+        pending = self._voice_tasks.get(text)
+        if pending is not None:
+            return pending[0]
+        budget = VOICE_FAST_BUDGET_S if fast else PREFETCH_TTS_BUDGET_S
+        task = asyncio.ensure_future(self._voice_text(text, fast, budget))
+        self._voice_tasks[text] = (task, fast)
+        task.add_done_callback(partial(self._voicing_done, text, fast, asyncio.get_running_loop().time()))
+        return task
+
+    def _voicing_done(self, text: str, fast: bool, started: float, task: asyncio.Task) -> None:
+        pending = self._voice_tasks.get(text)
+        if pending is not None and pending[0] is task:
+            del self._voice_tasks[text]
+        if not fast:
+            took = asyncio.get_running_loop().time() - started
+            if task.cancelled():  # late for its crumb: at least this slow, plus the margin it missed by
+                self._natural_s.append(took + NATURAL_VOICE_MARGIN_S)
+            elif task.exception() is None and task.result():
+                self._natural_s.append(took)
+
+    async def _voice_text(self, text: str, fast: bool, budget_s: float) -> bytes | None:
+        wav = await self._synth(text, budget_s, fast=fast)
+        if wav:
+            self._remember_audio(text, fast, wav)
+        return wav
+
+    async def _audio_for(self, text: str) -> bytes | None:
+        """Audio for a crumb being delivered now: the voiced take, a fast take that is about to land, or
+        the fast model on the spot. A natural take that is not ready yet is dropped (cancelled): the crumb
+        never waits for it."""
+        wav = self._cached_audio(text)
+        if wav is not None:
+            return wav
+        pending = self._voice_tasks.get(text)
+        if pending is not None:
+            task, fast = pending
+            if fast:  # the same model a fresh call would use: wait for it rather than pay twice
+                await _wait_task(task, MISS_TTS_BUDGET_S)
+                return self._cached_audio(text)
+            task.cancel()
+            log.info("natural voice not ready when the crumb fired; using the fast model")
+        return await self._voice_text(text, True, MISS_TTS_BUDGET_S)
+
+    async def _synth(self, text: str, budget_s: float, *, fast: bool | None = None) -> bytes | None:
+        # The natural voice model only when there is time for it (lazy voicing at the warming band, or a
+        # caller passing the prefetch budget); misses, Drop a crumb and the opener use the fast one. The
+        # budget is passed down too, so a slow model leaves time for the next one instead of using it up.
+        if fast is None:
+            fast = budget_s < PREFETCH_TTS_BUDGET_S
         try:
             return await asyncio.wait_for(
                 synthesize(text, self.gemini, fast=fast, budget_s=budget_s), timeout=budget_s
@@ -766,6 +1095,38 @@ def _cache_key(kind: CrumbKind) -> str | None:
     if kind == "wildcard":
         return None
     return "steer" if kind == "steer" else "switch"
+
+
+async def _wait_task(task: asyncio.Future, timeout: float | None) -> Any:
+    """The task's result if it finishes within `timeout` (None: no limit), else None. Never cancels it,
+    and a task that fails or is cancelled gives None (only our own cancellation propagates)."""
+    if not task.done():
+        await asyncio.wait({task}, timeout=None if timeout is None else max(0.0, timeout))
+    if task.done() and not task.cancelled() and task.exception() is None:
+        return task.result()
+    return None
+
+
+def _topic_stems(topic: str | None) -> set[str]:
+    text = (topic or "").strip()
+    if text.lower().startswith("outside:"):
+        text = text[len("outside:"):]
+    return h.stems(text)
+
+
+def _topics_differ(old: str | None, new: str | None) -> bool:
+    """A real change of subject: both topics known and no word stem in common."""
+    a, b = _topic_stems(old), _topic_stems(new)
+    return bool(a) and bool(b) and not (a & b)
+
+
+def _topics_overlap(a: str | None, b: str | None) -> bool:
+    return bool(_topic_stems(a) & _topic_stems(b))
+
+
+def _fact_key(topic: str | None) -> str:
+    """Facts are kept per topic: its sorted word stems ('' = the event location)."""
+    return " ".join(sorted(h.stems(topic or "")))
 
 
 def _lead_in(instruction: str | None) -> str | None:

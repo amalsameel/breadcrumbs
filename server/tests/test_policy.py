@@ -402,8 +402,10 @@ def test_classifier_upgrades_an_ambiguous_fragment_to_show() -> None:
     turns.append({"seat": 1, "text": "and then my phone has the", "start": end + 0.7, "end": end + 2.0})
     t = round(end + 2.0, 1)
     hold_results = {"4": {"hold": True, "kind": "show", "expected_seconds": 30, "confidence": 0.8}}
+    # The fragment goes to the classifier once 1 s of silence followed it (HOLD_CHECK_SILENCE_S), and the
+    # answer (1 s in the simulator) still lands before the 5 s steer threshold.
     expect = [
-        {"between": [t + 1.2, t + 1.4], "action": "hold", "kind": "show", "count": 1},
+        {"between": [t + 1.9, t + 2.2], "action": "hold", "kind": "show", "count": 1},
         {"between": [t, t + 59.9], "action": "none"},
     ]
     assert_script(script(turns, expect, hold_results=hold_results, duration=t + 59.9))

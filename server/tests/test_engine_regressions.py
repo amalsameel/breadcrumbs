@@ -80,7 +80,9 @@ def test_vetoed_hold_phrase_goes_to_the_classifier() -> None:
     e, _ = calibrated()
     fx = speak(e, 30, "A", "Honestly I just cannot wait, I really cant wait.", 12.0, 14.0)
     assert match_hold("Honestly I just cannot wait, I really cant wait.") is None
-    assert of_type(fx, "classify_hold")
+    # Usage: a vetoed phrase is only worth a classifier call once silence follows it (HOLD_CHECK_SILENCE_S).
+    assert not of_type(fx, "classify_hold") and not of_type(e.tick(14.0 + e.params.HOLD_CHECK_SILENCE_S - 0.2), "classify_hold")
+    assert of_type(e.tick(14.0 + e.params.HOLD_CHECK_SILENCE_S), "classify_hold")
 
 
 def test_surprise_then_show_holds_in_the_simulator() -> None:
